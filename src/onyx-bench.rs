@@ -1,0 +1,138 @@
+
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::task;
+use std::time::Instant;
+
+const NUM_THREADS: usize = 50;
+const OPS_PER_THREAD: usize = 500;
+const PIPELINE_BATCH: usize = 50;
+
+fn encode_command(parts: &[String]) -> String {
+    let mut out = format!("*{}\r\n", parts.len());
+    for p in parts {
+        out.push_str(&format!("${}\r\n{}\r\n", p.len(), p));
+    }
+    out
+}
+
+// Legge e scarta UNA risposta RESP (ci basta sapere che e' arrivata, per il benchmark).
+async fn skip_reply(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> std::io::Result<()> {
+    let mut header = String::new();
+    reader.read_line(&mut header).await?;
+    let header = header.trim_end();
+    if header.is_empty() {
+        return Ok(());
+    }
+
+    let prefix = header.chars().next().unwrap();
+    let rest = &header[1..];
+
+    match prefix {
+        '$' => {
+            let len: i64 = rest.parse().unwrap_or(-1);
+            if len >= 0 {
+                let mut buf = vec![0u8; len as usize + 2];
+                reader.read_exact(&mut buf).await?;
+            }
+        }
+        '*' => {
+            let count: i64 = rest.parse().unwrap_or(0);
+            for _ in 0..count.max(0) {
+                Box::pin(skip_reply(reader)).await?;
+            }
+        }
+        _ => {} // +OK, -ERR, :123 sono gia' consumati dalla read_line
+    }
+    Ok(())
+}
+
+async fn run_worker_sync(thread_id: usize) -> u128 {
+    let stream = TcpStream::connect("127.0.0.1:6380").await.expect("Connessione fallita");
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let start = Instant::now();
+
+    for i in 0..OPS_PER_THREAD {
+        let key = format!("bench_{}_{}", thread_id, i);
+        let _value = format!("valore_{}", i);
+        let set_cmd = encode_command(&["SET".to_string(), key.clone(), format!("valore_{}", i)]);
+        writer.write_all(set_cmd.as_bytes()).await.unwrap();
+        skip_reply(&mut reader).await.unwrap();
+
+        let get_cmd = encode_command(&["GET".to_string(), key.clone()]);
+        writer.write_all(get_cmd.as_bytes()).await.unwrap();
+        skip_reply(&mut reader).await.unwrap();
+    }
+
+    start.elapsed().as_millis()
+}
+
+async fn run_worker_pipeline(thread_id: usize) -> u128 {
+    let stream = TcpStream::connect("127.0.0.1:6380").await.expect("Connessione fallita");
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let start = Instant::now();
+
+    let mut i = 0;
+    while i < OPS_PER_THREAD {
+        let batch_end = (i + PIPELINE_BATCH).min(OPS_PER_THREAD);
+        let mut batch = String::new();
+        let mut expected_responses = 0;
+
+        for j in i..batch_end {
+            let key = format!("bench_{}_{}", thread_id, j);
+            let value = format!("valore_{}", j);
+            batch.push_str(&encode_command(&["SET".to_string(), key.clone(), value]));
+            batch.push_str(&encode_command(&["GET".to_string(), key]));
+            expected_responses += 2;
+        }
+
+        writer.write_all(batch.as_bytes()).await.unwrap();
+
+        for _ in 0..expected_responses {
+            skip_reply(&mut reader).await.unwrap();
+        }
+
+        i = batch_end;
+    }
+
+    start.elapsed().as_millis()
+}
+
+async fn run_benchmark(label: &str, worker: fn(usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = u128> + Send>>) {
+    println!("\n=== {} ===", label);
+    println!("Thread: {} | Operazioni per thread: {}", NUM_THREADS, OPS_PER_THREAD);
+
+    let total_start = Instant::now();
+    let mut handles = vec![];
+
+    for t in 0..NUM_THREADS {
+        let handle = task::spawn(worker(t));
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    let total_elapsed = total_start.elapsed();
+    let total_ops = NUM_THREADS * OPS_PER_THREAD * 2;
+
+    println!("Tempo totale: {} ms", total_elapsed.as_millis());
+    println!("Operazioni totali: {}", total_ops);
+
+    let ops_per_sec = (total_ops as f64) / (total_elapsed.as_secs_f64());
+    println!("Operazioni al secondo: {:.0} ops/sec", ops_per_sec);
+}
+
+#[tokio::main]
+async fn main() {
+    println!("OnyxDB Benchmark - Confronto Sync vs Pipeline (protocollo RESP)");
+    println!("Connessione al server su 127.0.0.1:6380...");
+
+    run_benchmark("Modalita SINCRONA (una richiesta alla volta)", |t| Box::pin(run_worker_sync(t))).await;
+    run_benchmark("Modalita PIPELINE (batch di comandi)", |t| Box::pin(run_worker_pipeline(t))).await;
+}

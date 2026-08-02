@@ -1,0 +1,31 @@
+[package]
+name = "onyxdb"
+version = "0.1.0"
+edition = "2024"
+default-run = "onyxdb"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+dashmap = "6.0"         
+mimalloc = "0.1.32"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+flate2 = "1.0"
+bytes = "1.5"            # ZERO-COPY BUFFERS
+crossbeam = "0.8"        # Lock-free channels
+serde_json = "1.0"       # Per tipo JSON nativo
+num_cpus = "1.16"        # Auto-detect core
+
+[[bin]]
+name = "onyx-cli"
+path = "src/onyx-cli.rs"
+
+[[bin]]
+name = "onyx-bench"
+path = "src/onyx-bench.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

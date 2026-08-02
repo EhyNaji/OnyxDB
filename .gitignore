@@ -1,0 +1,12 @@
+# Build artifacts
+/target/
+
+# Dati generati a runtime (non vanno versionati)
+onyx.snapshot
+onyx.binlog
+onyx.log
+*.tmp
+
+# Cargo.lock: lo escludo per ora
+# finché la struttura del progetto non è più stabile
+Cargo.lock
