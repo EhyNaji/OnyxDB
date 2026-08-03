@@ -1250,6 +1250,29 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             write_u16_be(&mut buf, field.len() as u16);
             buf.extend_from_slice(field.as_bytes());
         }
+        "JSON.SET" => {
+            // args: ["JSON.SET", key, path, value_json_compatto]
+            if args.len() < 4 { return None; }
+            let key = &args[1];
+            let path = &args[2];
+            let value = &args[3];
+            write_u16_be(&mut buf, key.len() as u16);
+            buf.extend_from_slice(key.as_bytes());
+            write_u16_be(&mut buf, path.len() as u16);
+            buf.extend_from_slice(path.as_bytes());
+            write_u32_be(&mut buf, value.len() as u32);
+            buf.extend_from_slice(value.as_bytes());
+        }
+        "JSON.DEL" => {
+            // args: ["JSON.DEL", key, path]
+            if args.len() < 3 { return None; }
+            let key = &args[1];
+            let path = &args[2];
+            write_u16_be(&mut buf, key.len() as u16);
+            buf.extend_from_slice(key.as_bytes());
+            write_u16_be(&mut buf, path.len() as u16);
+            buf.extend_from_slice(path.as_bytes());
+        }
         "COPY" => {
             if args.len() < 3 { return None; }
             let src = &args[1];
@@ -3525,6 +3548,66 @@ mod tests {
         let record = command_to_binary_record("COPY", &args, None).unwrap();
         assert_eq!(binary_record_to_args(&record).unwrap(), vec!["COPY", "src", "dst"]);
     }
+    #[test]
+    fn test_binlog_roundtrip_json_set() {
+        let args = vec![
+            "JSON.SET".to_string(),
+            "utente".to_string(),
+            "$".to_string(),
+            "{\"nome\":\"Marco\"}".to_string(),
+        ];
+        let record = command_to_binary_record("JSON.SET", &args, None).unwrap();
+        let decoded = binary_record_to_args(&record).unwrap();
+        assert_eq!(decoded, vec!["JSON.SET", "utente", "$", "{\"nome\":\"Marco\"}"]);
+    }
+
+    #[test]
+    fn test_binlog_roundtrip_json_set_path_annidato() {
+        let args = vec![
+            "JSON.SET".to_string(),
+            "utente".to_string(),
+            "$.indirizzo.città".to_string(),
+            "\"Roma\"".to_string(),
+        ];
+        let record = command_to_binary_record("JSON.SET", &args, None).unwrap();
+        let decoded = binary_record_to_args(&record).unwrap();
+        assert_eq!(decoded, vec!["JSON.SET", "utente", "$.indirizzo.città", "\"Roma\""]);
+    }
+    #[test]
+    fn test_binlog_roundtrip_json_del() {
+        let args = vec!["JSON.DEL".to_string(), "utente".to_string(), "$.età".to_string()];
+        let record = command_to_binary_record("JSON.DEL", &args, None).unwrap();
+        let decoded = binary_record_to_args(&record).unwrap();
+        assert_eq!(decoded, vec!["JSON.DEL", "utente", "$.età"]);
+    }
+
+    #[test]
+    fn test_binlog_json_set_argomenti_insufficienti_ritorna_none() {
+        let args = vec!["JSON.SET".to_string(), "utente".to_string()];
+        assert!(command_to_binary_record("JSON.SET", &args, None).is_none());
+    }
+
+    #[test]
+    fn test_binlog_json_del_argomenti_insufficienti_ritorna_none() {
+        let args = vec!["JSON.DEL".to_string(), "utente".to_string()];
+        assert!(command_to_binary_record("JSON.DEL", &args, None).is_none());
+    }
+
+    #[test]
+    fn test_snapshot_roundtrip_json() {
+        let entry = DataEntry {
+            value: OnyxValue::Json(serde_json::json!({"nome": "Marco", "età": 18})),
+            expires_at: None,
+            created_at: 0,
+            last_accessed: 0,
+        };
+        let line = value_to_line("k", &entry);
+        let (_, decoded) = line_to_entry(&line).unwrap();
+        match decoded.value {
+            OnyxValue::Json(v) => assert_eq!(v, serde_json::json!({"nome": "Marco", "età": 18})),
+            _ => panic!("tipo sbagliato dopo il round-trip"),
+        }
+     }
 
     #[test]
     fn test_binlog_comando_sconosciuto_ritorna_none() {
@@ -3658,7 +3741,7 @@ mod tests {
     }
     // ============================================================
     // Logica di resync: qui vive il regression test del bug che ha
-    // scoperto Yousef (backlog vuoto dopo un riavvio del Master scambiato
+    // scoperto Marco (backlog vuoto dopo un riavvio del Master scambiato
     // per "già allineati").
     // ============================================================
 
@@ -3781,9 +3864,9 @@ mod tests {
 
     #[test]
     fn test_get_json_path_campo_esistente() {
-        let val: serde_json::Value = serde_json::json!({"nome": "Yousef", "età": 18});
+        let val: serde_json::Value = serde_json::json!({"nome": "Marco", "età": 18});
         let path = parse_json_path("$.nome").unwrap();
-        assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("Yousef")));
+        assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("Marco")));
     }
 
     #[test]
@@ -3795,7 +3878,7 @@ mod tests {
 
     #[test]
     fn test_get_json_path_campo_assente_none() {
-        let val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let val: serde_json::Value = serde_json::json!({"nome": "Marco"});
         let path = parse_json_path("$.cognome").unwrap();
         assert_eq!(get_json_path(&val, &path), None);
     }
@@ -3817,7 +3900,7 @@ mod tests {
     #[test]
     fn test_get_json_path_tipo_sbagliato_none() {
         // Indice su un oggetto (non un array): non ha senso, deve dare None.
-        let val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let val: serde_json::Value = serde_json::json!({"nome": "Marco"});
         let path = parse_json_path("$.nome[0]").unwrap();
         assert_eq!(get_json_path(&val, &path), None);
     }
@@ -3832,7 +3915,7 @@ mod tests {
 
     #[test]
     fn test_set_json_path_campo_esistente() {
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
         let path = parse_json_path("$.nome").unwrap();
         assert!(set_json_path(&mut val, &path, serde_json::json!("Ahmed")));
         assert_eq!(val, serde_json::json!({"nome": "Ahmed"}));
@@ -3840,10 +3923,10 @@ mod tests {
 
     #[test]
     fn test_set_json_path_campo_nuovo_su_oggetto_esistente() {
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
         let path = parse_json_path("$.età").unwrap();
         assert!(set_json_path(&mut val, &path, serde_json::json!(18)));
-        assert_eq!(val, serde_json::json!({"nome": "Yousef", "età": 18}));
+        assert_eq!(val, serde_json::json!({"nome": "Marco", "età": 18}));
     }
 
     #[test]
@@ -3879,10 +3962,10 @@ mod tests {
 
     #[test]
     fn test_delete_json_path_campo() {
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Yousef", "età": 18});
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco", "età": 18});
         let path = parse_json_path("$.età").unwrap();
         assert!(delete_json_path(&mut val, &path));
-        assert_eq!(val, serde_json::json!({"nome": "Yousef"}));
+        assert_eq!(val, serde_json::json!({"nome": "Marco"}));
     }
 
     #[test]
@@ -3895,7 +3978,7 @@ mod tests {
 
     #[test]
     fn test_delete_json_path_campo_assente_fallisce() {
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
         let path = parse_json_path("$.cognome").unwrap();
         assert!(!delete_json_path(&mut val, &path));
     }
@@ -3904,7 +3987,7 @@ mod tests {
     fn test_delete_json_path_radice_fallisce() {
         // DEL su "$" (documento intero) non passa da qui, va gestito
         // separatamente con un DEL normale sulla chiave.
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
         let path = parse_json_path("$").unwrap();
         assert!(!delete_json_path(&mut val, &path));
     }
