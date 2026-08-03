@@ -645,6 +645,29 @@ impl ShardedStore {
             None => Err("ERR chiave inesistente".to_string()),
         }
     }
+    pub fn json_arrlen(&self, key: &str, path: &str) -> Result<Option<usize>, String> {
+        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let result = self.engine.read(&Bytes::from(key.to_string()), move |entry| match &entry.value {
+            OnyxValue::Json(root) => {
+                let node = if segments.is_empty() { Some(root) } else { get_json_path(root, &segments) };
+                node.and_then(|v| v.as_array().map(|a| a.len()))
+            }
+            _ => None,
+        });
+        Ok(result.flatten())
+    }
+
+    pub fn json_objkeys(&self, key: &str, path: &str) -> Result<Option<Vec<String>>, String> {
+        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let result = self.engine.read(&Bytes::from(key.to_string()), move |entry| match &entry.value {
+            OnyxValue::Json(root) => {
+                let node = if segments.is_empty() { Some(root) } else { get_json_path(root, &segments) };
+                node.and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
+            }
+            _ => None,
+        });
+        Ok(result.flatten())
+    }
     // --- Key operations ---
     pub fn rename(&self, old_key: &str, new_key: &str) -> bool {
         self.engine.rename(&Bytes::from(old_key.to_string()), Bytes::from(new_key.to_string()))
@@ -1867,6 +1890,22 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
                     Err(e) => (RESPValue::Error(e), false),
                 },
                 Err(_) => (RESPValue::Error("ERR valore non è JSON valido".to_string()), false),
+            }
+        }
+        "JSON.ARRLEN" if !key.is_empty() => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
+            match store.json_arrlen(key, path) {
+                Ok(Some(len)) => (RESPValue::Integer(len as i64), false),
+                Ok(None) => (RESPValue::BulkString(None), false),
+                Err(e) => (RESPValue::Error(e), false),
+            }
+        }
+        "JSON.OBJKEYS" if !key.is_empty() => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
+            match store.json_objkeys(key, path) {
+                Ok(Some(keys)) => (RESPValue::Array(keys.into_iter().map(|k| RESPValue::BulkString(Some(k))).collect()), false),
+                Ok(None) => (RESPValue::Array(Vec::new()), false),
+                Err(e) => (RESPValue::Error(e), false),
             }
         }
         "SADD" if !key.is_empty() && !arg.is_empty() => {
@@ -4210,6 +4249,44 @@ mod tests {
         let mut val: serde_json::Value = serde_json::json!({});
         let path = parse_json_path("$.tag").unwrap();
         assert!(arrappend_json_path(&mut val, &path, serde_json::json!("x")).is_err());
+    }
+    #[test]
+    fn test_json_arrlen_e_objkeys_via_store() {
+        let store = ShardedStore::new();
+        store.json_set("utente", "$", serde_json::json!({"nome": "Marco", "tag": ["dev", "rust"]})).unwrap();
+
+        assert_eq!(store.json_arrlen("utente", "$.tag"), Ok(Some(2)));
+
+        let keys = store.json_objkeys("utente", "$").unwrap().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"nome".to_string()));
+        assert!(keys.contains(&"tag".to_string()));
+    }
+
+    #[test]
+    fn test_json_arrlen_su_non_array_ritorna_none() {
+        let store = ShardedStore::new();
+        store.json_set("utente", "$", serde_json::json!({"nome": "Marco"})).unwrap();
+        assert_eq!(store.json_arrlen("utente", "$.nome"), Ok(None));
+    }
+
+    #[test]
+    fn test_json_objkeys_su_non_oggetto_ritorna_none() {
+        let store = ShardedStore::new();
+        store.json_set("utente", "$", serde_json::json!({"tag": ["dev"]})).unwrap();
+        assert_eq!(store.json_objkeys("utente", "$.tag"), Ok(None));
+    }
+
+    #[test]
+    fn test_json_arrlen_chiave_inesistente_ritorna_none() {
+        let store = ShardedStore::new();
+        assert_eq!(store.json_arrlen("non_esiste", "$"), Ok(None));
+    }
+
+    #[test]
+    fn test_json_objkeys_chiave_inesistente_ritorna_none() {
+        let store = ShardedStore::new();
+        assert_eq!(store.json_objkeys("non_esiste", "$"), Ok(None));
     }
 
     #[test]
