@@ -533,7 +533,89 @@ impl ShardedStore {
             }
         }).unwrap_or(false)
     }
+    // --- JSON operations ---
 
+    /// JSON.SET: se path == "$", sostituisce l'intero documento (creandolo
+    /// se la chiave non esiste). Con un path parziale, la chiave deve già
+    /// esistere e contenere un valore JSON.
+    pub fn json_set(&self, key: &str, path: &str, new_value: serde_json::Value) -> Result<(), &'static str> {
+        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let key_b = Bytes::from(key.to_string());
+
+        if segments.is_empty() {
+            // "$": crea o sovrascrive l'intero documento.
+            self.engine.set(key_b, OnyxValue::Json(new_value), None);
+            return Ok(());
+        }
+
+        // Path parziale: la chiave deve già esistere con un valore JSON.
+        let result = self.engine.update_if_exists(&key_b, move |v| match v {
+            OnyxValue::Json(root) => Some(set_json_path(root, &segments, new_value)),
+            _ => None, // esiste ma non è JSON: tipo sbagliato
+        });
+        match result {
+            Some(Some(true)) => Ok(()),
+            Some(Some(false)) => Err("ERR path non raggiungibile (elemento intermedio assente o indice fuori range)"),
+            Some(None) => Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON"),
+            None => Err("ERR chiave inesistente: usa JSON.SET chiave $ {...} per crearla"),
+        }
+    }
+
+    pub fn json_get(&self, key: &str, path: &str) -> Result<Option<String>, &'static str> {
+        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let result = self.engine.read(&Bytes::from(key.to_string()), move |entry| match &entry.value {
+            OnyxValue::Json(root) => {
+                if segments.is_empty() {
+                    Some(root.to_string())
+                } else {
+                    get_json_path(root, &segments).map(|v| v.to_string())
+                }
+            }
+            _ => None,
+        });
+        match result {
+            Some(Some(s)) => Ok(Some(s)),
+            Some(None) => Ok(None), // chiave JSON esiste ma il path non trova nulla
+            None => Ok(None),        // chiave inesistente
+        }
+    }
+
+    pub fn json_del(&self, key: &str, path: &str) -> Result<bool, &'static str> {
+        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        if segments.is_empty() {
+            // DEL sul documento intero: stessa semantica del DEL normale.
+            return Ok(self.delete(key));
+        }
+        let key_b = Bytes::from(key.to_string());
+        let result = self.engine.update_if_exists(&key_b, move |v| match v {
+            OnyxValue::Json(root) => Some(delete_json_path(root, &segments)),
+            _ => None,
+        });
+        match result {
+            Some(Some(deleted)) => Ok(deleted),
+            Some(None) => Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON"),
+            None => Ok(false), // chiave inesistente: nulla da cancellare
+        }
+    }
+
+    pub fn json_type(&self, key: &str, path: &str) -> Result<Option<&'static str>, &'static str> {
+        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let result = self.engine.read(&Bytes::from(key.to_string()), move |entry| match &entry.value {
+            OnyxValue::Json(root) => {
+                let node = if segments.is_empty() { Some(root) } else { get_json_path(root, &segments) };
+                node.map(|v| match v {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "boolean",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                })
+            }
+            _ => None,
+        });
+        Ok(result.flatten())
+    }
     // --- Key operations ---
     pub fn rename(&self, old_key: &str, new_key: &str) -> bool {
         self.engine.rename(&Bytes::from(old_key.to_string()), Bytes::from(new_key.to_string()))
@@ -648,6 +730,170 @@ fn is_expired(entry: &DataEntry) -> bool {
         false
     }
 }
+
+// ============================================================
+// JSON PATH — parser ridotto: solo campi (.nome) e indici di array ([N]).
+// Niente wildcard e niente filtri.
+// ============================================================
+
+#[derive(Debug, Clone, PartialEq)]
+enum JsonPathSegment {
+    Field(String),
+    Index(usize),
+}
+/// Interpreta un path stile "$.a.b[2].c" in una sequenza di passi da
+/// seguire dentro un serde_json::Value. "$" da solo (documento intero)
+/// ritorna un vettore vuoto. Ritorna None se il path è sintatticamente
+/// malformato (non se il path "non esiste" nei dati. Quello viene scoperto
+/// solo in get_json_path/set_json_path).
+fn parse_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
+    let path = path.trim();
+    if path != "$" && !path.starts_with('$') {
+        return None; // ogni path valido inizia con '$'
+    }
+    let rest = &path[1..]; // scarta il '$' iniziale
+    if rest.is_empty() {
+        return Some(Vec::new()); // "$" da solo: documento intero
+    }
+    if !rest.starts_with('.') && !rest.starts_with('[') {
+        return None; // dopo '$' deve seguire '.' o '['
+    }
+
+    let mut segments = Vec::new();
+    let chars: Vec<char> = rest.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            '.' => {
+                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
+                    i += 1;
+                }
+                if start == i {
+                    return None; // ".." o "." finale senza nome di campo
+                }
+                let field: String = chars[start..i].iter().collect();
+                segments.push(JsonPathSegment::Field(field));
+            }
+            '[' => {
+                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i] != ']' {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None; // '[' senza ']' di chiusura
+                }
+                let idx_str: String = chars[start..i].iter().collect();
+                let idx: usize = idx_str.parse().ok()?; // solo indici >= 0
+                segments.push(JsonPathSegment::Index(idx));
+                i += 1; // salta il ']'
+            }
+            _ => return None, // carattere inatteso fuori da un segmento . o [
+        }
+    }
+
+    Some(segments)
+}
+/// Naviga `root` seguendo `segments` e ritorna un riferimento al nodo
+/// finale, se esiste. None se un passo intermedio non esiste o non è del
+/// tipo giusto.
+fn get_json_path<'a>(root: &'a serde_json::Value, segments: &[JsonPathSegment]) -> Option<&'a serde_json::Value> {
+    let mut current = root;
+    for seg in segments {
+        current = match (seg, current) {
+            (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => map.get(f)?,
+            (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => arr.get(*idx)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// Imposta il valore al path indicato, creando l'ultimo passo se manca ma
+/// SENZA creare automaticamente livelli intermedi assenti. Ritorna true se ha scritto, false se il genitore del
+/// passo finale non esiste o non è del tipo compatibile.
+fn set_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment], new_value: serde_json::Value) -> bool {
+    if segments.is_empty() {
+        *root = new_value;
+        return true;
+    }
+    let mut current = root;
+    for seg in &segments[..segments.len() - 1] {
+        current = match (seg, current) {
+            (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => {
+                match map.get_mut(f) {
+                    Some(v) => v,
+                    None => return false, // livello intermedio assente: niente auto-creazione
+                }
+            }
+            (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => {
+                match arr.get_mut(*idx) {
+                    Some(v) => v,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+    }
+    match (&segments[segments.len() - 1], current) {
+        (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => {
+            map.insert(f.clone(), new_value);
+            true
+        }
+        (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => {
+            if *idx < arr.len() {
+                arr[*idx] = new_value;
+                true
+            } else if *idx == arr.len() {
+                arr.push(new_value); // append in coda, come farebbe un push naturale
+                true
+            } else {
+                false // indice troppo avanti, buco non ammesso
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Rimuove il nodo al path indicato. Ritorna true se ha rimosso qualcosa.
+fn delete_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment]) -> bool {
+    if segments.is_empty() {
+        return false; // DEL sul documento intero non passa da qui (si usa DEL normale sulla chiave)
+    }
+    let mut current = root;
+    for seg in &segments[..segments.len() - 1] {
+        current = match (seg, current) {
+            (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => {
+                match map.get_mut(f) {
+                    Some(v) => v,
+                    None => return false,
+                }
+            }
+            (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => {
+                match arr.get_mut(*idx) {
+                    Some(v) => v,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+    }
+    match (&segments[segments.len() - 1], current) {
+        (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => map.remove(f).is_some(),
+        (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => {
+            if *idx < arr.len() {
+                arr.remove(*idx);
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
 fn glob_match(pattern: &str, text: &str) -> bool {
     let mut p_idx = 0;
     let mut t_idx = 0;
@@ -686,9 +932,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// Quante voci tiene al massimo il backlog di replica (in numero di
-/// comandi, non byte come il backlog di Redis — semplificazione voluta:
-/// più facile da ragionare, il costo è che una Replica staccata a lungo
-/// perde "N comandi" invece di "N byte", che di solito è comunque un buon
+/// comandi, (non byte) — semplificazione voluta:
+/// più facile da ragionare Replica staccata a lungo
+/// perde "N comandi" invece di "N byte", è comunque un buon
 /// proxy dello stesso concetto).
 const BACKLOG_CAPACITY: usize = 10_000;
 
@@ -716,7 +962,7 @@ struct Persistence {
     // un Master indipendente (promozione manuale via REPLICAOF NO ONE).
     promote_to_master: Arc<AtomicBool>,
     // Offset di replicazione: cresce di 1 a ogni comando di scrittura
-    // replicato. Non è byte-accurato come in Redis, ma basta per capire
+    // replicato. Non è byte-accurato ma basta per capire
     // "quanti comandi indietro" è una Replica.
     repl_offset: AtomicU64,
     // Buffer circolare degli ultimi BACKLOG_CAPACITY comandi, con il loro
@@ -758,6 +1004,8 @@ const OP_MSET: u8 = 14;
 const OP_R_PUSH: u8 = 15;
 const OP_LPOP: u8 = 16;
 const OP_RPOP: u8 = 17;
+const OP_JSON_SET: u8 = 18;
+const OP_JSON_DEL: u8 = 19;
 
 fn write_u16_be(buf: &mut Vec<u8>, val: u16) {
     buf.push((val >> 8) as u8);
@@ -837,6 +1085,8 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
         "RPUSH" => OP_R_PUSH,
         "LPOP" => OP_LPOP,
         "RPOP" => OP_RPOP,
+        "JSON.SET" => OP_JSON_SET,
+        "JSON.DEL" => OP_JSON_DEL,
         "HSET" => OP_HSET,
         "SADD" => OP_SADD,
         "RENAME" => OP_RENAME,
@@ -1033,7 +1283,7 @@ fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
             offset += val_len;
             // I record scritti prima di questa versione non hanno questi 8
             // byte finali con la scadenza: se mancano, va bene lo stesso,
-            // vuol dire "nessuna scadenza" (comportamento invariato).
+            // significa che "nessuna scadenza" (comportamento invariato).
             let expiry = read_u64_be(record, &mut offset).unwrap_or(0);
             if expiry > 0 {
                 Some(vec!["SET".to_string(), key, value, "EXAT".to_string(), expiry.to_string()])
@@ -1167,6 +1417,25 @@ fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
             let dst = String::from_utf8_lossy(safe_slice(record, offset, dst_len)?).to_string();
             Some(vec!["COPY".to_string(), src, dst])
         }
+        OP_JSON_SET => {
+            let key_len = read_u16_be(record, &mut offset)? as usize;
+            let key = String::from_utf8_lossy(safe_slice(record, offset, key_len)?).to_string();
+            offset += key_len;
+            let path_len = read_u16_be(record, &mut offset)? as usize;
+            let path = String::from_utf8_lossy(safe_slice(record, offset, path_len)?).to_string();
+            offset += path_len;
+            let val_len = read_u32_be(record, &mut offset)? as usize;
+            let value = String::from_utf8_lossy(safe_slice(record, offset, val_len)?).to_string();
+            Some(vec!["JSON.SET".to_string(), key, path, value])
+        }
+        OP_JSON_DEL => {
+            let key_len = read_u16_be(record, &mut offset)? as usize;
+            let key = String::from_utf8_lossy(safe_slice(record, offset, key_len)?).to_string();
+            offset += key_len;
+            let path_len = read_u16_be(record, &mut offset)? as usize;
+            let path = String::from_utf8_lossy(safe_slice(record, offset, path_len)?).to_string();
+            Some(vec!["JSON.DEL".to_string(), key, path])
+        }
         _ => None,
     }
 }
@@ -1200,6 +1469,9 @@ fn line_to_entry(line: &str) -> Option<(String, DataEntry)> {
                 }
             }
             Some(OnyxValue::Hash(map))
+        }
+        "JSON" => {
+            serde_json::from_str::<serde_json::Value>(val_str).ok().map(OnyxValue::Json)
         }
         "SET" => {
             let set: std::collections::HashSet<Bytes> = if val_str.is_empty() {
@@ -1242,7 +1514,8 @@ fn value_to_line(key: &str, entry: &DataEntry) -> String {
                 .collect::<Vec<_>>()
                 .join("|"),
         ),
-        // Json/Vector: non ancora supportati nel formato snapshot testuale
+        OnyxValue::Json(j) => ("JSON", j.to_string()),
+        // Vector: non ancora supportato nel formato snapshot testuale
         _ => ("STR", String::new()),
     };
 
@@ -1259,6 +1532,7 @@ fn is_write_command(cmd: &str) -> bool {
         "SET" | "GETSET" | "SETNX" | "MSET" | "DEL" | "EXPIRE" | "EXPIREAT"
             | "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "HSET" | "SADD" | "RENAME"
             | "INCR" | "INCRBY" | "DECRBY" | "APPEND" | "HDEL" | "SREM" | "COPY"
+            | "JSON.SET" | "JSON.DEL"
     )
 }
 /// Un resync parziale è ammissibile solo se il replication ID richiesto
@@ -1271,7 +1545,6 @@ fn is_write_command(cmd: &str) -> bool {
 fn replid_allows_partial(requested_replid: u64, current_replid: u64) -> bool {
     requested_replid != 0 && requested_replid == current_replid
 }
-
 /// Dato che il replication ID combacia, decide se il backlog attuale
 /// permette davvero un resync parziale senza buchi.
 fn partial_resync_possible(
@@ -1289,7 +1562,7 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
     let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
     let arg = args.get(2).map(|s| s.as_str()).unwrap_or("");
 
-    const CREATE_COMMANDS: &[&str] = &["SET", "LPUSH", "RPUSH", "HSET", "SADD", "MSET", "APPEND", "GETSET", "INCRBY", "DECRBY", "INCR"];
+    const CREATE_COMMANDS: &[&str] = &["SET", "LPUSH", "RPUSH", "HSET", "SADD", "MSET", "APPEND", "GETSET", "INCRBY", "DECRBY", "INCR", "JSON.SET"];
     if CREATE_COMMANDS.contains(&cmd) && !key.is_empty() && !store.exists(key) {
         if store.is_full() {
             return (RESPValue::Error("ERR database pieno: limite massimo di chiavi raggiunto".to_string()), false);
@@ -1386,6 +1659,44 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
             match store.value_type(key) {
                 Some(t) => (RESPValue::SimpleString(t.to_string()), false),
                 None => (RESPValue::SimpleString("none".to_string()), false),
+            }
+        }
+        "JSON.SET" => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            let raw_value = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            if key.is_empty() || path.is_empty() || raw_value.is_empty() {
+                (RESPValue::Error("ERR uso: JSON.SET chiave path valore-json".to_string()), false)
+            } else {
+                match serde_json::from_str::<serde_json::Value>(raw_value) {
+                    Ok(parsed) => match store.json_set(key, path, parsed) {
+                        Ok(()) => (RESPValue::SimpleString("OK".to_string()), true),
+                        Err(e) => (RESPValue::Error(e.to_string()), false),
+                    },
+                    Err(_) => (RESPValue::Error("ERR valore non è JSON valido".to_string()), false),
+                }
+            }
+        }
+        "JSON.GET" if !key.is_empty() => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
+            match store.json_get(key, path) {
+                Ok(Some(s)) => (RESPValue::BulkString(Some(s)), false),
+                Ok(None) => (RESPValue::BulkString(None), false),
+                Err(e) => (RESPValue::Error(e.to_string()), false),
+            }
+        }
+        "JSON.DEL" if !key.is_empty() => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
+            match store.json_del(key, path) {
+                Ok(deleted) => (RESPValue::Integer(if deleted { 1 } else { 0 }), deleted),
+                Err(e) => (RESPValue::Error(e.to_string()), false),
+            }
+        }
+        "JSON.TYPE" if !key.is_empty() => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
+            match store.json_type(key, path) {
+                Ok(Some(t)) => (RESPValue::SimpleString(t.to_string()), false),
+                Ok(None) => (RESPValue::BulkString(None), false),
+                Err(e) => (RESPValue::Error(e.to_string()), false),
             }
         }
         "SADD" if !key.is_empty() && !arg.is_empty() => {
@@ -3401,5 +3712,200 @@ mod tests {
         // che l'offset richiesto combaci con quello corrente (0), non con
         // un numero qualsiasi lasciato da un processo precedente.
         assert!(!partial_resync_possible(9, None, 0));
+    }
+    // ============================================================
+    // JSON path: parser e navigazione
+    // ============================================================
+
+    #[test]
+    fn test_parse_path_radice() {
+        assert_eq!(parse_json_path("$"), Some(vec![]));
+    }
+
+    #[test]
+    fn test_parse_path_campo_singolo() {
+        assert_eq!(parse_json_path("$.nome"), Some(vec![JsonPathSegment::Field("nome".to_string())]));
+    }
+
+    #[test]
+    fn test_parse_path_annidato() {
+        assert_eq!(
+            parse_json_path("$.indirizzo.città"),
+            Some(vec![
+                JsonPathSegment::Field("indirizzo".to_string()),
+                JsonPathSegment::Field("città".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_path_indice_array() {
+        assert_eq!(
+            parse_json_path("$.tag[0]"),
+            Some(vec![JsonPathSegment::Field("tag".to_string()), JsonPathSegment::Index(0)])
+        );
+    }
+
+    #[test]
+    fn test_parse_path_misto_lungo() {
+        assert_eq!(
+            parse_json_path("$.a[1].b[2]"),
+            Some(vec![
+                JsonPathSegment::Field("a".to_string()),
+                JsonPathSegment::Index(1),
+                JsonPathSegment::Field("b".to_string()),
+                JsonPathSegment::Index(2),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_path_senza_dollaro_iniziale_none() {
+        assert_eq!(parse_json_path("nome"), None);
+    }
+
+    #[test]
+    fn test_parse_path_doppio_punto_none() {
+        assert_eq!(parse_json_path("$..nome"), None);
+    }
+
+    #[test]
+    fn test_parse_path_parentesi_non_chiusa_none() {
+        assert_eq!(parse_json_path("$.tag[0"), None);
+    }
+
+    #[test]
+    fn test_parse_path_indice_non_numerico_none() {
+        assert_eq!(parse_json_path("$.tag[x]"), None);
+    }
+
+    #[test]
+    fn test_get_json_path_campo_esistente() {
+        let val: serde_json::Value = serde_json::json!({"nome": "Yousef", "età": 18});
+        let path = parse_json_path("$.nome").unwrap();
+        assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("Yousef")));
+    }
+
+    #[test]
+    fn test_get_json_path_annidato() {
+        let val: serde_json::Value = serde_json::json!({"indirizzo": {"città": "Roma"}});
+        let path = parse_json_path("$.indirizzo.città").unwrap();
+        assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("Roma")));
+    }
+
+    #[test]
+    fn test_get_json_path_campo_assente_none() {
+        let val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let path = parse_json_path("$.cognome").unwrap();
+        assert_eq!(get_json_path(&val, &path), None);
+    }
+
+    #[test]
+    fn test_get_json_path_indice_array() {
+        let val: serde_json::Value = serde_json::json!({"tag": ["dev", "rust"]});
+        let path = parse_json_path("$.tag[1]").unwrap();
+        assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("rust")));
+    }
+
+    #[test]
+    fn test_get_json_path_indice_fuori_range_none() {
+        let val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
+        let path = parse_json_path("$.tag[5]").unwrap();
+        assert_eq!(get_json_path(&val, &path), None);
+    }
+
+    #[test]
+    fn test_get_json_path_tipo_sbagliato_none() {
+        // Indice su un oggetto (non un array): non ha senso, deve dare None.
+        let val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let path = parse_json_path("$.nome[0]").unwrap();
+        assert_eq!(get_json_path(&val, &path), None);
+    }
+
+    #[test]
+    fn test_set_json_path_documento_intero() {
+        let mut val: serde_json::Value = serde_json::json!({"vecchio": true});
+        let path = parse_json_path("$").unwrap();
+        assert!(set_json_path(&mut val, &path, serde_json::json!({"nuovo": true})));
+        assert_eq!(val, serde_json::json!({"nuovo": true}));
+    }
+
+    #[test]
+    fn test_set_json_path_campo_esistente() {
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let path = parse_json_path("$.nome").unwrap();
+        assert!(set_json_path(&mut val, &path, serde_json::json!("Ahmed")));
+        assert_eq!(val, serde_json::json!({"nome": "Ahmed"}));
+    }
+
+    #[test]
+    fn test_set_json_path_campo_nuovo_su_oggetto_esistente() {
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let path = parse_json_path("$.età").unwrap();
+        assert!(set_json_path(&mut val, &path, serde_json::json!(18)));
+        assert_eq!(val, serde_json::json!({"nome": "Yousef", "età": 18}));
+    }
+
+    #[test]
+    fn test_set_json_path_genitore_assente_fallisce() {
+        // $.a.b.c ma "a" non esiste: niente auto-creazione, deve fallire.
+        let mut val: serde_json::Value = serde_json::json!({});
+        let path = parse_json_path("$.a.b.c").unwrap();
+        assert!(!set_json_path(&mut val, &path, serde_json::json!(1)));
+    }
+
+    #[test]
+    fn test_set_json_path_indice_array_esistente() {
+        let mut val: serde_json::Value = serde_json::json!({"tag": ["dev", "rust"]});
+        let path = parse_json_path("$.tag[0]").unwrap();
+        assert!(set_json_path(&mut val, &path, serde_json::json!("go")));
+        assert_eq!(val, serde_json::json!({"tag": ["go", "rust"]}));
+    }
+
+    #[test]
+    fn test_set_json_path_append_in_coda_array() {
+        let mut val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
+        let path = parse_json_path("$.tag[1]").unwrap();
+        assert!(set_json_path(&mut val, &path, serde_json::json!("rust")));
+        assert_eq!(val, serde_json::json!({"tag": ["dev", "rust"]}));
+    }
+
+    #[test]
+    fn test_set_json_path_indice_troppo_avanti_fallisce() {
+        let mut val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
+        let path = parse_json_path("$.tag[5]").unwrap();
+        assert!(!set_json_path(&mut val, &path, serde_json::json!("x")));
+    }
+
+    #[test]
+    fn test_delete_json_path_campo() {
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Yousef", "età": 18});
+        let path = parse_json_path("$.età").unwrap();
+        assert!(delete_json_path(&mut val, &path));
+        assert_eq!(val, serde_json::json!({"nome": "Yousef"}));
+    }
+
+    #[test]
+    fn test_delete_json_path_indice_array() {
+        let mut val: serde_json::Value = serde_json::json!({"tag": ["dev", "rust"]});
+        let path = parse_json_path("$.tag[0]").unwrap();
+        assert!(delete_json_path(&mut val, &path));
+        assert_eq!(val, serde_json::json!({"tag": ["rust"]}));
+    }
+
+    #[test]
+    fn test_delete_json_path_campo_assente_fallisce() {
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let path = parse_json_path("$.cognome").unwrap();
+        assert!(!delete_json_path(&mut val, &path));
+    }
+
+    #[test]
+    fn test_delete_json_path_radice_fallisce() {
+        // DEL su "$" (documento intero) non passa da qui, va gestito
+        // separatamente con un DEL normale sulla chiave.
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Yousef"});
+        let path = parse_json_path("$").unwrap();
+        assert!(!delete_json_path(&mut val, &path));
     }
 }
