@@ -616,6 +616,35 @@ impl ShardedStore {
         });
         Ok(result.flatten())
     }
+    pub fn json_numincrby(&self, key: &str, path: &str, delta: f64) -> Result<f64, String> {
+        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let key_b = Bytes::from(key.to_string());
+        let result = self.engine.update_if_exists(&key_b, move |v| match v {
+            OnyxValue::Json(root) => Some(numincrby_json_path(root, &segments, delta)),
+            _ => None,
+        });
+        match result {
+            Some(Some(Ok(new_val))) => Ok(new_val),
+            Some(Some(Err(e))) => Err(e.to_string()),
+            Some(None) => Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON".to_string()),
+            None => Err("ERR chiave inesistente".to_string()),
+        }
+    }
+
+    pub fn json_arrappend(&self, key: &str, path: &str, new_value: serde_json::Value) -> Result<usize, String> {
+        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let key_b = Bytes::from(key.to_string());
+        let result = self.engine.update_if_exists(&key_b, move |v| match v {
+            OnyxValue::Json(root) => Some(arrappend_json_path(root, &segments, new_value)),
+            _ => None,
+        });
+        match result {
+            Some(Some(Ok(new_len))) => Ok(new_len),
+            Some(Some(Err(e))) => Err(e.to_string()),
+            Some(None) => Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON".to_string()),
+            None => Err("ERR chiave inesistente".to_string()),
+        }
+    }
     // --- Key operations ---
     pub fn rename(&self, old_key: &str, new_key: &str) -> bool {
         self.engine.rename(&Bytes::from(old_key.to_string()), Bytes::from(new_key.to_string()))
@@ -894,6 +923,51 @@ fn delete_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment]) 
         _ => false,
     }
 }
+/// Naviga fino al nodo indicato e ritorna un riferimento MUTABILE (a
+/// differenza di get_json_path che ritorna solo &). Serve per
+/// NUMINCRBY/ARRAPPEND, che modificano il nodo in-place invece di
+/// sostituirlo interamente come fa SET.
+fn get_json_path_mut<'a>(root: &'a mut serde_json::Value, segments: &[JsonPathSegment]) -> Option<&'a mut serde_json::Value> {
+    let mut current = root;
+    for seg in segments {
+        current = match (seg, current) {
+            (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => map.get_mut(f)?,
+            (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => arr.get_mut(*idx)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// Incrementa un numero al path indicato. Niente auto-creazione a 0 se il
+/// path non esiste (comportamento diverso da INCR su chiave stringa): dentro
+/// un documento JSON un path assente è più probabilmente un errore di
+/// battitura da segnalare che un "parti da zero" implicito.
+fn numincrby_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment], delta: f64) -> Result<f64, &'static str> {
+    let node = get_json_path_mut(root, segments).ok_or("ERR path JSON non trovato")?;
+    let current = node.as_f64().ok_or("WRONGTYPE il valore al path non è un numero")?;
+    let new_val = current + delta;
+    let new_number = if new_val.fract() == 0.0 && new_val.abs() < i64::MAX as f64 {
+        serde_json::Number::from(new_val as i64)
+    } else {
+        serde_json::Number::from_f64(new_val).ok_or("ERR risultato numerico non valido (NaN o infinito)")?
+    };
+    *node = serde_json::Value::Number(new_number);
+    Ok(new_val)
+}
+
+/// Aggiunge un elemento in coda all'array al path indicato. Errore se il
+/// path non esiste o non punta a un array.
+fn arrappend_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment], new_value: serde_json::Value) -> Result<usize, &'static str> {
+    let node = get_json_path_mut(root, segments).ok_or("ERR path JSON non trovato")?;
+    match node {
+        serde_json::Value::Array(arr) => {
+            arr.push(new_value);
+            Ok(arr.len())
+        }
+        _ => Err("WRONGTYPE il valore al path non è un array"),
+    }
+}
 fn glob_match(pattern: &str, text: &str) -> bool {
     let mut p_idx = 0;
     let mut t_idx = 0;
@@ -1006,7 +1080,8 @@ const OP_LPOP: u8 = 16;
 const OP_RPOP: u8 = 17;
 const OP_JSON_SET: u8 = 18;
 const OP_JSON_DEL: u8 = 19;
-
+const OP_JSON_NUMINCRBY: u8 = 20;
+const OP_JSON_ARRAPPEND: u8 = 21;
 fn write_u16_be(buf: &mut Vec<u8>, val: u16) {
     buf.push((val >> 8) as u8);
     buf.push(val as u8);
@@ -1087,6 +1162,8 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
         "RPOP" => OP_RPOP,
         "JSON.SET" => OP_JSON_SET,
         "JSON.DEL" => OP_JSON_DEL,
+        "JSON.NUMINCRBY" => OP_JSON_NUMINCRBY,
+        "JSON.ARRAPPEND" => OP_JSON_ARRAPPEND,
         "HSET" => OP_HSET,
         "SADD" => OP_SADD,
         "RENAME" => OP_RENAME,
@@ -1272,6 +1349,32 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             buf.extend_from_slice(key.as_bytes());
             write_u16_be(&mut buf, path.len() as u16);
             buf.extend_from_slice(path.as_bytes());
+        }
+        "JSON.NUMINCRBY" => {
+            // args: ["JSON.NUMINCRBY", key, path, delta_come_stringa]
+            if args.len() < 4 { return None; }
+            let key = &args[1];
+            let path = &args[2];
+            let delta = &args[3];
+            write_u16_be(&mut buf, key.len() as u16);
+            buf.extend_from_slice(key.as_bytes());
+            write_u16_be(&mut buf, path.len() as u16);
+            buf.extend_from_slice(path.as_bytes());
+            write_u16_be(&mut buf, delta.len() as u16);
+            buf.extend_from_slice(delta.as_bytes());
+        }
+        "JSON.ARRAPPEND" => {
+            // args: ["JSON.ARRAPPEND", key, path, value_json_compatto]
+            if args.len() < 4 { return None; }
+            let key = &args[1];
+            let path = &args[2];
+            let value = &args[3];
+            write_u16_be(&mut buf, key.len() as u16);
+            buf.extend_from_slice(key.as_bytes());
+            write_u16_be(&mut buf, path.len() as u16);
+            buf.extend_from_slice(path.as_bytes());
+            write_u32_be(&mut buf, value.len() as u32);
+            buf.extend_from_slice(value.as_bytes());
         }
         "COPY" => {
             if args.len() < 3 { return None; }
@@ -1459,6 +1562,28 @@ fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
             let path = String::from_utf8_lossy(safe_slice(record, offset, path_len)?).to_string();
             Some(vec!["JSON.DEL".to_string(), key, path])
         }
+        OP_JSON_NUMINCRBY => {
+            let key_len = read_u16_be(record, &mut offset)? as usize;
+            let key = String::from_utf8_lossy(safe_slice(record, offset, key_len)?).to_string();
+            offset += key_len;
+            let path_len = read_u16_be(record, &mut offset)? as usize;
+            let path = String::from_utf8_lossy(safe_slice(record, offset, path_len)?).to_string();
+            offset += path_len;
+            let delta_len = read_u16_be(record, &mut offset)? as usize;
+            let delta = String::from_utf8_lossy(safe_slice(record, offset, delta_len)?).to_string();
+            Some(vec!["JSON.NUMINCRBY".to_string(), key, path, delta])
+        }
+        OP_JSON_ARRAPPEND => {
+            let key_len = read_u16_be(record, &mut offset)? as usize;
+            let key = String::from_utf8_lossy(safe_slice(record, offset, key_len)?).to_string();
+            offset += key_len;
+            let path_len = read_u16_be(record, &mut offset)? as usize;
+            let path = String::from_utf8_lossy(safe_slice(record, offset, path_len)?).to_string();
+            offset += path_len;
+            let val_len = read_u32_be(record, &mut offset)? as usize;
+            let value = String::from_utf8_lossy(safe_slice(record, offset, val_len)?).to_string();
+            Some(vec!["JSON.ARRAPPEND".to_string(), key, path, value])
+        }
         _ => None,
     }
 }
@@ -1555,7 +1680,7 @@ fn is_write_command(cmd: &str) -> bool {
         "SET" | "GETSET" | "SETNX" | "MSET" | "DEL" | "EXPIRE" | "EXPIREAT"
             | "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "HSET" | "SADD" | "RENAME"
             | "INCR" | "INCRBY" | "DECRBY" | "APPEND" | "HDEL" | "SREM" | "COPY"
-            | "JSON.SET" | "JSON.DEL"
+            | "JSON.SET" | "JSON.DEL" | "JSON.NUMINCRBY" | "JSON.ARRAPPEND"
     )
 }
 /// Un resync parziale è ammissibile solo se il replication ID richiesto
@@ -1720,6 +1845,28 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
                 Ok(Some(t)) => (RESPValue::SimpleString(t.to_string()), false),
                 Ok(None) => (RESPValue::BulkString(None), false),
                 Err(e) => (RESPValue::Error(e.to_string()), false),
+            }
+        }
+        "JSON.NUMINCRBY" if !key.is_empty() => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            let delta_str = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            match delta_str.parse::<f64>() {
+                Ok(delta) => match store.json_numincrby(key, path, delta) {
+                    Ok(new_val) => (RESPValue::BulkString(Some(new_val.to_string())), true),
+                    Err(e) => (RESPValue::Error(e), false),
+                },
+                Err(_) => (RESPValue::Error("ERR delta non è un numero valido".to_string()), false),
+            }
+        }
+        "JSON.ARRAPPEND" if !key.is_empty() => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            let raw_value = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            match serde_json::from_str::<serde_json::Value>(raw_value) {
+                Ok(parsed) => match store.json_arrappend(key, path, parsed) {
+                    Ok(new_len) => (RESPValue::Integer(new_len as i64), true),
+                    Err(e) => (RESPValue::Error(e), false),
+                },
+                Err(_) => (RESPValue::Error("ERR valore non è JSON valido".to_string()), false),
             }
         }
         "SADD" if !key.is_empty() && !arg.is_empty() => {
@@ -3990,5 +4137,104 @@ mod tests {
         let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
         let path = parse_json_path("$").unwrap();
         assert!(!delete_json_path(&mut val, &path));
+    }
+    // ============================================================
+    // JSON NUMINCRBY / ARRAPPEND
+    // ============================================================
+
+    #[test]
+    fn test_numincrby_json_path_su_intero() {
+        let mut val: serde_json::Value = serde_json::json!({"visite": 5});
+        let path = parse_json_path("$.visite").unwrap();
+        let result = numincrby_json_path(&mut val, &path, 3.0);
+        assert_eq!(result, Ok(8.0));
+        assert_eq!(val, serde_json::json!({"visite": 8}));
+    }
+
+    #[test]
+    fn test_numincrby_json_path_con_delta_negativo() {
+        let mut val: serde_json::Value = serde_json::json!({"saldo": 10});
+        let path = parse_json_path("$.saldo").unwrap();
+        let result = numincrby_json_path(&mut val, &path, -3.0);
+        assert_eq!(result, Ok(7.0));
+    }
+
+    #[test]
+    fn test_numincrby_json_path_su_float() {
+        let mut val: serde_json::Value = serde_json::json!({"prezzo": 9.5});
+        let path = parse_json_path("$.prezzo").unwrap();
+        let result = numincrby_json_path(&mut val, &path, 0.5);
+        assert_eq!(result, Ok(10.0));
+    }
+
+    #[test]
+    fn test_numincrby_json_path_su_stringa_fallisce() {
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
+        let path = parse_json_path("$.nome").unwrap();
+        assert!(numincrby_json_path(&mut val, &path, 1.0).is_err());
+    }
+
+    #[test]
+    fn test_numincrby_json_path_assente_fallisce() {
+        let mut val: serde_json::Value = serde_json::json!({});
+        let path = parse_json_path("$.contatore").unwrap();
+        assert!(numincrby_json_path(&mut val, &path, 1.0).is_err());
+    }
+
+    #[test]
+    fn test_arrappend_json_path_su_array_esistente() {
+        let mut val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
+        let path = parse_json_path("$.tag").unwrap();
+        let result = arrappend_json_path(&mut val, &path, serde_json::json!("rust"));
+        assert_eq!(result, Ok(2));
+        assert_eq!(val, serde_json::json!({"tag": ["dev", "rust"]}));
+    }
+
+    #[test]
+    fn test_arrappend_json_path_su_array_vuoto() {
+        let mut val: serde_json::Value = serde_json::json!({"tag": []});
+        let path = parse_json_path("$.tag").unwrap();
+        let result = arrappend_json_path(&mut val, &path, serde_json::json!("primo"));
+        assert_eq!(result, Ok(1));
+    }
+
+    #[test]
+    fn test_arrappend_json_path_su_non_array_fallisce() {
+        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
+        let path = parse_json_path("$.nome").unwrap();
+        assert!(arrappend_json_path(&mut val, &path, serde_json::json!("x")).is_err());
+    }
+
+    #[test]
+    fn test_arrappend_json_path_assente_fallisce() {
+        let mut val: serde_json::Value = serde_json::json!({});
+        let path = parse_json_path("$.tag").unwrap();
+        assert!(arrappend_json_path(&mut val, &path, serde_json::json!("x")).is_err());
+    }
+
+    #[test]
+    fn test_binlog_roundtrip_json_numincrby() {
+        let args = vec![
+            "JSON.NUMINCRBY".to_string(),
+            "utente".to_string(),
+            "$.visite".to_string(),
+            "3".to_string(),
+        ];
+        let record = command_to_binary_record("JSON.NUMINCRBY", &args, None).unwrap();
+        let decoded = binary_record_to_args(&record).unwrap();
+        assert_eq!(decoded, vec!["JSON.NUMINCRBY", "utente", "$.visite", "3"]);
+    }
+
+    #[test]
+    fn test_binlog_roundtrip_json_arrappend() {
+        let args = vec![
+            "JSON.ARRAPPEND".to_string(),
+            "utente".to_string(),
+            "$.tag".to_string(),
+            "\"rust\"".to_string(),
+        ];
+        let record = command_to_binary_record("JSON.ARRAPPEND", &args, None).unwrap();
+        let decoded = binary_record_to_args(&record).unwrap();
+        assert_eq!(decoded, vec!["JSON.ARRAPPEND", "utente", "$.tag", "\"rust\""]);
     }
 }
