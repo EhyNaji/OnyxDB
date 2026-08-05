@@ -1,12 +1,12 @@
 //! OnyxDB Engine — Lock-free, shard-per-core storage
-//! 
+//!
 //! Ogni core logico ha il proprio shard. Le chiavi vengono distribuite
 //! tramite consistent hashing sui shard. Ogni shard è protetto da un
 //! Mutex indipendente, quindi la contesa è limitata alle chiavi che
 //! cadono sullo stesso shard.
 
-use std::collections::HashMap;
 use bytes::Bytes;
+use std::collections::HashMap;
 
 // Numero di shard: potenza di 2 per hashing veloce con bitmask
 pub const NUM_SHARDS: usize = 64; // 64 shard, bitmask 0x3F
@@ -110,7 +110,9 @@ impl EvictionPolicy {
 }
 
 fn cheap_random_index(len: usize) -> usize {
-    if len == 0 { return 0; }
+    if len == 0 {
+        return 0;
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -191,11 +193,10 @@ impl Shard {
     /// Rimuove le chiavi scadute, ritorna quante ne ha pulite
     fn expire_keys(&mut self) -> usize {
         let now = now();
-        let expired: Vec<Bytes> = self.data
+        let expired: Vec<Bytes> = self
+            .data
             .iter()
-            .filter(|(_, entry)| {
-                entry.expires_at.map_or(false, |exp| now >= exp)
-            })
+            .filter(|(_, entry)| entry.expires_at.map_or(false, |exp| now >= exp))
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -260,7 +261,11 @@ impl Shard {
             created_at: ts,
             last_accessed: ts,
         });
-        let old_size = if existed { approx_entry_size(&key, entry) } else { 0 };
+        let old_size = if existed {
+            approx_entry_size(&key, entry)
+        } else {
+            0
+        };
         entry.last_accessed = ts;
         let result = f(&mut entry.value);
         let new_size = approx_entry_size(&key, entry);
@@ -303,10 +308,18 @@ impl Shard {
     /// entry presa a caso. Per le policy `volatile-*` considera solo le
     /// chiavi che hanno un TTL impostato (esattamente come in Redis).
     fn eviction_candidate(&self, policy: EvictionPolicy) -> Option<(Bytes, u64)> {
-        let only_volatile = matches!(policy, EvictionPolicy::VolatileLru | EvictionPolicy::VolatileRandom);
-        let is_random = matches!(policy, EvictionPolicy::AllKeysRandom | EvictionPolicy::VolatileRandom);
+        let only_volatile = matches!(
+            policy,
+            EvictionPolicy::VolatileLru | EvictionPolicy::VolatileRandom
+        );
+        let is_random = matches!(
+            policy,
+            EvictionPolicy::AllKeysRandom | EvictionPolicy::VolatileRandom
+        );
 
-        let matching: Vec<(&Bytes, &DataEntry)> = self.data.iter()
+        let matching: Vec<(&Bytes, &DataEntry)> = self
+            .data
+            .iter()
             .filter(|(_, e)| !only_volatile || e.expires_at.is_some())
             .collect();
         if matching.is_empty() {
@@ -318,7 +331,8 @@ impl Shard {
             let (k, _) = matching[idx];
             Some((k.clone(), 0))
         } else {
-            matching.into_iter()
+            matching
+                .into_iter()
                 .min_by_key(|(_, e)| e.last_accessed)
                 .map(|(k, e)| (k.clone(), e.last_accessed))
         }
@@ -432,18 +446,21 @@ impl OnyxEngine {
         let mut shard = self.shards[shard_idx].lock().unwrap();
         let exists = shard.data.contains_key(&key);
         let allowed = match condition {
-            Some(true) => !exists,  // NX
+            Some(true) => !exists, // NX
             Some(false) => exists, // XX
             None => true,
         };
         if allowed {
             let ts = now();
-            shard.insert(key, DataEntry {
-                value,
-                expires_at,
-                created_at: ts,
-                last_accessed: ts,
-            });
+            shard.insert(
+                key,
+                DataEntry {
+                    value,
+                    expires_at,
+                    created_at: ts,
+                    last_accessed: ts,
+                },
+            );
         }
         allowed
     }
@@ -456,12 +473,15 @@ impl OnyxEngine {
         let shard_idx = shard_for_key(&key);
         let mut shard = self.shards[shard_idx].lock().unwrap();
         let ts = now();
-        shard.insert_if_absent(key, DataEntry {
-            value,
-            expires_at: None,
-            created_at: ts,
-            last_accessed: ts,
-        })
+        shard.insert_if_absent(
+            key,
+            DataEntry {
+                value,
+                expires_at: None,
+                created_at: ts,
+                last_accessed: ts,
+            },
+        )
     }
 
     /// RENAME — puo' toccare due shard diversi. Per evitare deadlock quando
@@ -520,7 +540,9 @@ impl OnyxEngine {
         let mut results: Vec<Option<DataEntry>> = vec![None; keys.len()];
 
         for (shard_idx, shard_keys) in by_shard.into_iter().enumerate() {
-            if shard_keys.is_empty() { continue; }
+            if shard_keys.is_empty() {
+                continue;
+            }
             let mut shard = self.shards[shard_idx].lock().unwrap();
             for (orig_idx, key) in shard_keys {
                 results[orig_idx] = shard.get(&key).cloned();
@@ -585,7 +607,10 @@ impl OnyxEngine {
     /// Somma approssimativa dei byte occupati da tutte le entry, su tutti
     /// gli shard. Usata da `--maxmemory` per decidere quando fare eviction.
     pub fn total_memory_bytes(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().unwrap().mem_bytes).sum()
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap().mem_bytes)
+            .sum()
     }
 
     /// Libera memoria finché si torna sotto `maxmemory_bytes`, secondo la

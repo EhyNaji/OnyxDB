@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut, Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 pub const OBP_MAGIC: u8 = 0x4F;
 pub const OBP_VERSION: u8 = 0x01;
 pub struct OBPFrame {
@@ -29,10 +29,14 @@ impl OBPFrame {
         }
     }
     pub fn decode(buf: &mut BytesMut) -> Option<Self> {
-        if buf.len() < 12 { return None; }
+        if buf.len() < 12 {
+            return None;
+        }
         let mut cursor = std::io::Cursor::new(&buf[..]);
         let magic = cursor.get_u8();
-        if magic != OBP_MAGIC { return None; }
+        if magic != OBP_MAGIC {
+            return None;
+        }
         let _version = cursor.get_u8();
         let cmd = cursor.get_u8();
         let flags = cursor.get_u16();
@@ -40,17 +44,25 @@ impl OBPFrame {
         let num_args = cursor.get_u16() as usize;
         let mut args = Vec::with_capacity(num_args);
         for _ in 0..num_args {
-            if buf.len() < cursor.position() as usize + 4 { return None; }
+            if buf.len() < cursor.position() as usize + 4 {
+                return None;
+            }
             let len = cursor.get_u32() as usize;
-            if buf.len() < cursor.position() as usize + len { return None; }
+            if buf.len() < cursor.position() as usize + len {
+                return None;
+            }
             let start = cursor.position() as usize;
             args.push(Bytes::copy_from_slice(&buf[start..start + len]));
             cursor.set_position((start + len) as u64);
         }
-        if buf.len() < cursor.position() as usize + 4 { return None; }
+        if buf.len() < cursor.position() as usize + 4 {
+            return None;
+        }
         let payload_len = cursor.get_u32() as usize;
         let payload = if payload_len > 0 {
-            if buf.len() < cursor.position() as usize + payload_len { return None; }
+            if buf.len() < cursor.position() as usize + payload_len {
+                return None;
+            }
             let start = cursor.position() as usize;
             Some(Bytes::copy_from_slice(&buf[start..start + payload_len]))
         } else {
@@ -58,7 +70,12 @@ impl OBPFrame {
         };
         let consumed = cursor.position() as usize;
         buf.advance(consumed);
-        Some(Self { cmd, flags, correlation_id, args, payload })
+        Some(Self {
+            cmd,
+            flags,
+            correlation_id,
+            args,
+            payload,
+        })
     }
 }
-

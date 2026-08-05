@@ -29,7 +29,11 @@ pub async fn read_command(
 
     if first_byte != Some(b'*') {
         // Comando in testo semplice (compatibilita' con vecchi tool)
-        let parts: Vec<String> = scratch.trim_end().split_whitespace().map(|s| s.to_string()).collect();
+        let parts: Vec<String> = scratch
+            .trim_end()
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
         return Ok(Some(parts));
     }
 
@@ -85,11 +89,21 @@ impl RESPValue {
     pub fn encode_into(&self, buf: &mut String) {
         use std::fmt::Write;
         match self {
-            RESPValue::SimpleString(s) => { let _ = write!(buf, "+{}\r\n", s); }
-            RESPValue::Error(s) => { let _ = write!(buf, "-{}\r\n", s); }
-            RESPValue::Integer(n) => { let _ = write!(buf, ":{}\r\n", n); }
-            RESPValue::BulkString(None) => { buf.push_str("$-1\r\n"); }
-            RESPValue::BulkString(Some(s)) => { let _ = write!(buf, "${}\r\n{}\r\n", s.len(), s); }
+            RESPValue::SimpleString(s) => {
+                let _ = write!(buf, "+{}\r\n", s);
+            }
+            RESPValue::Error(s) => {
+                let _ = write!(buf, "-{}\r\n", s);
+            }
+            RESPValue::Integer(n) => {
+                let _ = write!(buf, ":{}\r\n", n);
+            }
+            RESPValue::BulkString(None) => {
+                buf.push_str("$-1\r\n");
+            }
+            RESPValue::BulkString(Some(s)) => {
+                let _ = write!(buf, "${}\r\n{}\r\n", s.len(), s);
+            }
             RESPValue::Array(arr) => {
                 let _ = write!(buf, "*{}\r\n", arr.len());
                 for item in arr {

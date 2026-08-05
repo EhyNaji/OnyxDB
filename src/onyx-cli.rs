@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
- 
+
 fn encode_command(input: &str) -> String {
     let parts: Vec<&str> = input.split_whitespace().collect();
     let mut out = format!("*{}\r\n", parts.len());
@@ -11,7 +11,7 @@ fn encode_command(input: &str) -> String {
     }
     out
 }
- 
+
 async fn read_reply(reader: &mut BufReader<OwnedReadHalf>) -> std::io::Result<String> {
     let mut header = String::new();
     let n = reader.read_line(&mut header).await?;
@@ -53,28 +53,41 @@ async fn read_reply(reader: &mut BufReader<OwnedReadHalf>) -> std::io::Result<St
         _ => Ok(header.to_string()),
     }
 }
- 
+
 // Comandi che leggono soltanto: possono essere instradati verso una Replica.
 // Tutto il resto (scritture, PING, INFO, SAVE, SYNC) va sempre al Master.
 fn is_read_command(cmd: &str) -> bool {
     matches!(
         cmd.to_ascii_uppercase().as_str(),
-        "GET" | "MGET" | "LRANGE" | "LLEN" | "HGET" | "HGETALL"
-            | "SMEMBERS" | "SISMEMBER" | "EXISTS" | "TYPE" | "TTL"
-            | "KEYS" | "STRLEN"
+        "GET"
+            | "MGET"
+            | "LRANGE"
+            | "LLEN"
+            | "HGET"
+            | "HGETALL"
+            | "SMEMBERS"
+            | "SISMEMBER"
+            | "EXISTS"
+            | "TYPE"
+            | "TTL"
+            | "KEYS"
+            | "STRLEN"
     )
 }
- 
+
 struct Connection {
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
 }
- 
+
 async fn connect(addr: &str) -> Option<Connection> {
     match TcpStream::connect(addr).await {
         Ok(stream) => {
             let (r, w) = stream.into_split();
-            Some(Connection { reader: BufReader::new(r), writer: w })
+            Some(Connection {
+                reader: BufReader::new(r),
+                writer: w,
+            })
         }
         Err(e) => {
             println!("Impossibile connettersi a {}: {}", addr, e);
@@ -82,22 +95,24 @@ async fn connect(addr: &str) -> Option<Connection> {
         }
     }
 }
- 
+
 async fn send_and_read(conn: &mut Connection, command: &str) -> String {
     let encoded = encode_command(command);
     if conn.writer.write_all(encoded.as_bytes()).await.is_err() {
         return "(errore di scrittura, connessione persa)".to_string();
     }
-    read_reply(&mut conn.reader).await.unwrap_or_else(|e| format!("(errore di lettura: {})", e))
+    read_reply(&mut conn.reader)
+        .await
+        .unwrap_or_else(|e| format!("(errore di lettura: {})", e))
 }
- 
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
- 
+
     let mut master_addr = "127.0.0.1:6380".to_string();
     let mut replica_addrs: Vec<String> = Vec::new();
- 
+
     for i in 0..args.len() {
         if args[i] == "--port" && i + 1 < args.len() {
             master_addr = format!("127.0.0.1:{}", args[i + 1]);
@@ -106,20 +121,23 @@ async fn main() {
             master_addr = args[i + 1].clone();
         }
         if args[i] == "--replicas" && i + 1 < args.len() {
-            replica_addrs = args[i + 1].split(',').map(|s| s.trim().to_string()).collect();
+            replica_addrs = args[i + 1]
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
         }
     }
- 
+
     println!("OnyxDB CLI - Master: {}", master_addr);
     if !replica_addrs.is_empty() {
         println!("Repliche per le letture: {:?}", replica_addrs);
     }
- 
+
     let mut master_conn = match connect(&master_addr).await {
         Some(c) => c,
         None => return,
     };
- 
+
     // Teniamo indirizzo e connessione ACCOPPIATI: se una Replica fallisce la
     // connessione all'avvio viene scartata insieme al suo indirizzo, cosi'
     // gli indici restano sempre allineati (niente piu' mismatch tra "quale
@@ -131,14 +149,14 @@ async fn main() {
         }
     }
     let mut replica_index = 0usize;
- 
+
     println!("Connesso! Scrivi 'exit' per uscire.\n");
- 
+
     let stdin = io::stdin();
     loop {
         print!("onyx> ");
         io::stdout().flush().unwrap();
- 
+
         let mut input = String::new();
         if stdin.read_line(&mut input).unwrap() == 0 {
             break;
@@ -151,9 +169,9 @@ async fn main() {
             println!("Arrivederci!");
             break;
         }
- 
+
         let cmd_name = command.split_whitespace().next().unwrap_or("");
- 
+
         let reply = if is_read_command(cmd_name) && !replica_conns.is_empty() {
             let idx = replica_index % replica_conns.len();
             replica_index += 1;
@@ -164,8 +182,7 @@ async fn main() {
         } else {
             send_and_read(&mut master_conn, command).await
         };
- 
+
         println!("{}", reply);
     }
 }
- 

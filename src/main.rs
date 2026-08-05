@@ -1,24 +1,27 @@
-mod storage;
-mod resp;
 mod engine;
 mod protocol;
-use engine::{OnyxEngine, OnyxValue, DataEntry, EvictionPolicy};
-use protocol::OBPFrame;
+mod resp;
+mod storage;
 use bytes::Bytes;
-use flate2::write::GzEncoder;
-use flate2::read::GzDecoder;
+use engine::{DataEntry, EvictionPolicy, OnyxEngine, OnyxValue};
 use flate2::Compression;
-use tracing::{info, warn, error};
-use std::env;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use protocol::OBPFrame;
 use resp::{RESPValue, read_command};
+use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader as StdBufReader, BufWriter, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use tokio::io::{BufReader as TokioBufReader, BufWriter as TokioBufWriter, AsyncWriteExt, AsyncReadExt};use tokio::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{
+    AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter as TokioBufWriter,
+};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 // 1. ALLOCATORE DI MEMORIA AD ALTE PRESTAZIONI
 #[global_allocator]
@@ -33,7 +36,8 @@ const MAX_KEYS: usize = 1_000_000;
 /// è "chi ha una password valida può fare tutto", ma con utenti multipli
 /// invece di un'unica password condivisa. `--requirepass`/`ONYXDB_PASSWORD`
 /// restano supportati per compatibilità: diventano l'utente "default".
-static USERS: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+static USERS: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+    std::sync::OnceLock::new();
 
 fn auth_required() -> bool {
     USERS.get().map(|u| !u.is_empty()).unwrap_or(false)
@@ -48,7 +52,7 @@ fn check_credentials(username: &str, password: &str) -> bool {
 
 // ============================================================
 // FSYNC POLICY — quanto spesso forzare la scrittura fisica su disco del
-// binlog. 
+// binlog.
 // - Always:    fsync dopo ogni batch di scritture. Massima durabilità,
 //              più latenza per comando.
 // - EverySec:  fsync una volta al secondo in background (default, come Redis).
@@ -113,11 +117,13 @@ fn maxmemory_bytes() -> usize {
 }
 
 fn maxmemory_policy() -> EvictionPolicy {
-    *MAXMEMORY_POLICY.get().unwrap_or(&EvictionPolicy::NoEviction)
+    *MAXMEMORY_POLICY
+        .get()
+        .unwrap_or(&EvictionPolicy::NoEviction)
 }
 
 /// Converte una stringa tipo "100mb", "1gb", "500kb" o un numero puro di
-/// byte nel corrispondente valore in byte. 
+/// byte nel corrispondente valore in byte.
 /// (`--maxmemory 100mb`), case-insensitive.
 fn parse_memory_size(s: &str) -> Option<usize> {
     let s = s.trim().to_ascii_lowercase();
@@ -132,7 +138,11 @@ fn parse_memory_size(s: &str) -> Option<usize> {
     } else {
         (s.as_str(), 1)
     };
-    number_part.trim().parse::<usize>().ok().map(|n| n * multiplier)
+    number_part
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .map(|n| n * multiplier)
 }
 
 // 2. FAST TIME (Orologio di Sistema Cachato)
@@ -172,24 +182,26 @@ impl ShardedStore {
 
     // --- String operations ---
     pub fn set(&self, key: String, value: String) {
-        self.engine.set(Bytes::from(key), OnyxValue::Blob(Bytes::from(value)), None);
+        self.engine
+            .set(Bytes::from(key), OnyxValue::Blob(Bytes::from(value)), None);
     }
 
     pub fn set_raw(&self, key: String, entry: DataEntry) {
-        self.engine.set(Bytes::from(key), entry.value, entry.expires_at);
+        self.engine
+            .set(Bytes::from(key), entry.value, entry.expires_at);
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
-        self.engine.read(&Bytes::from(key.to_string()), |entry| {
-            match &entry.value {
+        self.engine
+            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
                 OnyxValue::Blob(b) => Some(String::from_utf8_lossy(b).to_string()),
                 OnyxValue::Int(n) => Some(n.to_string()),
                 OnyxValue::List(l) => Some(format!("{:?}", l)),
                 OnyxValue::Hash(h) => Some(format!("{:?}", h)),
                 OnyxValue::Set(s) => Some(format!("{:?}", s)),
                 _ => None,
-            }
-        }).flatten()
+            })
+            .flatten()
     }
 
     pub fn get_raw(&self, key: &str) -> Option<DataEntry> {
@@ -207,7 +219,8 @@ impl ShardedStore {
     pub fn expire_at(&self, key: &str, timestamp: u64) -> bool {
         // Un solo lock: imposta solo la scadenza, senza clonare il valore
         // (prima: get() dell'intera entry + set() di rimpiazzo).
-        self.engine.set_expiry(&Bytes::from(key.to_string()), timestamp)
+        self.engine
+            .set_expiry(&Bytes::from(key.to_string()), timestamp)
     }
 
     pub fn expire(&self, key: &str, seconds: u64) -> bool {
@@ -349,12 +362,18 @@ impl ShardedStore {
         let result = self.engine.update_if_exists(&key_b, |v| match v {
             OnyxValue::List(l) if !l.is_empty() => {
                 let item = l.remove(0);
-                (Some(String::from_utf8_lossy(&item).to_string()), l.is_empty())
+                (
+                    Some(String::from_utf8_lossy(&item).to_string()),
+                    l.is_empty(),
+                )
             }
             _ => (None, false),
         });
         match result {
-            Some((Some(item), true)) => { self.engine.delete(&key_b); Some(item) }
+            Some((Some(item), true)) => {
+                self.engine.delete(&key_b);
+                Some(item)
+            }
             Some((Some(item), false)) => Some(item),
             _ => None,
         }
@@ -365,12 +384,18 @@ impl ShardedStore {
         let result = self.engine.update_if_exists(&key_b, |v| match v {
             OnyxValue::List(l) if !l.is_empty() => {
                 let item = l.pop().unwrap();
-                (Some(String::from_utf8_lossy(&item).to_string()), l.is_empty())
+                (
+                    Some(String::from_utf8_lossy(&item).to_string()),
+                    l.is_empty(),
+                )
             }
             _ => (None, false),
         });
         match result {
-            Some((Some(item), true)) => { self.engine.delete(&key_b); Some(item) }
+            Some((Some(item), true)) => {
+                self.engine.delete(&key_b);
+                Some(item)
+            }
             Some((Some(item), false)) => Some(item),
             _ => None,
         }
@@ -382,30 +407,41 @@ impl ShardedStore {
     /// errore. `LRANGE chiave` (senza indici, dal vecchio comportamento)
     /// continua a funzionare passando start=0, stop=-1 dal chiamante.
     pub fn lrange(&self, key: &str, start: i64, stop: i64) -> Option<Vec<String>> {
-        self.engine.read(&Bytes::from(key.to_string()), |entry| {
-            match &entry.value {
+        self.engine
+            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
                 OnyxValue::List(l) => {
                     let len = l.len() as i64;
-                    if len == 0 { return Some(Vec::new()); }
+                    if len == 0 {
+                        return Some(Vec::new());
+                    }
                     let norm = |idx: i64| -> i64 { if idx < 0 { (len + idx).max(0) } else { idx } };
                     let s = norm(start);
                     let mut e = norm(stop);
-                    if s > len - 1 || s > e { return Some(Vec::new()); }
-                    if e > len - 1 { e = len - 1; }
-                    Some(l[s as usize..=e as usize].iter().map(|b| String::from_utf8_lossy(b).to_string()).collect())
+                    if s > len - 1 || s > e {
+                        return Some(Vec::new());
+                    }
+                    if e > len - 1 {
+                        e = len - 1;
+                    }
+                    Some(
+                        l[s as usize..=e as usize]
+                            .iter()
+                            .map(|b| String::from_utf8_lossy(b).to_string())
+                            .collect(),
+                    )
                 }
                 _ => None,
-            }
-        }).flatten()
+            })
+            .flatten()
     }
 
     pub fn llen(&self, key: &str) -> Option<usize> {
-        self.engine.read(&Bytes::from(key.to_string()), |entry| {
-            match &entry.value {
+        self.engine
+            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
                 OnyxValue::List(l) => Some(l.len()),
                 _ => None,
-            }
-        }).flatten()
+            })
+            .flatten()
     }
 
     // --- Hash operations ---
@@ -429,28 +465,34 @@ impl ShardedStore {
 
     pub fn hget(&self, key: &str, field: &str) -> Option<String> {
         let field_b = Bytes::from(field.to_string());
-        self.engine.read(&Bytes::from(key.to_string()), move |entry| {
-            match &entry.value {
-                OnyxValue::Hash(h) => h.get(&field_b).map(|b| String::from_utf8_lossy(b).to_string()),
-                _ => None,
-            }
-        }).flatten()
+        self.engine
+            .read(&Bytes::from(key.to_string()), move |entry| {
+                match &entry.value {
+                    OnyxValue::Hash(h) => h
+                        .get(&field_b)
+                        .map(|b| String::from_utf8_lossy(b).to_string()),
+                    _ => None,
+                }
+            })
+            .flatten()
     }
 
     pub fn hgetall(&self, key: &str) -> Option<Vec<(String, String)>> {
-        self.engine.read(&Bytes::from(key.to_string()), |entry| {
-            match &entry.value {
-                OnyxValue::Hash(h) => {
-                    Some(h.iter().map(|(k, v)| {
-                        (
-                            String::from_utf8_lossy(k).to_string(),
-                            String::from_utf8_lossy(v).to_string(),
-                        )
-                    }).collect())
-                }
+        self.engine
+            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
+                OnyxValue::Hash(h) => Some(
+                    h.iter()
+                        .map(|(k, v)| {
+                            (
+                                String::from_utf8_lossy(k).to_string(),
+                                String::from_utf8_lossy(v).to_string(),
+                            )
+                        })
+                        .collect(),
+                ),
                 _ => None,
-            }
-        }).flatten()
+            })
+            .flatten()
     }
 
     pub fn hdel(&self, key: &str, field: &str) -> bool {
@@ -464,18 +506,23 @@ impl ShardedStore {
             _ => (false, false),
         });
         match result {
-            Some((removed, true)) => { self.engine.delete(&key_b); removed }
+            Some((removed, true)) => {
+                self.engine.delete(&key_b);
+                removed
+            }
             Some((removed, false)) => removed,
             None => false,
         }
     }
 
     pub fn hkeys(&self, key: &str) -> Option<Vec<String>> {
-        self.hgetall(key).map(|h| h.into_iter().map(|(k, _)| k).collect())
+        self.hgetall(key)
+            .map(|h| h.into_iter().map(|(k, _)| k).collect())
     }
 
     pub fn hvals(&self, key: &str) -> Option<Vec<String>> {
-        self.hgetall(key).map(|h| h.into_iter().map(|(_, v)| v).collect())
+        self.hgetall(key)
+            .map(|h| h.into_iter().map(|(_, v)| v).collect())
     }
 
     // --- Set operations ---
@@ -497,14 +544,16 @@ impl ShardedStore {
     }
 
     pub fn smembers(&self, key: &str) -> Option<Vec<String>> {
-        self.engine.read(&Bytes::from(key.to_string()), |entry| {
-            match &entry.value {
-                OnyxValue::Set(s) => {
-                    Some(s.iter().map(|b| String::from_utf8_lossy(b).to_string()).collect())
-                }
+        self.engine
+            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
+                OnyxValue::Set(s) => Some(
+                    s.iter()
+                        .map(|b| String::from_utf8_lossy(b).to_string())
+                        .collect(),
+                ),
                 _ => None,
-            }
-        }).flatten()
+            })
+            .flatten()
     }
 
     pub fn srem(&self, key: &str, member: &str) -> bool {
@@ -518,7 +567,10 @@ impl ShardedStore {
             _ => (false, false),
         });
         match result {
-            Some((removed, true)) => { self.engine.delete(&key_b); removed }
+            Some((removed, true)) => {
+                self.engine.delete(&key_b);
+                removed
+            }
             Some((removed, false)) => removed,
             None => false,
         }
@@ -526,19 +578,26 @@ impl ShardedStore {
 
     pub fn sismember(&self, key: &str, member: &str) -> bool {
         let member_b = Bytes::from(member.to_string());
-        self.engine.read(&Bytes::from(key.to_string()), move |entry| {
-            match &entry.value {
-                OnyxValue::Set(s) => s.contains(&member_b),
-                _ => false,
-            }
-        }).unwrap_or(false)
+        self.engine
+            .read(&Bytes::from(key.to_string()), move |entry| {
+                match &entry.value {
+                    OnyxValue::Set(s) => s.contains(&member_b),
+                    _ => false,
+                }
+            })
+            .unwrap_or(false)
     }
     // --- JSON operations ---
 
     /// JSON.SET: se path == "$", sostituisce l'intero documento (creandolo
     /// se la chiave non esiste). Con un path parziale, la chiave deve già
     /// esistere e contenere un valore JSON.
-    pub fn json_set(&self, key: &str, path: &str, new_value: serde_json::Value) -> Result<(), &'static str> {
+    pub fn json_set(
+        &self,
+        key: &str,
+        path: &str,
+        new_value: serde_json::Value,
+    ) -> Result<(), &'static str> {
         let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
         let key_b = Bytes::from(key.to_string());
 
@@ -555,7 +614,9 @@ impl ShardedStore {
         });
         match result {
             Some(Some(true)) => Ok(()),
-            Some(Some(false)) => Err("ERR path non raggiungibile (elemento intermedio assente o indice fuori range)"),
+            Some(Some(false)) => {
+                Err("ERR path non raggiungibile (elemento intermedio assente o indice fuori range)")
+            }
             Some(None) => Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON"),
             None => Err("ERR chiave inesistente: usa JSON.SET chiave $ {...} per crearla"),
         }
@@ -563,20 +624,24 @@ impl ShardedStore {
 
     pub fn json_get(&self, key: &str, path: &str) -> Result<Option<String>, &'static str> {
         let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
-        let result = self.engine.read(&Bytes::from(key.to_string()), move |entry| match &entry.value {
-            OnyxValue::Json(root) => {
-                if segments.is_empty() {
-                    Some(root.to_string())
-                } else {
-                    get_json_path(root, &segments).map(|v| v.to_string())
+        let result = self
+            .engine
+            .read(&Bytes::from(key.to_string()), move |entry| {
+                match &entry.value {
+                    OnyxValue::Json(root) => {
+                        if segments.is_empty() {
+                            Some(root.to_string())
+                        } else {
+                            get_json_path(root, &segments).map(|v| v.to_string())
+                        }
+                    }
+                    _ => None,
                 }
-            }
-            _ => None,
-        });
+            });
         match result {
             Some(Some(s)) => Ok(Some(s)),
             Some(None) => Ok(None), // chiave JSON esiste ma il path non trova nulla
-            None => Ok(None),        // chiave inesistente
+            None => Ok(None),       // chiave inesistente
         }
     }
 
@@ -600,20 +665,28 @@ impl ShardedStore {
 
     pub fn json_type(&self, key: &str, path: &str) -> Result<Option<&'static str>, &'static str> {
         let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
-        let result = self.engine.read(&Bytes::from(key.to_string()), move |entry| match &entry.value {
-            OnyxValue::Json(root) => {
-                let node = if segments.is_empty() { Some(root) } else { get_json_path(root, &segments) };
-                node.map(|v| match v {
-                    serde_json::Value::Null => "null",
-                    serde_json::Value::Bool(_) => "boolean",
-                    serde_json::Value::Number(_) => "number",
-                    serde_json::Value::String(_) => "string",
-                    serde_json::Value::Array(_) => "array",
-                    serde_json::Value::Object(_) => "object",
-                })
-            }
-            _ => None,
-        });
+        let result = self
+            .engine
+            .read(&Bytes::from(key.to_string()), move |entry| {
+                match &entry.value {
+                    OnyxValue::Json(root) => {
+                        let node = if segments.is_empty() {
+                            Some(root)
+                        } else {
+                            get_json_path(root, &segments)
+                        };
+                        node.map(|v| match v {
+                            serde_json::Value::Null => "null",
+                            serde_json::Value::Bool(_) => "boolean",
+                            serde_json::Value::Number(_) => "number",
+                            serde_json::Value::String(_) => "string",
+                            serde_json::Value::Array(_) => "array",
+                            serde_json::Value::Object(_) => "object",
+                        })
+                    }
+                    _ => None,
+                }
+            });
         Ok(result.flatten())
     }
     pub fn json_numincrby(&self, key: &str, path: &str, delta: f64) -> Result<f64, String> {
@@ -626,12 +699,19 @@ impl ShardedStore {
         match result {
             Some(Some(Ok(new_val))) => Ok(new_val),
             Some(Some(Err(e))) => Err(e.to_string()),
-            Some(None) => Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON".to_string()),
+            Some(None) => {
+                Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON".to_string())
+            }
             None => Err("ERR chiave inesistente".to_string()),
         }
     }
 
-    pub fn json_arrappend(&self, key: &str, path: &str, new_value: serde_json::Value) -> Result<usize, String> {
+    pub fn json_arrappend(
+        &self,
+        key: &str,
+        path: &str,
+        new_value: serde_json::Value,
+    ) -> Result<usize, String> {
         let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
         let key_b = Bytes::from(key.to_string());
         let result = self.engine.update_if_exists(&key_b, move |v| match v {
@@ -641,41 +721,63 @@ impl ShardedStore {
         match result {
             Some(Some(Ok(new_len))) => Ok(new_len),
             Some(Some(Err(e))) => Err(e.to_string()),
-            Some(None) => Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON".to_string()),
+            Some(None) => {
+                Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON".to_string())
+            }
             None => Err("ERR chiave inesistente".to_string()),
         }
     }
     pub fn json_arrlen(&self, key: &str, path: &str) -> Result<Option<usize>, String> {
         let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
-        let result = self.engine.read(&Bytes::from(key.to_string()), move |entry| match &entry.value {
-            OnyxValue::Json(root) => {
-                let node = if segments.is_empty() { Some(root) } else { get_json_path(root, &segments) };
-                node.and_then(|v| v.as_array().map(|a| a.len()))
-            }
-            _ => None,
-        });
+        let result = self
+            .engine
+            .read(&Bytes::from(key.to_string()), move |entry| {
+                match &entry.value {
+                    OnyxValue::Json(root) => {
+                        let node = if segments.is_empty() {
+                            Some(root)
+                        } else {
+                            get_json_path(root, &segments)
+                        };
+                        node.and_then(|v| v.as_array().map(|a| a.len()))
+                    }
+                    _ => None,
+                }
+            });
         Ok(result.flatten())
     }
 
     pub fn json_objkeys(&self, key: &str, path: &str) -> Result<Option<Vec<String>>, String> {
         let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
-        let result = self.engine.read(&Bytes::from(key.to_string()), move |entry| match &entry.value {
-            OnyxValue::Json(root) => {
-                let node = if segments.is_empty() { Some(root) } else { get_json_path(root, &segments) };
-                node.and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
-            }
-            _ => None,
-        });
+        let result = self
+            .engine
+            .read(&Bytes::from(key.to_string()), move |entry| {
+                match &entry.value {
+                    OnyxValue::Json(root) => {
+                        let node = if segments.is_empty() {
+                            Some(root)
+                        } else {
+                            get_json_path(root, &segments)
+                        };
+                        node.and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
+                    }
+                    _ => None,
+                }
+            });
         Ok(result.flatten())
     }
     // --- Key operations ---
     pub fn rename(&self, old_key: &str, new_key: &str) -> bool {
-        self.engine.rename(&Bytes::from(old_key.to_string()), Bytes::from(new_key.to_string()))
+        self.engine.rename(
+            &Bytes::from(old_key.to_string()),
+            Bytes::from(new_key.to_string()),
+        )
     }
 
     pub fn copy(&self, src: &str, dst: &str) -> bool {
         if let Some(entry) = self.engine.get(&Bytes::from(src.to_string())) {
-            self.engine.set(Bytes::from(dst.to_string()), entry.value, entry.expires_at);
+            self.engine
+                .set(Bytes::from(dst.to_string()), entry.value, entry.expires_at);
             true
         } else {
             false
@@ -683,15 +785,16 @@ impl ShardedStore {
     }
 
     pub fn value_type(&self, key: &str) -> Option<&'static str> {
-        self.engine.read(&Bytes::from(key.to_string()), |entry| match &entry.value {
-            OnyxValue::Blob(_) => "string",
-            OnyxValue::Int(_) | OnyxValue::Float(_) => "int",
-            OnyxValue::List(_) => "list",
-            OnyxValue::Hash(_) => "hash",
-            OnyxValue::Set(_) => "set",
-            OnyxValue::Json(_) => "json",
-            OnyxValue::Vector(_) => "vector",
-        })
+        self.engine
+            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
+                OnyxValue::Blob(_) => "string",
+                OnyxValue::Int(_) | OnyxValue::Float(_) => "int",
+                OnyxValue::List(_) => "list",
+                OnyxValue::Hash(_) => "hash",
+                OnyxValue::Set(_) => "set",
+                OnyxValue::Json(_) => "json",
+                OnyxValue::Vector(_) => "vector",
+            })
     }
 
     pub fn all_keys(&self) -> Vec<String> {
@@ -706,7 +809,10 @@ impl ShardedStore {
         if pattern == "*" || pattern.is_empty() {
             return self.all_keys();
         }
-        self.all_keys().into_iter().filter(|k| glob_match(pattern, k)).collect()
+        self.all_keys()
+            .into_iter()
+            .filter(|k| glob_match(pattern, k))
+            .collect()
     }
 
     pub fn snapshot_entries(&self) -> Vec<(String, DataEntry)> {
@@ -761,7 +867,9 @@ impl ShardedStore {
     }
 
     pub fn get_expiry(&self, key: &str) -> Option<u64> {
-        self.engine.read(&Bytes::from(key.to_string()), |e| e.expires_at).flatten()
+        self.engine
+            .read(&Bytes::from(key.to_string()), |e| e.expires_at)
+            .flatten()
     }
 
     pub fn stats(&self) -> engine::EngineStats {
@@ -774,7 +882,7 @@ impl ShardedStore {
     pub fn engine(&self) -> &OnyxEngine {
         &self.engine
     }
- }
+}
 fn is_expired(entry: &DataEntry) -> bool {
     if let Some(exp) = entry.expires_at {
         now() >= exp
@@ -852,7 +960,10 @@ fn parse_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
 /// Naviga `root` seguendo `segments` e ritorna un riferimento al nodo
 /// finale, se esiste. None se un passo intermedio non esiste o non è del
 /// tipo giusto.
-fn get_json_path<'a>(root: &'a serde_json::Value, segments: &[JsonPathSegment]) -> Option<&'a serde_json::Value> {
+fn get_json_path<'a>(
+    root: &'a serde_json::Value,
+    segments: &[JsonPathSegment],
+) -> Option<&'a serde_json::Value> {
     let mut current = root;
     for seg in segments {
         current = match (seg, current) {
@@ -867,7 +978,11 @@ fn get_json_path<'a>(root: &'a serde_json::Value, segments: &[JsonPathSegment]) 
 /// Imposta il valore al path indicato, creando l'ultimo passo se manca ma
 /// SENZA creare automaticamente livelli intermedi assenti. Ritorna true se ha scritto, false se il genitore del
 /// passo finale non esiste o non è del tipo compatibile.
-fn set_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment], new_value: serde_json::Value) -> bool {
+fn set_json_path(
+    root: &mut serde_json::Value,
+    segments: &[JsonPathSegment],
+    new_value: serde_json::Value,
+) -> bool {
     if segments.is_empty() {
         *root = new_value;
         return true;
@@ -918,12 +1033,10 @@ fn delete_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment]) 
     let mut current = root;
     for seg in &segments[..segments.len() - 1] {
         current = match (seg, current) {
-            (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => {
-                match map.get_mut(f) {
-                    Some(v) => v,
-                    None => return false,
-                }
-            }
+            (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => match map.get_mut(f) {
+                Some(v) => v,
+                None => return false,
+            },
             (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => {
                 match arr.get_mut(*idx) {
                     Some(v) => v,
@@ -950,7 +1063,10 @@ fn delete_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment]) 
 /// differenza di get_json_path che ritorna solo &). Serve per
 /// NUMINCRBY/ARRAPPEND, che modificano il nodo in-place invece di
 /// sostituirlo interamente come fa SET.
-fn get_json_path_mut<'a>(root: &'a mut serde_json::Value, segments: &[JsonPathSegment]) -> Option<&'a mut serde_json::Value> {
+fn get_json_path_mut<'a>(
+    root: &'a mut serde_json::Value,
+    segments: &[JsonPathSegment],
+) -> Option<&'a mut serde_json::Value> {
     let mut current = root;
     for seg in segments {
         current = match (seg, current) {
@@ -966,14 +1082,21 @@ fn get_json_path_mut<'a>(root: &'a mut serde_json::Value, segments: &[JsonPathSe
 /// path non esiste (comportamento diverso da INCR su chiave stringa): dentro
 /// un documento JSON un path assente è più probabilmente un errore di
 /// battitura da segnalare che un "parti da zero" implicito.
-fn numincrby_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment], delta: f64) -> Result<f64, &'static str> {
+fn numincrby_json_path(
+    root: &mut serde_json::Value,
+    segments: &[JsonPathSegment],
+    delta: f64,
+) -> Result<f64, &'static str> {
     let node = get_json_path_mut(root, segments).ok_or("ERR path JSON non trovato")?;
-    let current = node.as_f64().ok_or("WRONGTYPE il valore al path non è un numero")?;
+    let current = node
+        .as_f64()
+        .ok_or("WRONGTYPE il valore al path non è un numero")?;
     let new_val = current + delta;
     let new_number = if new_val.fract() == 0.0 && new_val.abs() < i64::MAX as f64 {
         serde_json::Number::from(new_val as i64)
     } else {
-        serde_json::Number::from_f64(new_val).ok_or("ERR risultato numerico non valido (NaN o infinito)")?
+        serde_json::Number::from_f64(new_val)
+            .ok_or("ERR risultato numerico non valido (NaN o infinito)")?
     };
     *node = serde_json::Value::Number(new_number);
     Ok(new_val)
@@ -981,7 +1104,11 @@ fn numincrby_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment
 
 /// Aggiunge un elemento in coda all'array al path indicato. Errore se il
 /// path non esiste o non punta a un array.
-fn arrappend_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment], new_value: serde_json::Value) -> Result<usize, &'static str> {
+fn arrappend_json_path(
+    root: &mut serde_json::Value,
+    segments: &[JsonPathSegment],
+    new_value: serde_json::Value,
+) -> Result<usize, &'static str> {
     let node = get_json_path_mut(root, segments).ok_or("ERR path JSON non trovato")?;
     match node {
         serde_json::Value::Array(arr) => {
@@ -1036,7 +1163,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 const BACKLOG_CAPACITY: usize = 10_000;
 
 enum LogMessage {
-    Append(Vec<u8>),  // modificato il 07/26 in Vec<u8> (binario)
+    Append(Vec<u8>), // modificato il 07/26 in Vec<u8> (binario)
     Compact,
 }
 
@@ -1078,7 +1205,8 @@ struct Persistence {
     next_subscriber_id: AtomicU64,
     // canale -> insieme di id di subscriber iscritti, usato solo per dare
     // a PUBLISH il numero di destinatari (Redis fa lo stesso).
-    subscriptions: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<u64>>>,
+    subscriptions:
+        std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<u64>>>,
 }
 
 // ============================================================
@@ -1135,14 +1263,18 @@ fn write_u64_be(buf: &mut Vec<u8>, val: u64) {
 // crashare il processo — nel peggiore dei casi si perde quel singolo
 // record, non l'intero avvio.
 fn read_u16_be(bytes: &[u8], offset: &mut usize) -> Option<u16> {
-    if offset.checked_add(2)? > bytes.len() { return None; }
+    if offset.checked_add(2)? > bytes.len() {
+        return None;
+    }
     let val = ((bytes[*offset] as u16) << 8) | (bytes[*offset + 1] as u16);
     *offset += 2;
     Some(val)
 }
 
 fn read_u32_be(bytes: &[u8], offset: &mut usize) -> Option<u32> {
-    if offset.checked_add(4)? > bytes.len() { return None; }
+    if offset.checked_add(4)? > bytes.len() {
+        return None;
+    }
     let val = ((bytes[*offset] as u32) << 24)
         | ((bytes[*offset + 1] as u32) << 16)
         | ((bytes[*offset + 2] as u32) << 8)
@@ -1152,7 +1284,9 @@ fn read_u32_be(bytes: &[u8], offset: &mut usize) -> Option<u32> {
 }
 
 fn read_u64_be(bytes: &[u8], offset: &mut usize) -> Option<u64> {
-    if offset.checked_add(8)? > bytes.len() { return None; }
+    if offset.checked_add(8)? > bytes.len() {
+        return None;
+    }
     let val = ((bytes[*offset] as u64) << 56)
         | ((bytes[*offset + 1] as u64) << 48)
         | ((bytes[*offset + 2] as u64) << 40)
@@ -1173,7 +1307,11 @@ fn safe_slice(bytes: &[u8], offset: usize, len: usize) -> Option<&[u8]> {
 }
 
 /// Converte un comando + entry in record binario per il log
-fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntry>) -> Option<Vec<u8>> {
+fn command_to_binary_record(
+    cmd: &str,
+    args: &[String],
+    _entry: Option<&DataEntry>,
+) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(256);
     let op_code = match cmd {
         "SET" | "GETSET" | "SETNX" | "MSET" => OP_SET,
@@ -1198,12 +1336,14 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
         "COPY" => OP_COPY,
         _ => return None, // Comando non persistente
     };
-    
+
     buf.push(op_code);
-    
+
     match cmd {
         "SET" | "GETSET" | "SETNX" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let key = &args[1];
             let value = &args[2];
             write_u16_be(&mut buf, key.len() as u16);
@@ -1223,7 +1363,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             write_u64_be(&mut buf, expiry);
         }
         "MSET" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             buf[0] = OP_MSET;
             let num_pairs = (args.len() - 1) / 2;
             write_u16_be(&mut buf, num_pairs as u16);
@@ -1240,13 +1382,17 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             return Some(buf);
         }
         "DEL" => {
-            if args.len() < 2 { return None; }
+            if args.len() < 2 {
+                return None;
+            }
             let key = &args[1];
             write_u16_be(&mut buf, key.len() as u16);
             buf.extend_from_slice(key.as_bytes());
         }
         "EXPIRE" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let key = &args[1];
             let seconds = args[2].parse::<u64>().unwrap_or(0);
             write_u16_be(&mut buf, key.len() as u16);
@@ -1254,7 +1400,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             write_u64_be(&mut buf, seconds);
         }
         "EXPIREAT" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let key = &args[1];
             let timestamp = args[2].parse::<u64>().unwrap_or(0);
             buf[0] = OP_EXPIRE; // stesso codice, timestamp assoluto
@@ -1263,7 +1411,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             write_u64_be(&mut buf, timestamp);
         }
         "LPUSH" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let key = &args[1];
             let item = &args[2];
             write_u16_be(&mut buf, key.len() as u16);
@@ -1272,7 +1422,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             buf.extend_from_slice(item.as_bytes());
         }
         "RPUSH" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let key = &args[1];
             let item = &args[2];
             write_u16_be(&mut buf, key.len() as u16);
@@ -1281,13 +1433,17 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             buf.extend_from_slice(item.as_bytes());
         }
         "LPOP" | "RPOP" => {
-            if args.len() < 2 { return None; }
+            if args.len() < 2 {
+                return None;
+            }
             let key = &args[1];
             write_u16_be(&mut buf, key.len() as u16);
             buf.extend_from_slice(key.as_bytes());
         }
         "HSET" => {
-            if args.len() < 4 { return None; }
+            if args.len() < 4 {
+                return None;
+            }
             let key = &args[1];
             let field = &args[2];
             let value = &args[3];
@@ -1299,7 +1455,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             buf.extend_from_slice(value.as_bytes());
         }
         "SADD" | "SREM" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let key = &args[1];
             let member = &args[2];
             write_u16_be(&mut buf, key.len() as u16);
@@ -1308,7 +1466,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             buf.extend_from_slice(member.as_bytes());
         }
         "RENAME" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let old_key = &args[1];
             let new_key = &args[2];
             write_u16_be(&mut buf, old_key.len() as u16);
@@ -1317,15 +1477,23 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             buf.extend_from_slice(new_key.as_bytes());
         }
         "INCR" | "INCRBY" => {
-            if args.len() < 2 { return None; }
+            if args.len() < 2 {
+                return None;
+            }
             let key = &args[1];
-            let delta = if cmd == "INCR" { 1 } else { args.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(1) };
+            let delta = if cmd == "INCR" {
+                1
+            } else {
+                args.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(1)
+            };
             write_u16_be(&mut buf, key.len() as u16);
             buf.extend_from_slice(key.as_bytes());
             write_u64_be(&mut buf, delta as u64);
         }
         "DECRBY" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let key = &args[1];
             let delta = args[2].parse::<i64>().unwrap_or(1);
             write_u16_be(&mut buf, key.len() as u16);
@@ -1333,7 +1501,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             write_u64_be(&mut buf, delta.abs() as u64);
         }
         "APPEND" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let key = &args[1];
             let suffix = &args[2];
             write_u16_be(&mut buf, key.len() as u16);
@@ -1342,7 +1512,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             buf.extend_from_slice(suffix.as_bytes());
         }
         "HDEL" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let key = &args[1];
             let field = &args[2];
             write_u16_be(&mut buf, key.len() as u16);
@@ -1352,7 +1524,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
         }
         "JSON.SET" => {
             // args: ["JSON.SET", key, path, value_json_compatto]
-            if args.len() < 4 { return None; }
+            if args.len() < 4 {
+                return None;
+            }
             let key = &args[1];
             let path = &args[2];
             let value = &args[3];
@@ -1365,7 +1539,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
         }
         "JSON.DEL" => {
             // args: ["JSON.DEL", key, path]
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let key = &args[1];
             let path = &args[2];
             write_u16_be(&mut buf, key.len() as u16);
@@ -1375,7 +1551,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
         }
         "JSON.NUMINCRBY" => {
             // args: ["JSON.NUMINCRBY", key, path, delta_come_stringa]
-            if args.len() < 4 { return None; }
+            if args.len() < 4 {
+                return None;
+            }
             let key = &args[1];
             let path = &args[2];
             let delta = &args[3];
@@ -1388,7 +1566,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
         }
         "JSON.ARRAPPEND" => {
             // args: ["JSON.ARRAPPEND", key, path, value_json_compatto]
-            if args.len() < 4 { return None; }
+            if args.len() < 4 {
+                return None;
+            }
             let key = &args[1];
             let path = &args[2];
             let value = &args[3];
@@ -1400,7 +1580,9 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
             buf.extend_from_slice(value.as_bytes());
         }
         "COPY" => {
-            if args.len() < 3 { return None; }
+            if args.len() < 3 {
+                return None;
+            }
             let src = &args[1];
             let dst = &args[2];
             write_u16_be(&mut buf, src.len() as u16);
@@ -1410,23 +1592,26 @@ fn command_to_binary_record(cmd: &str, args: &[String], _entry: Option<&DataEntr
         }
         _ => return None,
     }
-    
+
     Some(buf)
 }
 
 /// Legge un record binario e lo converte in args per execute_command
 fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
-    if record.is_empty() { return None; }
-    
+    if record.is_empty() {
+        return None;
+    }
+
     let op = record[0];
     let mut offset = 1;
-    
+
     match op {
         OP_SET => {
             let key_len = read_u16_be(record, &mut offset)? as usize;
             let key = String::from_utf8_lossy(safe_slice(record, offset, key_len)?).to_string();
             offset += key_len;
-            let _val_type = *record.get(offset)?; offset += 1;
+            let _val_type = *record.get(offset)?;
+            offset += 1;
             let val_len = read_u32_be(record, &mut offset)? as usize;
             let value = String::from_utf8_lossy(safe_slice(record, offset, val_len)?).to_string();
             offset += val_len;
@@ -1435,7 +1620,13 @@ fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
             // significa che "nessuna scadenza" (comportamento invariato).
             let expiry = read_u64_be(record, &mut offset).unwrap_or(0);
             if expiry > 0 {
-                Some(vec!["SET".to_string(), key, value, "EXAT".to_string(), expiry.to_string()])
+                Some(vec![
+                    "SET".to_string(),
+                    key,
+                    value,
+                    "EXAT".to_string(),
+                    expiry.to_string(),
+                ])
             } else {
                 Some(vec!["SET".to_string(), key, value])
             }
@@ -1448,7 +1639,8 @@ fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
                 let key = String::from_utf8_lossy(safe_slice(record, offset, key_len)?).to_string();
                 offset += key_len;
                 let val_len = read_u32_be(record, &mut offset)? as usize;
-                let value = String::from_utf8_lossy(safe_slice(record, offset, val_len)?).to_string();
+                let value =
+                    String::from_utf8_lossy(safe_slice(record, offset, val_len)?).to_string();
                 offset += val_len;
                 args.push(key);
                 args.push(value);
@@ -1509,7 +1701,8 @@ fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
             let key = String::from_utf8_lossy(safe_slice(record, offset, key_len)?).to_string();
             offset += key_len;
             let member_len = read_u32_be(record, &mut offset)? as usize;
-            let member = String::from_utf8_lossy(safe_slice(record, offset, member_len)?).to_string();
+            let member =
+                String::from_utf8_lossy(safe_slice(record, offset, member_len)?).to_string();
             Some(vec!["SADD".to_string(), key, member])
         }
         OP_SREM => {
@@ -1517,7 +1710,8 @@ fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
             let key = String::from_utf8_lossy(safe_slice(record, offset, key_len)?).to_string();
             offset += key_len;
             let member_len = read_u32_be(record, &mut offset)? as usize;
-            let member = String::from_utf8_lossy(safe_slice(record, offset, member_len)?).to_string();
+            let member =
+                String::from_utf8_lossy(safe_slice(record, offset, member_len)?).to_string();
             Some(vec!["SREM".to_string(), key, member])
         }
         OP_RENAME => {
@@ -1547,7 +1741,8 @@ fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
             let key = String::from_utf8_lossy(safe_slice(record, offset, key_len)?).to_string();
             offset += key_len;
             let suffix_len = read_u32_be(record, &mut offset)? as usize;
-            let suffix = String::from_utf8_lossy(safe_slice(record, offset, suffix_len)?).to_string();
+            let suffix =
+                String::from_utf8_lossy(safe_slice(record, offset, suffix_len)?).to_string();
             Some(vec!["APPEND".to_string(), key, suffix])
         }
         OP_HDEL => {
@@ -1626,7 +1821,10 @@ fn line_to_entry(line: &str) -> Option<(String, DataEntry)> {
             let items: Vec<Bytes> = if val_str.is_empty() {
                 Vec::new()
             } else {
-                val_str.split('|').map(|s| Bytes::from(s.to_string())).collect()
+                val_str
+                    .split('|')
+                    .map(|s| Bytes::from(s.to_string()))
+                    .collect()
             };
             Some(OnyxValue::List(items))
         }
@@ -1641,14 +1839,17 @@ fn line_to_entry(line: &str) -> Option<(String, DataEntry)> {
             }
             Some(OnyxValue::Hash(map))
         }
-        "JSON" => {
-            serde_json::from_str::<serde_json::Value>(val_str).ok().map(OnyxValue::Json)
-        }
+        "JSON" => serde_json::from_str::<serde_json::Value>(val_str)
+            .ok()
+            .map(OnyxValue::Json),
         "SET" => {
             let set: std::collections::HashSet<Bytes> = if val_str.is_empty() {
                 std::collections::HashSet::new()
             } else {
-                val_str.split('|').map(|s| Bytes::from(s.to_string())).collect()
+                val_str
+                    .split('|')
+                    .map(|s| Bytes::from(s.to_string()))
+                    .collect()
             };
             Some(OnyxValue::Set(set))
         }
@@ -1656,7 +1857,15 @@ fn line_to_entry(line: &str) -> Option<(String, DataEntry)> {
     }?;
 
     let ts = now();
-    Some((key, DataEntry { value, expires_at, created_at: ts, last_accessed: ts }))
+    Some((
+        key,
+        DataEntry {
+            value,
+            expires_at,
+            created_at: ts,
+            last_accessed: ts,
+        },
+    ))
 }
 
 fn value_to_line(key: &str, entry: &DataEntry) -> String {
@@ -1674,7 +1883,13 @@ fn value_to_line(key: &str, entry: &DataEntry) -> String {
         OnyxValue::Hash(map) => (
             "HASH",
             map.iter()
-                .map(|(k, v)| format!("{}={}", String::from_utf8_lossy(k), String::from_utf8_lossy(v)))
+                .map(|(k, v)| {
+                    format!(
+                        "{}={}",
+                        String::from_utf8_lossy(k),
+                        String::from_utf8_lossy(v)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("|"),
         ),
@@ -1700,10 +1915,31 @@ fn value_to_line(key: &str, entry: &DataEntry) -> String {
 fn is_write_command(cmd: &str) -> bool {
     matches!(
         cmd,
-        "SET" | "GETSET" | "SETNX" | "MSET" | "DEL" | "EXPIRE" | "EXPIREAT"
-            | "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "HSET" | "SADD" | "RENAME"
-            | "INCR" | "INCRBY" | "DECRBY" | "APPEND" | "HDEL" | "SREM" | "COPY"
-            | "JSON.SET" | "JSON.DEL" | "JSON.NUMINCRBY" | "JSON.ARRAPPEND"
+        "SET"
+            | "GETSET"
+            | "SETNX"
+            | "MSET"
+            | "DEL"
+            | "EXPIRE"
+            | "EXPIREAT"
+            | "LPUSH"
+            | "RPUSH"
+            | "LPOP"
+            | "RPOP"
+            | "HSET"
+            | "SADD"
+            | "RENAME"
+            | "INCR"
+            | "INCRBY"
+            | "DECRBY"
+            | "APPEND"
+            | "HDEL"
+            | "SREM"
+            | "COPY"
+            | "JSON.SET"
+            | "JSON.DEL"
+            | "JSON.NUMINCRBY"
+            | "JSON.ARRAPPEND"
     )
 }
 /// Un resync parziale è ammissibile solo se il replication ID richiesto
@@ -1733,13 +1969,26 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
     let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
     let arg = args.get(2).map(|s| s.as_str()).unwrap_or("");
 
-    const CREATE_COMMANDS: &[&str] = &["SET", "LPUSH", "RPUSH", "HSET", "SADD", "MSET", "APPEND", "GETSET", "INCRBY", "DECRBY", "INCR", "JSON.SET"];
+    const CREATE_COMMANDS: &[&str] = &[
+        "SET", "LPUSH", "RPUSH", "HSET", "SADD", "MSET", "APPEND", "GETSET", "INCRBY", "DECRBY",
+        "INCR", "JSON.SET",
+    ];
     if CREATE_COMMANDS.contains(&cmd) && !key.is_empty() && !store.exists(key) {
         if store.is_full() {
-            return (RESPValue::Error("ERR database pieno: limite massimo di chiavi raggiunto".to_string()), false);
+            return (
+                RESPValue::Error(
+                    "ERR database pieno: limite massimo di chiavi raggiunto".to_string(),
+                ),
+                false,
+            );
         }
         if !store.make_room_for_write() {
-            return (RESPValue::Error("OOM command not allowed when used memory > 'maxmemory'".to_string()), false);
+            return (
+                RESPValue::Error(
+                    "OOM command not allowed when used memory > 'maxmemory'".to_string(),
+                ),
+                false,
+            );
         }
     }
 
@@ -1757,20 +2006,47 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
             while i < args.len() {
                 match args[i].to_uppercase().as_str() {
                     "EX" => match args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
-                        Some(secs) => { expires_at = Some(now() + secs); i += 2; }
-                        None => { valid = false; break; }
+                        Some(secs) => {
+                            expires_at = Some(now() + secs);
+                            i += 2;
+                        }
+                        None => {
+                            valid = false;
+                            break;
+                        }
                     },
                     "PX" => match args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
-                        Some(millis) => { expires_at = Some(now() + millis / 1000); i += 2; }
-                        None => { valid = false; break; }
+                        Some(millis) => {
+                            expires_at = Some(now() + millis / 1000);
+                            i += 2;
+                        }
+                        None => {
+                            valid = false;
+                            break;
+                        }
                     },
                     "EXAT" => match args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
-                        Some(ts) => { expires_at = Some(ts); i += 2; }
-                        None => { valid = false; break; }
+                        Some(ts) => {
+                            expires_at = Some(ts);
+                            i += 2;
+                        }
+                        None => {
+                            valid = false;
+                            break;
+                        }
                     },
-                    "NX" => { condition = Some(true); i += 1; }
-                    "XX" => { condition = Some(false); i += 1; }
-                    _ => { valid = false; break; }
+                    "NX" => {
+                        condition = Some(true);
+                        i += 1;
+                    }
+                    "XX" => {
+                        condition = Some(false);
+                        i += 1;
+                    }
+                    _ => {
+                        valid = false;
+                        break;
+                    }
                 }
             }
             if !valid {
@@ -1791,59 +2067,90 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
                 }
             }
         }
-        "GET" if !key.is_empty() => (match store.get(key) { Some(v) => RESPValue::BulkString(Some(v)), None => RESPValue::BulkString(None) }, false),
-        "DEL" if !key.is_empty() => (RESPValue::Integer(if store.delete(key) { 1 } else { 0 }), true),
+        "GET" if !key.is_empty() => (
+            match store.get(key) {
+                Some(v) => RESPValue::BulkString(Some(v)),
+                None => RESPValue::BulkString(None),
+            },
+            false,
+        ),
+        "DEL" if !key.is_empty() => (
+            RESPValue::Integer(if store.delete(key) { 1 } else { 0 }),
+            true,
+        ),
         "INCR" if !key.is_empty() => (RESPValue::Integer(store.incr(key)), true),
-        "LPUSH" if !key.is_empty() && !arg.is_empty() => (RESPValue::Integer(store.lpush(key, arg.to_string()) as i64), true),
-        "RPUSH" if !key.is_empty() && !arg.is_empty() => (RESPValue::Integer(store.rpush(key, arg.to_string()) as i64), true),
-        "LPOP" if !key.is_empty() => {
-            match store.lpop(key) {
-                Some(v) => (RESPValue::BulkString(Some(v)), true),
-                None => (RESPValue::BulkString(None), false),
-            }
-        }
-        "RPOP" if !key.is_empty() => {
-            match store.rpop(key) {
-                Some(v) => (RESPValue::BulkString(Some(v)), true),
-                None => (RESPValue::BulkString(None), false),
-            }
-        }
+        "LPUSH" if !key.is_empty() && !arg.is_empty() => (
+            RESPValue::Integer(store.lpush(key, arg.to_string()) as i64),
+            true,
+        ),
+        "RPUSH" if !key.is_empty() && !arg.is_empty() => (
+            RESPValue::Integer(store.rpush(key, arg.to_string()) as i64),
+            true,
+        ),
+        "LPOP" if !key.is_empty() => match store.lpop(key) {
+            Some(v) => (RESPValue::BulkString(Some(v)), true),
+            None => (RESPValue::BulkString(None), false),
+        },
+        "RPOP" if !key.is_empty() => match store.rpop(key) {
+            Some(v) => (RESPValue::BulkString(Some(v)), true),
+            None => (RESPValue::BulkString(None), false),
+        },
         "LRANGE" if !key.is_empty() => {
             let start = args.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-            let stop = args.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1);
+            let stop = args
+                .get(3)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(-1);
             match store.lrange(key, start, stop) {
-                Some(list) => (RESPValue::Array(list.into_iter().map(|s| RESPValue::BulkString(Some(s))).collect()), false),
+                Some(list) => (
+                    RESPValue::Array(
+                        list.into_iter()
+                            .map(|s| RESPValue::BulkString(Some(s)))
+                            .collect(),
+                    ),
+                    false,
+                ),
                 None => (RESPValue::Array(Vec::new()), false),
             }
         }
 
         "EXPIREAT" if !key.is_empty() && !arg.is_empty() => {
             if let Ok(t) = arg.parse::<u64>() {
-                (RESPValue::Integer(if store.expire_at(key, t) { 1 } else { 0 }), true)
+                (
+                    RESPValue::Integer(if store.expire_at(key, t) { 1 } else { 0 }),
+                    true,
+                )
             } else {
                 (RESPValue::Error("ERR invalid timestamp".to_string()), false)
             }
         }
         "TTL" if !key.is_empty() => (RESPValue::Integer(store.ttl(key)), false),
-        "EXISTS" if !key.is_empty() => (RESPValue::Integer(if store.exists(key) { 1 } else { 0 }), false),
-        "TYPE" if !key.is_empty() => {
-            match store.value_type(key) {
-                Some(t) => (RESPValue::SimpleString(t.to_string()), false),
-                None => (RESPValue::SimpleString("none".to_string()), false),
-            }
-        }
+        "EXISTS" if !key.is_empty() => (
+            RESPValue::Integer(if store.exists(key) { 1 } else { 0 }),
+            false,
+        ),
+        "TYPE" if !key.is_empty() => match store.value_type(key) {
+            Some(t) => (RESPValue::SimpleString(t.to_string()), false),
+            None => (RESPValue::SimpleString("none".to_string()), false),
+        },
         "JSON.SET" => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
             let raw_value = args.get(3).map(|s| s.as_str()).unwrap_or("");
             if key.is_empty() || path.is_empty() || raw_value.is_empty() {
-                (RESPValue::Error("ERR uso: JSON.SET chiave path valore-json".to_string()), false)
+                (
+                    RESPValue::Error("ERR uso: JSON.SET chiave path valore-json".to_string()),
+                    false,
+                )
             } else {
                 match serde_json::from_str::<serde_json::Value>(raw_value) {
                     Ok(parsed) => match store.json_set(key, path, parsed) {
                         Ok(()) => (RESPValue::SimpleString("OK".to_string()), true),
                         Err(e) => (RESPValue::Error(e.to_string()), false),
                     },
-                    Err(_) => (RESPValue::Error("ERR valore non è JSON valido".to_string()), false),
+                    Err(_) => (
+                        RESPValue::Error("ERR valore non è JSON valido".to_string()),
+                        false,
+                    ),
                 }
             }
         }
@@ -1878,7 +2185,10 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
                     Ok(new_val) => (RESPValue::BulkString(Some(new_val.to_string())), true),
                     Err(e) => (RESPValue::Error(e), false),
                 },
-                Err(_) => (RESPValue::Error("ERR delta non è un numero valido".to_string()), false),
+                Err(_) => (
+                    RESPValue::Error("ERR delta non è un numero valido".to_string()),
+                    false,
+                ),
             }
         }
         "JSON.ARRAPPEND" if !key.is_empty() => {
@@ -1889,7 +2199,10 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
                     Ok(new_len) => (RESPValue::Integer(new_len as i64), true),
                     Err(e) => (RESPValue::Error(e), false),
                 },
-                Err(_) => (RESPValue::Error("ERR valore non è JSON valido".to_string()), false),
+                Err(_) => (
+                    RESPValue::Error("ERR valore non è JSON valido".to_string()),
+                    false,
+                ),
             }
         }
         "JSON.ARRLEN" if !key.is_empty() => {
@@ -1903,29 +2216,46 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
         "JSON.OBJKEYS" if !key.is_empty() => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
             match store.json_objkeys(key, path) {
-                Ok(Some(keys)) => (RESPValue::Array(keys.into_iter().map(|k| RESPValue::BulkString(Some(k))).collect()), false),
+                Ok(Some(keys)) => (
+                    RESPValue::Array(
+                        keys.into_iter()
+                            .map(|k| RESPValue::BulkString(Some(k)))
+                            .collect(),
+                    ),
+                    false,
+                ),
                 Ok(None) => (RESPValue::Array(Vec::new()), false),
                 Err(e) => (RESPValue::Error(e), false),
             }
         }
-        "SADD" if !key.is_empty() && !arg.is_empty() => {
-            (RESPValue::Integer(if store.sadd(key, arg) { 1 } else { 0 }), true)
-        }
-        "SMEMBERS" if !key.is_empty() => {
-            match store.smembers(key) {
-                Some(members) => (RESPValue::Array(members.into_iter().map(|m| RESPValue::BulkString(Some(m))).collect()), false),
-                None => (RESPValue::Array(Vec::new()), false),
-            }
-        }
-        "SREM" if !key.is_empty() && !arg.is_empty() => {
-            (RESPValue::Integer(if store.srem(key, arg) { 1 } else { 0 }), true)
-        }
-        "SISMEMBER" if !key.is_empty() && !arg.is_empty() => {
-            (RESPValue::Integer(if store.sismember(key, arg) { 1 } else { 0 }), false)
-        }
-        "LLEN" if !key.is_empty() => {
-            (RESPValue::Integer(store.llen(key).unwrap_or(0) as i64), false)
-        }
+        "SADD" if !key.is_empty() && !arg.is_empty() => (
+            RESPValue::Integer(if store.sadd(key, arg) { 1 } else { 0 }),
+            true,
+        ),
+        "SMEMBERS" if !key.is_empty() => match store.smembers(key) {
+            Some(members) => (
+                RESPValue::Array(
+                    members
+                        .into_iter()
+                        .map(|m| RESPValue::BulkString(Some(m)))
+                        .collect(),
+                ),
+                false,
+            ),
+            None => (RESPValue::Array(Vec::new()), false),
+        },
+        "SREM" if !key.is_empty() && !arg.is_empty() => (
+            RESPValue::Integer(if store.srem(key, arg) { 1 } else { 0 }),
+            true,
+        ),
+        "SISMEMBER" if !key.is_empty() && !arg.is_empty() => (
+            RESPValue::Integer(if store.sismember(key, arg) { 1 } else { 0 }),
+            false,
+        ),
+        "LLEN" if !key.is_empty() => (
+            RESPValue::Integer(store.llen(key).unwrap_or(0) as i64),
+            false,
+        ),
         "RENAME" if !key.is_empty() && !arg.is_empty() => {
             if store.rename(key, arg) {
                 (RESPValue::SimpleString("OK".to_string()), true)
@@ -1935,7 +2265,10 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
         }
         "MSET" => {
             if args.len() < 3 || (args.len() - 1) % 2 != 0 {
-                (RESPValue::Error("ERR wrong number of arguments for 'mset'".to_string()), false)
+                (
+                    RESPValue::Error("ERR wrong number of arguments for 'mset'".to_string()),
+                    false,
+                )
             } else {
                 let mut i = 1;
                 while i + 1 < args.len() {
@@ -1946,7 +2279,8 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
             }
         }
         "MGET" => {
-            let results: Vec<RESPValue> = args[1..].iter()
+            let results: Vec<RESPValue> = args[1..]
+                .iter()
                 .map(|k| match store.get(k) {
                     Some(v) => RESPValue::BulkString(Some(v)),
                     None => RESPValue::BulkString(None),
@@ -1957,13 +2291,23 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
         "KEYS" => {
             let pattern = key;
             let keys = store.keys_matching(pattern);
-            (RESPValue::Array(keys.into_iter().map(|k| RESPValue::BulkString(Some(k))).collect()), false)
+            (
+                RESPValue::Array(
+                    keys.into_iter()
+                        .map(|k| RESPValue::BulkString(Some(k)))
+                        .collect(),
+                ),
+                false,
+            )
         }
         "HSET" if !key.is_empty() && !arg.is_empty() => {
             let field = arg;
             let value = args.get(3).map(|s| s.as_str()).unwrap_or("");
             if value.is_empty() {
-                (RESPValue::Error("ERR wrong number of arguments for 'hset'".to_string()), false)
+                (
+                    RESPValue::Error("ERR wrong number of arguments for 'hset'".to_string()),
+                    false,
+                )
             } else {
                 let is_new = store.hset(key, field, value);
                 (RESPValue::Integer(if is_new { 1 } else { 0 }), true)
@@ -1971,53 +2315,64 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
         }
         "HGET" if !key.is_empty() && !arg.is_empty() => {
             let field = arg;
-            (match store.hget(key, field) { Some(v) => RESPValue::BulkString(Some(v)), None => RESPValue::BulkString(None) }, false)
+            (
+                match store.hget(key, field) {
+                    Some(v) => RESPValue::BulkString(Some(v)),
+                    None => RESPValue::BulkString(None),
+                },
+                false,
+            )
         }
-        "HGETALL" if !key.is_empty() => {
-            match store.hgetall(key) {
-                Some(pairs) => {
-                    let mut flat = Vec::with_capacity(pairs.len() * 2);
-                    for (f, v) in pairs {
-                        flat.push(RESPValue::BulkString(Some(f)));
-                        flat.push(RESPValue::BulkString(Some(v)));
-                    }
-                    (RESPValue::Array(flat), false)
+        "HGETALL" if !key.is_empty() => match store.hgetall(key) {
+            Some(pairs) => {
+                let mut flat = Vec::with_capacity(pairs.len() * 2);
+                for (f, v) in pairs {
+                    flat.push(RESPValue::BulkString(Some(f)));
+                    flat.push(RESPValue::BulkString(Some(v)));
                 }
-                None => (RESPValue::Array(Vec::new()), false),
+                (RESPValue::Array(flat), false)
             }
-        }
+            None => (RESPValue::Array(Vec::new()), false),
+        },
         "HDEL" if !key.is_empty() && !arg.is_empty() => {
             let field = arg;
-            (RESPValue::Integer(if store.hdel(key, field) { 1 } else { 0 }), true)
+            (
+                RESPValue::Integer(if store.hdel(key, field) { 1 } else { 0 }),
+                true,
+            )
         }
         "REPLICAOF" if key.eq_ignore_ascii_case("no") && arg.eq_ignore_ascii_case("one") => {
             (RESPValue::SimpleString("OK".to_string()), false)
         }
-        "INCRBY" if !key.is_empty() && !arg.is_empty() => {
-            match arg.parse::<i64>() {
-                Ok(delta) => (RESPValue::Integer(store.incrby(key, delta)), true),
-                Err(_) => (RESPValue::Error("ERR value is not an integer".to_string()), false),
-            }
-        }
-        "DECRBY" if !key.is_empty() && !arg.is_empty() => {
-            match arg.parse::<i64>() {
-                Ok(delta) => (RESPValue::Integer(store.incrby(key, -delta)), true),
-                Err(_) => (RESPValue::Error("ERR value is not an integer".to_string()), false),
-            }
-        }
+        "INCRBY" if !key.is_empty() && !arg.is_empty() => match arg.parse::<i64>() {
+            Ok(delta) => (RESPValue::Integer(store.incrby(key, delta)), true),
+            Err(_) => (
+                RESPValue::Error("ERR value is not an integer".to_string()),
+                false,
+            ),
+        },
+        "DECRBY" if !key.is_empty() && !arg.is_empty() => match arg.parse::<i64>() {
+            Ok(delta) => (RESPValue::Integer(store.incrby(key, -delta)), true),
+            Err(_) => (
+                RESPValue::Error("ERR value is not an integer".to_string()),
+                false,
+            ),
+        },
         "APPEND" if !key.is_empty() && !arg.is_empty() => {
             (RESPValue::Integer(store.append(key, arg) as i64), true)
         }
-        "STRLEN" if !key.is_empty() => {
-            (RESPValue::Integer(store.strlen(key) as i64), false)
-        }
+        "STRLEN" if !key.is_empty() => (RESPValue::Integer(store.strlen(key) as i64), false),
         "GETSET" if !key.is_empty() && !arg.is_empty() => {
             let old = store.getset(key, arg);
             (RESPValue::BulkString(old), true)
         }
         "INFO" => {
             let uptime = now().saturating_sub(START_TIME.load(Ordering::Relaxed));
-            let role = if IS_REPLICA.load(Ordering::Relaxed) { "replica" } else { "master" };
+            let role = if IS_REPLICA.load(Ordering::Relaxed) {
+                "replica"
+            } else {
+                "master"
+            };
             let num_keys = store.stats().total_keys;
             let active_conns = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
             let total_cmds = TOTAL_COMMANDS.load(Ordering::Relaxed);
@@ -2034,28 +2389,52 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
 
             let info_text = format!(
                 "role:{}\nuptime_seconds:{}\nconnected_keys:{}\nmax_keys:{}\nactive_connections:{}\ntotal_commands:{}\ncache_hits:{}\ncache_misses:{}\nhit_rate_percent:{:.1}\nused_memory_bytes:{}\nmaxmemory_bytes:{}\nmaxmemory_policy:{}",
-                role, uptime, num_keys, MAX_KEYS, active_conns, total_cmds, hits, misses, hit_rate, used_memory, mm_limit, mm_policy_str
+                role,
+                uptime,
+                num_keys,
+                MAX_KEYS,
+                active_conns,
+                total_cmds,
+                hits,
+                misses,
+                hit_rate,
+                used_memory,
+                mm_limit,
+                mm_policy_str
             );
             (RESPValue::BulkString(Some(info_text)), false)
         }
-        "SETNX" if !key.is_empty() && !arg.is_empty() => {
-            (RESPValue::Integer(if store.setnx(key, arg) { 1 } else { 0 }), true)
-        }
-        "HKEYS" if !key.is_empty() => {
-            match store.hkeys(key) {
-                Some(fields) => (RESPValue::Array(fields.into_iter().map(|f| RESPValue::BulkString(Some(f))).collect()), false),
-                None => (RESPValue::Array(Vec::new()), false),
-            }
-        }
-        "HVALS" if !key.is_empty() => {
-            match store.hvals(key) {
-                Some(vals) => (RESPValue::Array(vals.into_iter().map(|v| RESPValue::BulkString(Some(v))).collect()), false),
-                None => (RESPValue::Array(Vec::new()), false),
-            }
-        }
-        "COPY" if !key.is_empty() && !arg.is_empty() => {
-            (RESPValue::Integer(if store.copy(key, arg) { 1 } else { 0 }), true)
-        }
+        "SETNX" if !key.is_empty() && !arg.is_empty() => (
+            RESPValue::Integer(if store.setnx(key, arg) { 1 } else { 0 }),
+            true,
+        ),
+        "HKEYS" if !key.is_empty() => match store.hkeys(key) {
+            Some(fields) => (
+                RESPValue::Array(
+                    fields
+                        .into_iter()
+                        .map(|f| RESPValue::BulkString(Some(f)))
+                        .collect(),
+                ),
+                false,
+            ),
+            None => (RESPValue::Array(Vec::new()), false),
+        },
+        "HVALS" if !key.is_empty() => match store.hvals(key) {
+            Some(vals) => (
+                RESPValue::Array(
+                    vals.into_iter()
+                        .map(|v| RESPValue::BulkString(Some(v)))
+                        .collect(),
+                ),
+                false,
+            ),
+            None => (RESPValue::Array(Vec::new()), false),
+        },
+        "COPY" if !key.is_empty() && !arg.is_empty() => (
+            RESPValue::Integer(if store.copy(key, arg) { 1 } else { 0 }),
+            true,
+        ),
         "EXPIRE" if !key.is_empty() && !arg.is_empty() => {
             let condition = args.get(3).map(|s| s.to_uppercase());
             match arg.parse::<u64>() {
@@ -2066,11 +2445,17 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
                     };
                     (RESPValue::Integer(if ok { 1 } else { 0 }), true)
                 }
-                Err(_) => (RESPValue::Error("ERR invalid expire time".to_string()), false),
+                Err(_) => (
+                    RESPValue::Error("ERR invalid expire time".to_string()),
+                    false,
+                ),
             }
         }
         "PING" => (RESPValue::SimpleString("PONG".to_string()), false),
-        _ => (RESPValue::Error("ERR comando non riconosciuto o sintassi errata".to_string()), false),
+        _ => (
+            RESPValue::Error("ERR comando non riconosciuto o sintassi errata".to_string()),
+            false,
+        ),
     }
 }
 
@@ -2098,9 +2483,15 @@ fn normalize_for_log(store: &ShardedStore, args: &[String]) -> String {
     }
     args.join(" ")
 }
-   
+
 fn load_data(store: &ShardedStore) {
-    CURRENT_TIME.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(), Ordering::SeqCst);
+    CURRENT_TIME.store(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        Ordering::SeqCst,
+    );
 
     if Path::new(SNAPSHOT_PATH).exists() {
         if let Ok(file) = File::open(SNAPSHOT_PATH) {
@@ -2110,7 +2501,10 @@ fn load_data(store: &ShardedStore) {
             for line_result in StdBufReader::new(decoder).lines() {
                 let line = match line_result {
                     Ok(l) => l,
-                    Err(_) => { skipped += 1; continue; } // riga non UTF-8 valida
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    } // riga non UTF-8 valida
                 };
                 match line_to_entry(&line) {
                     Some((key, entry)) => {
@@ -2123,7 +2517,10 @@ fn load_data(store: &ShardedStore) {
                 }
             }
             if skipped > 0 {
-                warn!("Snapshot: {} righe scartate perché malformate o illeggibili", skipped);
+                warn!(
+                    "Snapshot: {} righe scartate perché malformate o illeggibili",
+                    skipped
+                );
             }
             info!("Snapshot caricato: {} elementi attivi", count);
         }
@@ -2152,7 +2549,8 @@ fn load_data(store: &ShardedStore) {
                 if offset + record_len as usize > data.len() {
                     warn!(
                         "Binlog troncato: un record dichiara {} byte ma ne restano solo {}, scartato",
-                        record_len, data.len() - offset
+                        record_len,
+                        data.len() - offset
                     );
                     break;
                 }
@@ -2168,7 +2566,10 @@ fn load_data(store: &ShardedStore) {
                 }
             }
             if corrupt_records > 0 {
-                warn!("Binlog: {} record scartati perché corrotti o non riconosciuti", corrupt_records);
+                warn!(
+                    "Binlog: {} record scartati perché corrotti o non riconosciuti",
+                    corrupt_records
+                );
             }
             info!("Binlog riprodotto: {} comandi", count);
         }
@@ -2176,7 +2577,10 @@ fn load_data(store: &ShardedStore) {
 }
 async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence: Arc<Persistence>) {
     let _ = stream.set_nodelay(true);
-    let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "sconosciuto".to_string());
+    let peer_addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "sconosciuto".to_string());
     ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
     struct ConnGuard;
     impl Drop for ConnGuard {
@@ -2187,7 +2591,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
     let _guard = ConnGuard;
     let (reader, writer) = stream.into_split();
     let mut buf_reader = TokioBufReader::with_capacity(65536, reader);
-    let mut buf_writer = TokioBufWriter::with_capacity (65536, writer); 
+    let mut buf_writer = TokioBufWriter::with_capacity(65536, writer);
     let mut scratch = String::with_capacity(256);
     let mut resp_buf = String::with_capacity(256);
     let mut authenticated = !auth_required();
@@ -2216,7 +2620,10 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             let (username, provided_password) = if args.len() >= 3 {
                 (args[1].clone(), args[2].clone())
             } else {
-                ("default".to_string(), args.get(1).cloned().unwrap_or_default())
+                (
+                    "default".to_string(),
+                    args.get(1).cloned().unwrap_or_default(),
+                )
             };
             let response = if !auth_required() {
                 RESPValue::Error("ERR nessuna password configurata su questo server".to_string())
@@ -2228,8 +2635,8 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             };
             resp_buf.clear();
             response.encode_into(&mut resp_buf);
-           let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
-           let _ = buf_writer.flush().await;
+            let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
+            let _ = buf_writer.flush().await;
             continue;
         }
         // Autenticazione: da qui in poi, se serve login e non è stato fatto,
@@ -2243,7 +2650,6 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             continue;
         }
         // MULTI
-
 
         if cmd.eq_ignore_ascii_case("MULTI") {
             in_transaction = true;
@@ -2262,7 +2668,9 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 queued_commands.clear();
                 RESPValue::SimpleString("OK".to_string())
             } else {
-                RESPValue::Error("ERR DISCARD senza una transazione attiva (usa prima MULTI)".to_string())
+                RESPValue::Error(
+                    "ERR DISCARD senza una transazione attiva (usa prima MULTI)".to_string(),
+                )
             };
             resp_buf.clear();
             response.encode_into(&mut resp_buf);
@@ -2274,14 +2682,18 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
         // EXEC
         if cmd.eq_ignore_ascii_case("EXEC") {
             let response = if !in_transaction {
-                RESPValue::Error("ERR EXEC senza una transazione attiva (usa prima MULTI)".to_string())
+                RESPValue::Error(
+                    "ERR EXEC senza una transazione attiva (usa prima MULTI)".to_string(),
+                )
             } else {
                 in_transaction = false;
                 let mut results = Vec::with_capacity(queued_commands.len());
                 for queued_args in queued_commands.drain(..) {
                     let queued_cmd = queued_args.get(0).map(|s| s.as_str()).unwrap_or("");
                     if IS_REPLICA.load(Ordering::Relaxed) && is_write_command(queued_cmd) {
-                        results.push(RESPValue::Error("READONLY questa istanza è una Replica in sola lettura".to_string()));
+                        results.push(RESPValue::Error(
+                            "READONLY questa istanza è una Replica in sola lettura".to_string(),
+                        ));
                         continue;
                     }
                     let (resp, is_write) = execute_command(&store, &queued_args);
@@ -2309,16 +2721,19 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             continue;
         }
 
-
-
         // PUBLISH — non richiede modalità speciale, un comando normale come
         // gli altri, solo che non passa da execute_command/persistenza (i
         // messaggi pub/sub sono effimeri, non finiscono nel binlog).
         if cmd == "PUBLISH" {
             let channel = args.get(1).cloned().unwrap_or_default();
             let message = args.get(2).cloned().unwrap_or_default();
-            let receiver_count = persistence.subscriptions.lock().unwrap()
-                .get(&channel).map(|s| s.len()).unwrap_or(0);
+            let receiver_count = persistence
+                .subscriptions
+                .lock()
+                .unwrap()
+                .get(&channel)
+                .map(|s| s.len())
+                .unwrap_or(0);
             let _ = persistence.pubsub_tx.send((channel, message));
             resp_buf.clear();
             RESPValue::Integer(receiver_count as i64).encode_into(&mut resp_buf);
@@ -2331,13 +2746,21 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
         // smette di eseguire comandi normali e resta bloccata a inoltrare
         // messaggi dei canali sottoscritti, finché il client si disconnette.
         if cmd == "SUBSCRIBE" {
-            let sub_id = persistence.next_subscriber_id.fetch_add(1, Ordering::SeqCst) + 1;
-            let mut my_channels: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let sub_id = persistence
+                .next_subscriber_id
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            let mut my_channels: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             for channel in args[1..].to_vec() {
                 my_channels.insert(channel.clone());
-                persistence.subscriptions.lock().unwrap()
-                    .entry(channel.clone()).or_insert_with(std::collections::HashSet::new)
+                persistence
+                    .subscriptions
+                    .lock()
+                    .unwrap()
+                    .entry(channel.clone())
+                    .or_insert_with(std::collections::HashSet::new)
                     .insert(sub_id);
                 let count = my_channels.len();
                 let confirm = RESPValue::Array(vec![
@@ -2360,7 +2783,8 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             // Stesso schema usato per gli ACK delle Repliche: un task
             // possiede la metà "lettura", il ciclo principale sceglie tra
             // canali cancel-safe (mpsc/broadcast), mai su read_line diretto.
-            let (chan_tx, mut chan_rx) = tokio::sync::mpsc::unbounded_channel::<(bool, Vec<String>)>();
+            let (chan_tx, mut chan_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(bool, Vec<String>)>();
             let reader_task = tokio::spawn(async move {
                 let mut sub_scratch = String::new();
                 loop {
@@ -2370,7 +2794,11 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                             if sub_cmd == "SUBSCRIBE" {
                                 let _ = chan_tx.send((true, sub_args[1..].to_vec()));
                             } else if sub_cmd == "UNSUBSCRIBE" {
-                                let chans = if sub_args.len() > 1 { sub_args[1..].to_vec() } else { Vec::new() };
+                                let chans = if sub_args.len() > 1 {
+                                    sub_args[1..].to_vec()
+                                } else {
+                                    Vec::new()
+                                };
                                 let _ = chan_tx.send((false, chans));
                             }
                             // Altri comandi vengono ignorati finché si è in
@@ -2477,8 +2905,10 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             // che il Master è ripartito da zero da quando la Replica si è
             // vista l'ultima volta — il suo vecchio offset non ha più senso
             // qui, anche se il backlog risultasse "vuoto" per coincidenza).
-            let requested_replid: u64 = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            let requested_offset: u64 = args.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let requested_replid: u64 =
+                args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let requested_offset: u64 =
+                args.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             let replid_matches = replid_allows_partial(requested_replid, repl_id());
             let replica_id = persistence.next_replica_id.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -2497,24 +2927,34 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             // Un resync parziale è possibile SOLO se il replication ID
             // combacia (stesso processo Master) E il backlog copre ancora
             // tutto da requested_offset+1 in poi (nessun buco).
-            let backlog_snapshot: Option<Vec<(u64, String)>> = if replid_matches && requested_offset > 0 {
-                let backlog = persistence.backlog.lock().unwrap();
-                let backlog_oldest = backlog.front().map(|(off, _)| *off);
-                let current_offset = persistence.repl_offset.load(Ordering::SeqCst);
-                if partial_resync_possible(requested_offset, backlog_oldest, current_offset) {
-                    Some(backlog.iter().filter(|(off, _)| *off > requested_offset).cloned().collect())
+            let backlog_snapshot: Option<Vec<(u64, String)>> =
+                if replid_matches && requested_offset > 0 {
+                    let backlog = persistence.backlog.lock().unwrap();
+                    let backlog_oldest = backlog.front().map(|(off, _)| *off);
+                    let current_offset = persistence.repl_offset.load(Ordering::SeqCst);
+                    if partial_resync_possible(requested_offset, backlog_oldest, current_offset) {
+                        Some(
+                            backlog
+                                .iter()
+                                .filter(|(off, _)| *off > requested_offset)
+                                .cloned()
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
-            persistence.replica_status.lock().unwrap().insert(replica_id, ReplicaStatus {
-                addr: peer_addr.clone(),
-                last_ack_offset: requested_offset,
-                last_ack_time: now(),
-            });
+            persistence.replica_status.lock().unwrap().insert(
+                replica_id,
+                ReplicaStatus {
+                    addr: peer_addr.clone(),
+                    last_ack_offset: requested_offset,
+                    last_ack_time: now(),
+                },
+            );
 
             // Task dedicato a leggere gli ACK della Replica (REPLCONF ACK
             // <offset>): possiede esclusivamente la metà "lettura" della
@@ -2529,10 +2969,20 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     match read_command(&mut buf_reader, &mut ack_scratch).await {
                         Ok(Some(ack_args)) if !ack_args.is_empty() => {
                             if ack_args[0].eq_ignore_ascii_case("REPLCONF")
-                                && ack_args.get(1).map(|s| s.eq_ignore_ascii_case("ACK")).unwrap_or(false)
+                                && ack_args
+                                    .get(1)
+                                    .map(|s| s.eq_ignore_ascii_case("ACK"))
+                                    .unwrap_or(false)
                             {
-                                if let Some(off) = ack_args.get(2).and_then(|s| s.parse::<u64>().ok()) {
-                                    if let Some(status) = persistence_ack.replica_status.lock().unwrap().get_mut(&replica_id) {
+                                if let Some(off) =
+                                    ack_args.get(2).and_then(|s| s.parse::<u64>().ok())
+                                {
+                                    if let Some(status) = persistence_ack
+                                        .replica_status
+                                        .lock()
+                                        .unwrap()
+                                        .get_mut(&replica_id)
+                                    {
                                         status.last_ack_offset = off;
                                         status.last_ack_time = now();
                                     }
@@ -2554,51 +3004,81 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 let marker = format!("+CONTINUE {} {}\r\n", repl_id(), requested_offset);
                 if buf_writer.write_all(marker.as_bytes()).await.is_err() {
                     reader_task.abort();
-                    persistence.replica_status.lock().unwrap().remove(&replica_id);
+                    persistence
+                        .replica_status
+                        .lock()
+                        .unwrap()
+                        .remove(&replica_id);
                     return;
                 }
                 for (off, cmd_line) in missing {
                     let line = format!("{}\r\n", cmd_line);
                     if buf_writer.write_all(line.as_bytes()).await.is_err() {
                         reader_task.abort();
-                        persistence.replica_status.lock().unwrap().remove(&replica_id);
+                        persistence
+                            .replica_status
+                            .lock()
+                            .unwrap()
+                            .remove(&replica_id);
                         return;
                     }
                     last_sent_offset = off;
                 }
-                info!("Replica {} risincronizzata parzialmente da offset {}", peer_addr, requested_offset);
+                info!(
+                    "Replica {} risincronizzata parzialmente da offset {}",
+                    peer_addr, requested_offset
+                );
             } else {
                 // FULL RESYNC (comportamento di prima: dump completo di tutte le chiavi)
                 let full_sync_offset = persistence.repl_offset.load(Ordering::SeqCst);
                 let marker = format!("+FULLRESYNC {} {}\r\n", repl_id(), full_sync_offset);
                 if buf_writer.write_all(marker.as_bytes()).await.is_err() {
                     reader_task.abort();
-                    persistence.replica_status.lock().unwrap().remove(&replica_id);
+                    persistence
+                        .replica_status
+                        .lock()
+                        .unwrap()
+                        .remove(&replica_id);
                     return;
                 }
 
                 for (k, entry) in store.snapshot_entries() {
                     let restore_cmd = match &entry.value {
-                        OnyxValue::Blob(b) => format!("SET {} {}\r\n", k, String::from_utf8_lossy(b)),
+                        OnyxValue::Blob(b) => {
+                            format!("SET {} {}\r\n", k, String::from_utf8_lossy(b))
+                        }
                         OnyxValue::Int(n) => format!("SET {} {}\r\n", k, n),
                         OnyxValue::List(list) => {
                             let mut cmds = String::new();
                             for item in list.iter().rev() {
-                                cmds.push_str(&format!("LPUSH {} {}\r\n", k, String::from_utf8_lossy(item)));
+                                cmds.push_str(&format!(
+                                    "LPUSH {} {}\r\n",
+                                    k,
+                                    String::from_utf8_lossy(item)
+                                ));
                             }
                             cmds
                         }
                         OnyxValue::Hash(map) => {
                             let mut cmds = String::new();
                             for (f, v) in map.iter() {
-                                cmds.push_str(&format!("HSET {} {} {}\r\n", k, String::from_utf8_lossy(f), String::from_utf8_lossy(v)));
+                                cmds.push_str(&format!(
+                                    "HSET {} {} {}\r\n",
+                                    k,
+                                    String::from_utf8_lossy(f),
+                                    String::from_utf8_lossy(v)
+                                ));
                             }
                             cmds
                         }
                         OnyxValue::Set(set) => {
                             let mut cmds = String::new();
                             for item in set.iter() {
-                                cmds.push_str(&format!("SADD {} {}\r\n", k, String::from_utf8_lossy(item)));
+                                cmds.push_str(&format!(
+                                    "SADD {} {}\r\n",
+                                    k,
+                                    String::from_utf8_lossy(item)
+                                ));
                             }
                             cmds
                         }
@@ -2606,12 +3086,19 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     };
                     if buf_writer.write_all(restore_cmd.as_bytes()).await.is_err() {
                         reader_task.abort();
-                        persistence.replica_status.lock().unwrap().remove(&replica_id);
+                        persistence
+                            .replica_status
+                            .lock()
+                            .unwrap()
+                            .remove(&replica_id);
                         return;
                     }
                 }
                 last_sent_offset = full_sync_offset;
-                info!("Replica {} sincronizzata con dump completo (offset {})", peer_addr, full_sync_offset);
+                info!(
+                    "Replica {} sincronizzata con dump completo (offset {})",
+                    peer_addr, full_sync_offset
+                );
             }
 
             // Marcatore esplicito di "fine sincronizzazione iniziale": senza
@@ -2619,14 +3106,25 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             // tra righe del dump/backlog (che non corrispondono 1:1 a un
             // offset) e comandi live (che sì) — le direbbe come contare da qui.
             let syncdone_marker = format!("+SYNCDONE {}\r\n", last_sent_offset);
-            if buf_writer.write_all(syncdone_marker.as_bytes()).await.is_err() {
+            if buf_writer
+                .write_all(syncdone_marker.as_bytes())
+                .await
+                .is_err()
+            {
                 reader_task.abort();
-                persistence.replica_status.lock().unwrap().remove(&replica_id);
+                persistence
+                    .replica_status
+                    .lock()
+                    .unwrap()
+                    .remove(&replica_id);
                 return;
             }
             let _ = buf_writer.flush().await;
 
-            info!("Replica {} in streaming in tempo reale (offset corrente: {})", peer_addr, last_sent_offset);
+            info!(
+                "Replica {} in streaming in tempo reale (offset corrente: {})",
+                peer_addr, last_sent_offset
+            );
 
             loop {
                 match replica_rx.recv().await {
@@ -2637,7 +3135,11 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                             continue;
                         }
                         let line_with_newline = format!("{}\r\n", cmd_line);
-                        if buf_writer.write_all(line_with_newline.as_bytes()).await.is_err() {
+                        if buf_writer
+                            .write_all(line_with_newline.as_bytes())
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                         let _ = buf_writer.flush().await;
@@ -2649,7 +3151,10 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                         // consegnati. Meglio chiudere e forzare un resync
                         // completo alla prossima riconnessione, piuttosto che
                         // lasciare un buco silenzioso nel flusso replicato.
-                        warn!("Replica {} troppo lenta, disconnessione forzata (richiederà un nuovo SYNC)", peer_addr);
+                        warn!(
+                            "Replica {} troppo lenta, disconnessione forzata (richiederà un nuovo SYNC)",
+                            peer_addr
+                        );
                         break;
                     }
                     Err(_) => break,
@@ -2657,7 +3162,11 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             }
 
             reader_task.abort();
-            persistence.replica_status.lock().unwrap().remove(&replica_id);
+            persistence
+                .replica_status
+                .lock()
+                .unwrap()
+                .remove(&replica_id);
             info!("Replica {} disconnessa", peer_addr);
             return;
         }
@@ -2677,8 +3186,14 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             RESPValue::Error("READONLY questa istanza è una Replica in sola lettura".to_string())
         } else {
             if cmd.eq_ignore_ascii_case("REPLICAOF")
-                && args.get(1).map(|s| s.eq_ignore_ascii_case("no")).unwrap_or(false)
-                && args.get(2).map(|s| s.eq_ignore_ascii_case("one")).unwrap_or(false)
+                && args
+                    .get(1)
+                    .map(|s| s.eq_ignore_ascii_case("no"))
+                    .unwrap_or(false)
+                && args
+                    .get(2)
+                    .map(|s| s.eq_ignore_ascii_case("one"))
+                    .unwrap_or(false)
             {
                 persistence.promote_to_master.store(true, Ordering::Relaxed);
                 IS_REPLICA.store(false, Ordering::Relaxed);
@@ -2692,7 +3207,8 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     let repl_offset = persistence.repl_offset.load(Ordering::SeqCst);
                     let statuses = persistence.replica_status.lock().unwrap();
                     let connected_replicas = statuses.len();
-                    let max_lag = statuses.values()
+                    let max_lag = statuses
+                        .values()
                         .map(|s| repl_offset.saturating_sub(s.last_ack_offset))
                         .max()
                         .unwrap_or(0);
@@ -2713,8 +3229,12 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             }
             if !is_write {
                 match &resp {
-                    RESPValue::BulkString(None) => { CACHE_MISSES.fetch_add(1, Ordering::Relaxed); }
-                    RESPValue::BulkString(Some(_)) => { CACHE_HITS.fetch_add(1, Ordering::Relaxed); }
+                    RESPValue::BulkString(None) => {
+                        CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    RESPValue::BulkString(Some(_)) => {
+                        CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                    }
                     _ => {}
                 }
             }
@@ -2739,12 +3259,17 @@ async fn active_expiration_task(store: Arc<ShardedStore>) {
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
         let count = store.gc_expired();
-        if count > 0 { println!("🧹 GC: rimosse {} chiavi scadute.", count); }
+        if count > 0 {
+            println!("🧹 GC: rimosse {} chiavi scadute.", count);
+        }
     }
 }
 async fn time_updater_task() {
     loop {
-        let now_sec = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         CURRENT_TIME.store(now_sec, Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -2791,12 +3316,17 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
     let total_cmds = TOTAL_COMMANDS.load(Ordering::Relaxed);
     let hits = CACHE_HITS.load(Ordering::Relaxed);
     let misses = CACHE_MISSES.load(Ordering::Relaxed);
-    let role_value = if IS_REPLICA.load(Ordering::Relaxed) { 0 } else { 1 };
+    let role_value = if IS_REPLICA.load(Ordering::Relaxed) {
+        0
+    } else {
+        1
+    };
 
     let repl_offset = persistence.repl_offset.load(Ordering::SeqCst);
     let statuses = persistence.replica_status.lock().unwrap();
     let connected_replicas = statuses.len();
-    let max_lag = statuses.values()
+    let max_lag = statuses
+        .values()
         .map(|s| repl_offset.saturating_sub(s.last_ack_offset))
         .max()
         .unwrap_or(0);
@@ -2836,8 +3366,17 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
          # HELP onyxdb_memory_bytes Byte occupati (stima approssimativa)\n\
          # TYPE onyxdb_memory_bytes gauge\n\
          onyxdb_memory_bytes {}\n",
-        uptime, num_keys, active_conns, total_cmds, hits, misses, role_value,
-        repl_offset, connected_replicas, max_lag, store.used_memory_bytes()
+        uptime,
+        num_keys,
+        active_conns,
+        total_cmds,
+        hits,
+        misses,
+        role_value,
+        repl_offset,
+        connected_replicas,
+        max_lag,
+        store.used_memory_bytes()
     )
 }
 
@@ -2850,7 +3389,10 @@ async fn run_metrics_server(store: Arc<ShardedStore>, persistence: Arc<Persisten
             return;
         }
     };
-    info!("Server metriche Prometheus in ascolto su http://{}/metrics", addr);
+    info!(
+        "Server metriche Prometheus in ascolto su http://{}/metrics",
+        addr
+    );
 
     loop {
         let (mut stream, _) = match listener.accept().await {
@@ -2873,12 +3415,16 @@ async fn run_metrics_server(store: Arc<ShardedStore>, persistence: Arc<Persisten
             let _ = stream.write_all(response.as_bytes()).await;
         });
     }
-}  
+}
 // ============================================================
 // HANDLER OBP (Onyx Binary Protocol) - Listener parallelo
 // ============================================================
 
-async fn handle_obp_client(stream: TcpStream, store: Arc<ShardedStore>, persistence: Arc<Persistence>) {
+async fn handle_obp_client(
+    stream: TcpStream,
+    store: Arc<ShardedStore>,
+    persistence: Arc<Persistence>,
+) {
     let _ = stream.set_nodelay(true);
     let (reader, writer) = stream.into_split();
     let mut buf_reader = TokioBufReader::with_capacity(65536, reader);
@@ -2893,7 +3439,8 @@ async fn handle_obp_client(stream: TcpStream, store: Arc<ShardedStore>, persiste
         }
 
         while let Some(frame) = OBPFrame::decode(&mut buf) {
-            let response = execute_obp_command(&store, &persistence, frame, &mut authenticated).await;
+            let response =
+                execute_obp_command(&store, &persistence, frame, &mut authenticated).await;
             let mut out = bytes::BytesMut::new();
             response.encode(&mut out);
             if buf_writer.write_all(&out).await.is_err() {
@@ -2914,7 +3461,11 @@ async fn handle_obp_client(stream: TcpStream, store: Arc<ShardedStore>, persiste
 /// handle_client) sia dal percorso OBP. Assegna l'offset di replicazione,
 /// lo mette nel backlog, lo trasmette in tempo reale, lo scrive sul binlog
 /// e innesca la compattazione se serve.
-async fn persist_and_replicate(store: &ShardedStore, persistence: &Persistence, cmd_args: &[String]) {
+async fn persist_and_replicate(
+    store: &ShardedStore,
+    persistence: &Persistence,
+    cmd_args: &[String],
+) {
     let text_for_replica = normalize_for_log(store, cmd_args);
     // Usiamo la STESSA versione normalizzata sia per il binlog sia per lo
     // stream di replica: prima venivano ricalcolate separatamente (binlog
@@ -2922,7 +3473,10 @@ async fn persist_and_replicate(store: &ShardedStore, persistence: &Persistence, 
     // "SET ... EX ..." avrebbe fatto sì che il binlog perdesse la scadenza
     // mentre la Replica no (o viceversa) — due percorsi che potevano
     // silenziosamente divergere sullo stesso identico comando.
-    let normalized_args: Vec<String> = text_for_replica.split_whitespace().map(|s| s.to_string()).collect();
+    let normalized_args: Vec<String> = text_for_replica
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
 
     let new_offset = persistence.repl_offset.fetch_add(1, Ordering::SeqCst) + 1;
     {
@@ -2936,11 +3490,18 @@ async fn persist_and_replicate(store: &ShardedStore, persistence: &Persistence, 
 
     let cmd_name = normalized_args.get(0).map(|s| s.as_str()).unwrap_or("");
     if let Some(binary_record) = command_to_binary_record(cmd_name, &normalized_args, None) {
-        let _ = persistence.log_tx.send(LogMessage::Append(binary_record)).await;
+        let _ = persistence
+            .log_tx
+            .send(LogMessage::Append(binary_record))
+            .await;
     }
 
     if persistence.write_count.fetch_add(1, Ordering::SeqCst) + 1 >= COMPACTION_THRESHOLD {
-        if persistence.compaction_pending.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        if persistence
+            .compaction_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             let _ = persistence.log_tx.send(LogMessage::Compact).await;
         }
         persistence.write_count.store(0, Ordering::SeqCst);
@@ -2959,16 +3520,26 @@ async fn execute_obp_command(
     // AUTH via OBP (codice 0x10): arg[0]=password, oppure arg[0]=utente e arg[1]=password.
     if cmd == 0x10 {
         let (user, pass) = if args.len() >= 2 {
-            (String::from_utf8_lossy(&args[0]).to_string(),
-             String::from_utf8_lossy(&args[1]).to_string())
+            (
+                String::from_utf8_lossy(&args[0]).to_string(),
+                String::from_utf8_lossy(&args[1]).to_string(),
+            )
         } else {
-            ("default".to_string(),
-             args.get(0).map(|a| String::from_utf8_lossy(a).to_string()).unwrap_or_default())
+            (
+                "default".to_string(),
+                args.get(0)
+                    .map(|a| String::from_utf8_lossy(a).to_string())
+                    .unwrap_or_default(),
+            )
         };
         let ok = auth_required() && check_credentials(&user, &pass);
-        if ok { *authenticated = true; }
+        if ok {
+            *authenticated = true;
+        }
         return OBPFrame {
-            cmd: 0x00, flags: 0, correlation_id: frame.correlation_id,
+            cmd: 0x00,
+            flags: 0,
+            correlation_id: frame.correlation_id,
             args: Vec::new(),
             payload: Some(Bytes::from(if ok { "OK" } else { "WRONGPASS" })),
         };
@@ -2977,12 +3548,13 @@ async fn execute_obp_command(
     // Se serve login e non è stato fatto, rifiuta qualsiasi altro comando.
     if !*authenticated {
         return OBPFrame {
-            cmd: 0x00, flags: 0, correlation_id: frame.correlation_id,
+            cmd: 0x00,
+            flags: 0,
+            correlation_id: frame.correlation_id,
             args: Vec::new(),
             payload: Some(Bytes::from("NOAUTH auth richiesta")),
         };
     }
-
 
     let (value, _is_write) = match cmd {
         0x01 => {
@@ -3028,12 +3600,8 @@ async fn execute_obp_command(
                 (OnyxValue::Int(0), false)
             }
         }
-        0xF0 => {
-            (OnyxValue::Blob(Bytes::from("PONG")), false)
-        }
-        _ => {
-            (OnyxValue::Blob(Bytes::from("ERR unknown command")), false)
-        }
+        0xF0 => (OnyxValue::Blob(Bytes::from("PONG")), false),
+        _ => (OnyxValue::Blob(Bytes::from("ERR unknown command")), false),
     };
 
     OBPFrame {
@@ -3048,9 +3616,18 @@ async fn execute_obp_command(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     info!("Starting OnyxDB");
-    START_TIME.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(), Ordering::Relaxed);
+    START_TIME.store(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        Ordering::Relaxed,
+    );
     let repl_id_val: u64 = {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
         let pid = std::process::id() as u64;
         // Non serve crittograficamente sicuro, solo "diverso ad ogni avvio
         // con probabilità di collisione trascurabile".
@@ -3086,8 +3663,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // --user nome:password — ripetibile, un utente per occorrenza.
         if args[i] == "--user" && i + 1 < args.len() {
             match args[i + 1].split_once(':') {
-                Some((name, pw)) => { users_map.insert(name.to_string(), pw.to_string()); }
-                None => warn!("Formato non valido per --user (atteso nome:password): '{}'", args[i + 1]),
+                Some((name, pw)) => {
+                    users_map.insert(name.to_string(), pw.to_string());
+                }
+                None => warn!(
+                    "Formato non valido per --user (atteso nome:password): '{}'",
+                    args[i + 1]
+                ),
             }
         }
         if args[i] == "--auto-failover" {
@@ -3109,12 +3691,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_users = users_map.len();
     USERS.set(users_map).ok();
     if num_users > 0 {
-        info!("Autenticazione richiesta: {} utente/i configurato/i", num_users);
+        info!(
+            "Autenticazione richiesta: {} utente/i configurato/i",
+            num_users
+        );
     }
 
     let policy = match appendfsync.as_deref() {
         Some(s) => FsyncPolicy::parse(s).unwrap_or_else(|| {
-            warn!("Valore non valido per --appendfsync ('{}'), uso 'everysec' di default", s);
+            warn!(
+                "Valore non valido per --appendfsync ('{}'), uso 'everysec' di default",
+                s
+            );
             FsyncPolicy::EverySec
         }),
         None => FsyncPolicy::EverySec,
@@ -3125,7 +3713,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // maxmemory accetta suffissi come Redis: 100mb, 1gb, o un numero puro di byte.
     let maxmemory_val: usize = match maxmemory_arg.as_deref() {
         Some(s) => parse_memory_size(s).unwrap_or_else(|| {
-            warn!("Valore non valido per --maxmemory ('{}'), nessun limite applicato", s);
+            warn!(
+                "Valore non valido per --maxmemory ('{}'), nessun limite applicato",
+                s
+            );
             0
         }),
         None => 0,
@@ -3134,17 +3725,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mm_policy = match maxmemory_policy_arg.as_deref() {
         Some(s) => EvictionPolicy::parse(s).unwrap_or_else(|| {
-            warn!("Valore non valido per --maxmemory-policy ('{}'), uso 'noeviction' di default", s);
+            warn!(
+                "Valore non valido per --maxmemory-policy ('{}'), uso 'noeviction' di default",
+                s
+            );
             EvictionPolicy::NoEviction
         }),
         None => EvictionPolicy::NoEviction,
     };
     MAXMEMORY_POLICY.set(mm_policy).ok();
     if maxmemory_val > 0 {
-        info!("Limite di memoria: {} byte, policy {:?}", maxmemory_val, mm_policy);
+        info!(
+            "Limite di memoria: {} byte, policy {:?}",
+            maxmemory_val, mm_policy
+        );
     }
 
-    tokio::spawn(async { time_updater_task().await; });
+    tokio::spawn(async {
+        time_updater_task().await;
+    });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let store = Arc::new(ShardedStore::new());
@@ -3153,7 +3752,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let store_gc = Arc::clone(&store);
-    tokio::spawn(async move { active_expiration_task(store_gc).await; });
+    tokio::spawn(async move {
+        active_expiration_task(store_gc).await;
+    });
 
     let (tx, mut rx) = mpsc::channel::<LogMessage>(100_000);
     let (replica_tx, _) = tokio::sync::broadcast::channel::<(u64, String)>(4096);
@@ -3208,7 +3809,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     while let Ok(next) = rx.try_recv() {
                         match next {
                             LogMessage::Append(r) => batch.push(r),
-                            LogMessage::Compact => { compact_after = true; break; }
+                            LogMessage::Compact => {
+                                compact_after = true;
+                                break;
+                            }
                         }
                     }
 
@@ -3238,7 +3842,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = fs::remove_file(BINLOG_PATH);
                         let new_file = open_binlog_file(BINLOG_PATH);
                         *binlog_writer.lock().unwrap() = new_file;
-                        persistence_worker.compaction_pending.store(false, Ordering::SeqCst);
+                        persistence_worker
+                            .compaction_pending
+                            .store(false, Ordering::SeqCst);
                     }
                 }
                 LogMessage::Compact => {
@@ -3246,7 +3852,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = fs::remove_file(BINLOG_PATH);
                     let new_file = open_binlog_file(BINLOG_PATH);
                     *binlog_writer.lock().unwrap() = new_file;
-                    persistence_worker.compaction_pending.store(false, Ordering::SeqCst);
+                    persistence_worker
+                        .compaction_pending
+                        .store(false, Ordering::SeqCst);
                 }
             }
         }
@@ -3267,7 +3875,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store_replica = Arc::clone(&store);
         let promote_flag_replica = Arc::clone(&promote_flag);
         tokio::spawn(async move {
-            run_replica(addr, store_replica, promote_flag_replica, auto_failover, failover_timeout_secs).await;
+            run_replica(
+                addr,
+                store_replica,
+                promote_flag_replica,
+                auto_failover,
+                failover_timeout_secs,
+            )
+            .await;
         });
     }
 
@@ -3284,7 +3899,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let obp_addr = format!("127.0.0.1:{}", obp_port);
     let obp_listener = TcpListener::bind(&obp_addr).await?;
     info!("Server OBP (binario) in ascolto su {}", obp_addr);
-    
+
     let store_obp = Arc::clone(&store);
     let persistence_obp = Arc::clone(&persistence);
     tokio::spawn(async move {
@@ -3295,13 +3910,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let store_clone = Arc::clone(&store_obp);
             let persistence_clone = Arc::clone(&persistence_obp);
-            tokio::spawn(async move { handle_obp_client(stream, store_clone, persistence_clone).await; });
+            tokio::spawn(async move {
+                handle_obp_client(stream, store_clone, persistence_clone).await;
+            });
         }
     });
     let metrics_port: u16 = port.parse::<u16>().unwrap_or(6380) + 1000;
     let store_metrics = Arc::clone(&store);
     let persistence_metrics = Arc::clone(&persistence);
-    tokio::spawn(async move { run_metrics_server(store_metrics, persistence_metrics, metrics_port).await; });
+    tokio::spawn(async move {
+        run_metrics_server(store_metrics, persistence_metrics, metrics_port).await;
+    });
 
     let store_shutdown = Arc::clone(&store);
     let persistence_shutdown = Arc::clone(&persistence);
@@ -3394,9 +4013,14 @@ async fn run_replica(
                 let known_replid = local_replid.load(Ordering::SeqCst);
                 let sync_cmd = format!("SYNC {} {}\n", known_replid, starting_offset);
                 if writer.write_all(sync_cmd.as_bytes()).await.is_err() {
-                    warn!("Impossibile inviare SYNC al Master, riprovo tra {}s", backoff_secs);
+                    warn!(
+                        "Impossibile inviare SYNC al Master, riprovo tra {}s",
+                        backoff_secs
+                    );
                     unreachable_since.get_or_insert_with(std::time::Instant::now);
-                    if maybe_self_promote(&unreachable_since) { return; }
+                    if maybe_self_promote(&unreachable_since) {
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                     continue;
@@ -3408,8 +4032,9 @@ async fn run_replica(
                 // <offset>. Se manca o è malformata, meglio riprovare da capo
                 // che procedere alla cieca.
                 let handshake_ok = match read_command(&mut buf_reader, &mut scratch).await {
-                    Ok(Some(marker)) if !marker.is_empty()
-                        && (marker[0] == "+FULLRESYNC" || marker[0] == "+CONTINUE") =>
+                    Ok(Some(marker))
+                        if !marker.is_empty()
+                            && (marker[0] == "+FULLRESYNC" || marker[0] == "+CONTINUE") =>
                     {
                         let is_full = marker[0] == "+FULLRESYNC";
                         if let Some(replid) = marker.get(1).and_then(|s| s.parse::<u64>().ok()) {
@@ -3418,16 +4043,24 @@ async fn run_replica(
                         if is_full {
                             info!("Master ha risposto con dump completo");
                         } else {
-                            info!("Master ha risposto con resync parziale (offset richiesto: {})", starting_offset);
+                            info!(
+                                "Master ha risposto con resync parziale (offset richiesto: {})",
+                                starting_offset
+                            );
                         }
                         true
                     }
                     _ => false,
                 };
                 if !handshake_ok {
-                    warn!("Risposta inattesa dal Master al SYNC, riprovo tra {}s", backoff_secs);
+                    warn!(
+                        "Risposta inattesa dal Master al SYNC, riprovo tra {}s",
+                        backoff_secs
+                    );
                     unreachable_since.get_or_insert_with(std::time::Instant::now);
-                    if maybe_self_promote(&unreachable_since) { return; }
+                    if maybe_self_promote(&unreachable_since) {
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                     continue;
@@ -3456,7 +4089,9 @@ async fn run_replica(
 
                 loop {
                     if promote_flag.load(Ordering::Relaxed) {
-                        info!("Promozione a Master completata, interrotta la connessione col vecchio Master");
+                        info!(
+                            "Promozione a Master completata, interrotta la connessione col vecchio Master"
+                        );
                         ack_task.abort();
                         return;
                     }
@@ -3481,19 +4116,26 @@ async fn run_replica(
                             break;
                         }
                         Err(_) => {
-                            warn!("Errore di lettura dal Master, riprovo tra {}s", backoff_secs);
+                            warn!(
+                                "Errore di lettura dal Master, riprovo tra {}s",
+                                backoff_secs
+                            );
                             unreachable_since.get_or_insert_with(std::time::Instant::now);
                             break;
                         }
                     }
                 }
                 ack_task.abort();
-                if maybe_self_promote(&unreachable_since) { return; }
+                if maybe_self_promote(&unreachable_since) {
+                    return;
+                }
             }
             Err(_) => {
                 warn!("Master non raggiungibile, riprovo tra {}s", backoff_secs);
                 unreachable_since.get_or_insert_with(std::time::Instant::now);
-                if maybe_self_promote(&unreachable_since) { return; }
+                if maybe_self_promote(&unreachable_since) {
+                    return;
+                }
             }
         }
 
@@ -3546,7 +4188,10 @@ mod tests {
         let store = ShardedStore::new();
         store.lpush("lista", "uno".to_string());
         store.lpush("lista", "due".to_string());
-        assert_eq!(store.lrange("lista", 0, -1), Some(vec!["due".to_string(), "uno".to_string()]));
+        assert_eq!(
+            store.lrange("lista", 0, -1),
+            Some(vec!["due".to_string(), "uno".to_string()])
+        );
     }
 
     #[test]
@@ -3605,8 +4250,8 @@ mod tests {
         store.set("s".to_string(), "ciao".to_string());
         assert_eq!(store.strlen("s"), 4);
         assert_eq!(store.strlen("non_esiste"), 0);
-    } 
-// ============================================================
+    }
+    // ============================================================
     // Round-trip binlog binario: ogni comando che scrive deve sopravvivere
     // intatto a command_to_binary_record -> binary_record_to_args.
     // ============================================================
@@ -3621,7 +4266,13 @@ mod tests {
 
     #[test]
     fn test_binlog_roundtrip_set_con_scadenza() {
-        let args = vec!["SET".to_string(), "k".to_string(), "v".to_string(), "EXAT".to_string(), "9999999999".to_string()];
+        let args = vec![
+            "SET".to_string(),
+            "k".to_string(),
+            "v".to_string(),
+            "EXAT".to_string(),
+            "9999999999".to_string(),
+        ];
         let record = command_to_binary_record("SET", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
         assert_eq!(decoded, vec!["SET", "k", "v", "EXAT", "9999999999"]);
@@ -3638,7 +4289,13 @@ mod tests {
 
     #[test]
     fn test_binlog_roundtrip_mset() {
-        let args = vec!["MSET".to_string(), "a".to_string(), "1".to_string(), "b".to_string(), "2".to_string()];
+        let args = vec![
+            "MSET".to_string(),
+            "a".to_string(),
+            "1".to_string(),
+            "b".to_string(),
+            "2".to_string(),
+        ];
         let record = command_to_binary_record("MSET", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
         assert_eq!(decoded, vec!["MSET", "a", "1", "b", "2"]);
@@ -3648,7 +4305,10 @@ mod tests {
     fn test_binlog_roundtrip_del() {
         let args = vec!["DEL".to_string(), "chiave".to_string()];
         let record = command_to_binary_record("DEL", &args, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["DEL", "chiave"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["DEL", "chiave"]
+        );
     }
 
     #[test]
@@ -3665,74 +4325,123 @@ mod tests {
     fn test_binlog_roundtrip_lpush_rpush() {
         let lpush = vec!["LPUSH".to_string(), "lista".to_string(), "x".to_string()];
         let record = command_to_binary_record("LPUSH", &lpush, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["LPUSH", "lista", "x"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["LPUSH", "lista", "x"]
+        );
 
         let rpush = vec!["RPUSH".to_string(), "lista".to_string(), "y".to_string()];
         let record = command_to_binary_record("RPUSH", &rpush, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["RPUSH", "lista", "y"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["RPUSH", "lista", "y"]
+        );
     }
 
     #[test]
     fn test_binlog_roundtrip_lpop_rpop() {
         let args = vec!["LPOP".to_string(), "lista".to_string()];
         let record = command_to_binary_record("LPOP", &args, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["LPOP", "lista"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["LPOP", "lista"]
+        );
     }
 
     #[test]
     fn test_binlog_roundtrip_hset() {
-        let args = vec!["HSET".to_string(), "h".to_string(), "campo".to_string(), "valore".to_string()];
+        let args = vec![
+            "HSET".to_string(),
+            "h".to_string(),
+            "campo".to_string(),
+            "valore".to_string(),
+        ];
         let record = command_to_binary_record("HSET", &args, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["HSET", "h", "campo", "valore"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["HSET", "h", "campo", "valore"]
+        );
     }
 
     #[test]
     fn test_binlog_roundtrip_sadd_srem() {
         let sadd = vec!["SADD".to_string(), "s".to_string(), "membro".to_string()];
         let record = command_to_binary_record("SADD", &sadd, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["SADD", "s", "membro"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["SADD", "s", "membro"]
+        );
 
         let srem = vec!["SREM".to_string(), "s".to_string(), "membro".to_string()];
         let record = command_to_binary_record("SREM", &srem, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["SREM", "s", "membro"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["SREM", "s", "membro"]
+        );
     }
 
     #[test]
     fn test_binlog_roundtrip_rename() {
-        let args = vec!["RENAME".to_string(), "vecchia".to_string(), "nuova".to_string()];
+        let args = vec![
+            "RENAME".to_string(),
+            "vecchia".to_string(),
+            "nuova".to_string(),
+        ];
         let record = command_to_binary_record("RENAME", &args, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["RENAME", "vecchia", "nuova"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["RENAME", "vecchia", "nuova"]
+        );
     }
 
     #[test]
     fn test_binlog_roundtrip_incrby_decrby() {
         let incr = vec!["INCRBY".to_string(), "c".to_string(), "7".to_string()];
         let record = command_to_binary_record("INCRBY", &incr, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["INCRBY", "c", "7"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["INCRBY", "c", "7"]
+        );
         let decr = vec!["DECRBY".to_string(), "c".to_string(), "3".to_string()];
         let record = command_to_binary_record("DECRBY", &decr, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["DECRBY", "c", "3"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["DECRBY", "c", "3"]
+        );
     }
 
     #[test]
     fn test_binlog_roundtrip_append() {
-        let args = vec!["APPEND".to_string(), "s".to_string(), "suffisso".to_string()];
+        let args = vec![
+            "APPEND".to_string(),
+            "s".to_string(),
+            "suffisso".to_string(),
+        ];
         let record = command_to_binary_record("APPEND", &args, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["APPEND", "s", "suffisso"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["APPEND", "s", "suffisso"]
+        );
     }
 
     #[test]
     fn test_binlog_roundtrip_hdel() {
         let args = vec!["HDEL".to_string(), "h".to_string(), "campo".to_string()];
         let record = command_to_binary_record("HDEL", &args, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["HDEL", "h", "campo"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["HDEL", "h", "campo"]
+        );
     }
 
     #[test]
     fn test_binlog_roundtrip_copy() {
         let args = vec!["COPY".to_string(), "src".to_string(), "dst".to_string()];
         let record = command_to_binary_record("COPY", &args, None).unwrap();
-        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["COPY", "src", "dst"]);
+        assert_eq!(
+            binary_record_to_args(&record).unwrap(),
+            vec!["COPY", "src", "dst"]
+        );
     }
     #[test]
     fn test_binlog_roundtrip_json_set() {
@@ -3744,7 +4453,10 @@ mod tests {
         ];
         let record = command_to_binary_record("JSON.SET", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
-        assert_eq!(decoded, vec!["JSON.SET", "utente", "$", "{\"nome\":\"Marco\"}"]);
+        assert_eq!(
+            decoded,
+            vec!["JSON.SET", "utente", "$", "{\"nome\":\"Marco\"}"]
+        );
     }
 
     #[test]
@@ -3757,11 +4469,18 @@ mod tests {
         ];
         let record = command_to_binary_record("JSON.SET", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
-        assert_eq!(decoded, vec!["JSON.SET", "utente", "$.indirizzo.città", "\"Roma\""]);
+        assert_eq!(
+            decoded,
+            vec!["JSON.SET", "utente", "$.indirizzo.città", "\"Roma\""]
+        );
     }
     #[test]
     fn test_binlog_roundtrip_json_del() {
-        let args = vec!["JSON.DEL".to_string(), "utente".to_string(), "$.età".to_string()];
+        let args = vec![
+            "JSON.DEL".to_string(),
+            "utente".to_string(),
+            "$.età".to_string(),
+        ];
         let record = command_to_binary_record("JSON.DEL", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
         assert_eq!(decoded, vec!["JSON.DEL", "utente", "$.età"]);
@@ -3793,7 +4512,7 @@ mod tests {
             OnyxValue::Json(v) => assert_eq!(v, serde_json::json!({"nome": "Marco", "età": 18})),
             _ => panic!("tipo sbagliato dopo il round-trip"),
         }
-     }
+    }
 
     #[test]
     fn test_binlog_comando_sconosciuto_ritorna_none() {
@@ -3911,7 +4630,12 @@ mod tests {
     fn test_snapshot_roundtrip_hash() {
         let mut h = std::collections::HashMap::new();
         h.insert(Bytes::from("f1"), Bytes::from("v1"));
-        let entry = DataEntry { value: OnyxValue::Hash(h), expires_at: None, created_at: 0, last_accessed: 0 };
+        let entry = DataEntry {
+            value: OnyxValue::Hash(h),
+            expires_at: None,
+            created_at: 0,
+            last_accessed: 0,
+        };
         let line = value_to_line("k", &entry);
         let (_, decoded) = line_to_entry(&line).unwrap();
         match decoded.value {
@@ -3993,7 +4717,10 @@ mod tests {
 
     #[test]
     fn test_parse_path_campo_singolo() {
-        assert_eq!(parse_json_path("$.nome"), Some(vec![JsonPathSegment::Field("nome".to_string())]));
+        assert_eq!(
+            parse_json_path("$.nome"),
+            Some(vec![JsonPathSegment::Field("nome".to_string())])
+        );
     }
 
     #[test]
@@ -4011,7 +4738,10 @@ mod tests {
     fn test_parse_path_indice_array() {
         assert_eq!(
             parse_json_path("$.tag[0]"),
-            Some(vec![JsonPathSegment::Field("tag".to_string()), JsonPathSegment::Index(0)])
+            Some(vec![
+                JsonPathSegment::Field("tag".to_string()),
+                JsonPathSegment::Index(0)
+            ])
         );
     }
 
@@ -4052,7 +4782,10 @@ mod tests {
     fn test_get_json_path_campo_esistente() {
         let val: serde_json::Value = serde_json::json!({"nome": "Marco", "età": 18});
         let path = parse_json_path("$.nome").unwrap();
-        assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("Marco")));
+        assert_eq!(
+            get_json_path(&val, &path),
+            Some(&serde_json::json!("Marco"))
+        );
     }
 
     #[test]
@@ -4095,7 +4828,11 @@ mod tests {
     fn test_set_json_path_documento_intero() {
         let mut val: serde_json::Value = serde_json::json!({"vecchio": true});
         let path = parse_json_path("$").unwrap();
-        assert!(set_json_path(&mut val, &path, serde_json::json!({"nuovo": true})));
+        assert!(set_json_path(
+            &mut val,
+            &path,
+            serde_json::json!({"nuovo": true})
+        ));
         assert_eq!(val, serde_json::json!({"nuovo": true}));
     }
 
@@ -4253,7 +4990,13 @@ mod tests {
     #[test]
     fn test_json_arrlen_e_objkeys_via_store() {
         let store = ShardedStore::new();
-        store.json_set("utente", "$", serde_json::json!({"nome": "Marco", "tag": ["dev", "rust"]})).unwrap();
+        store
+            .json_set(
+                "utente",
+                "$",
+                serde_json::json!({"nome": "Marco", "tag": ["dev", "rust"]}),
+            )
+            .unwrap();
 
         assert_eq!(store.json_arrlen("utente", "$.tag"), Ok(Some(2)));
 
@@ -4266,14 +5009,18 @@ mod tests {
     #[test]
     fn test_json_arrlen_su_non_array_ritorna_none() {
         let store = ShardedStore::new();
-        store.json_set("utente", "$", serde_json::json!({"nome": "Marco"})).unwrap();
+        store
+            .json_set("utente", "$", serde_json::json!({"nome": "Marco"}))
+            .unwrap();
         assert_eq!(store.json_arrlen("utente", "$.nome"), Ok(None));
     }
 
     #[test]
     fn test_json_objkeys_su_non_oggetto_ritorna_none() {
         let store = ShardedStore::new();
-        store.json_set("utente", "$", serde_json::json!({"tag": ["dev"]})).unwrap();
+        store
+            .json_set("utente", "$", serde_json::json!({"tag": ["dev"]}))
+            .unwrap();
         assert_eq!(store.json_objkeys("utente", "$.tag"), Ok(None));
     }
 
@@ -4312,6 +5059,9 @@ mod tests {
         ];
         let record = command_to_binary_record("JSON.ARRAPPEND", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
-        assert_eq!(decoded, vec!["JSON.ARRAPPEND", "utente", "$.tag", "\"rust\""]);
+        assert_eq!(
+            decoded,
+            vec!["JSON.ARRAPPEND", "utente", "$.tag", "\"rust\""]
+        );
     }
 }

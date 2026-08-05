@@ -1,8 +1,7 @@
-
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::task;
-use std::time::Instant;
 
 const NUM_THREADS: usize = 50;
 const OPS_PER_THREAD: usize = 500;
@@ -48,7 +47,9 @@ async fn skip_reply(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> s
 }
 
 async fn run_worker_sync(thread_id: usize) -> u128 {
-    let stream = TcpStream::connect("127.0.0.1:6380").await.expect("Connessione fallita");
+    let stream = TcpStream::connect("127.0.0.1:6380")
+        .await
+        .expect("Connessione fallita");
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -70,7 +71,9 @@ async fn run_worker_sync(thread_id: usize) -> u128 {
 }
 
 async fn run_worker_pipeline(thread_id: usize) -> u128 {
-    let stream = TcpStream::connect("127.0.0.1:6380").await.expect("Connessione fallita");
+    let stream = TcpStream::connect("127.0.0.1:6380")
+        .await
+        .expect("Connessione fallita");
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -102,9 +105,15 @@ async fn run_worker_pipeline(thread_id: usize) -> u128 {
     start.elapsed().as_millis()
 }
 
-async fn run_benchmark(label: &str, worker: fn(usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = u128> + Send>>) {
+async fn run_benchmark(
+    label: &str,
+    worker: fn(usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = u128> + Send>>,
+) {
     println!("\n=== {} ===", label);
-    println!("Thread: {} | Operazioni per thread: {}", NUM_THREADS, OPS_PER_THREAD);
+    println!(
+        "Thread: {} | Operazioni per thread: {}",
+        NUM_THREADS, OPS_PER_THREAD
+    );
 
     let total_start = Instant::now();
     let mut handles = vec![];
@@ -133,6 +142,12 @@ async fn main() {
     println!("OnyxDB Benchmark - Confronto Sync vs Pipeline (protocollo RESP)");
     println!("Connessione al server su 127.0.0.1:6380...");
 
-    run_benchmark("Modalita SINCRONA (una richiesta alla volta)", |t| Box::pin(run_worker_sync(t))).await;
-    run_benchmark("Modalita PIPELINE (batch di comandi)", |t| Box::pin(run_worker_pipeline(t))).await;
+    run_benchmark("Modalita SINCRONA (una richiesta alla volta)", |t| {
+        Box::pin(run_worker_sync(t))
+    })
+    .await;
+    run_benchmark("Modalita PIPELINE (batch di comandi)", |t| {
+        Box::pin(run_worker_pipeline(t))
+    })
+    .await;
 }
