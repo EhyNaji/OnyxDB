@@ -173,6 +173,12 @@ pub struct ShardedStore {
     engine: OnyxEngine,
 }
 
+impl Default for ShardedStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ShardedStore {
     pub fn new() -> Self {
         Self {
@@ -1048,14 +1054,11 @@ fn delete_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment]) 
     }
     match (&segments[segments.len() - 1], current) {
         (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => map.remove(f).is_some(),
-        (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => {
-            if *idx < arr.len() {
+        (JsonPathSegment::Index(idx), serde_json::Value::Array(arr))
+            if *idx < arr.len() => {
                 arr.remove(*idx);
                 true
-            } else {
-                false
             }
-        }
         _ => false,
     }
 }
@@ -1138,10 +1141,8 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             star_idx = Some(p_idx);
             match_idx = t_idx;
             p_idx += 1;
-        } else if star_idx.is_some() {
-            // Non ha funzionato: fai "espandere" l'ultimo '*' di un
-            // carattere in piu' e riprova da li'.
-            p_idx = star_idx.unwrap() + 1;
+        } else if let Some(star) = star_idx {
+            p_idx = star + 1;
             match_idx += 1;
             t_idx = match_idx;
         } else {
@@ -1498,7 +1499,7 @@ fn command_to_binary_record(
             let delta = args[2].parse::<i64>().unwrap_or(1);
             write_u16_be(&mut buf, key.len() as u16);
             buf.extend_from_slice(key.as_bytes());
-            write_u64_be(&mut buf, delta.abs() as u64);
+            write_u64_be(&mut buf, delta.unsigned_abs());
         }
         "APPEND" => {
             if args.len() < 3 {
@@ -1965,7 +1966,7 @@ fn partial_resync_possible(
     }
 }
 fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
-    let cmd = args.get(0).map(|s| s.as_str()).unwrap_or("");
+    let cmd = args.first().map(|s| s.as_str()).unwrap_or("");
     let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
     let arg = args.get(2).map(|s| s.as_str()).unwrap_or("");
 
@@ -2264,7 +2265,7 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
             }
         }
         "MSET" => {
-            if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+            if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
                 (
                     RESPValue::Error("ERR wrong number of arguments for 'mset'".to_string()),
                     false,
@@ -2460,14 +2461,13 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
 }
 
 fn normalize_for_log(store: &ShardedStore, args: &[String]) -> String {
-    let cmd = args.get(0).map(|s| s.as_str()).unwrap_or("");
+    let cmd = args.first().map(|s| s.as_str()).unwrap_or("");
     let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
-    if cmd == "EXPIRE" {
-        if let Some(exp) = store.get_expiry(key) {
+    if cmd == "EXPIRE"
+        && let Some(exp) = store.get_expiry(key) {
             return format!("EXPIREAT {} {}", key, exp);
         }
-    }
     if cmd == "SET" && args.len() > 3 {
         // SET con opzioni (EX/PX/NX/XX): NX/XX sono a posto così come sono
         // (existence-based, replay deterministico), ma EX/PX sono relativi
@@ -2493,8 +2493,8 @@ fn load_data(store: &ShardedStore) {
         Ordering::SeqCst,
     );
 
-    if Path::new(SNAPSHOT_PATH).exists() {
-        if let Ok(file) = File::open(SNAPSHOT_PATH) {
+    if Path::new(SNAPSHOT_PATH).exists()
+        && let Ok(file) = File::open(SNAPSHOT_PATH) {
             let decoder = GzDecoder::new(file);
             let mut count = 0;
             let mut skipped = 0;
@@ -2524,11 +2524,10 @@ fn load_data(store: &ShardedStore) {
             }
             info!("Snapshot caricato: {} elementi attivi", count);
         }
-    }
 
     const BINLOG_PATH: &str = "onyx.binlog";
-    if Path::new(BINLOG_PATH).exists() {
-        if let Ok(data) = fs::read(BINLOG_PATH) {
+    if Path::new(BINLOG_PATH).exists()
+        && let Ok(data) = fs::read(BINLOG_PATH) {
             let mut offset = 0;
             let mut count = 0;
             let mut corrupt_records = 0;
@@ -2573,7 +2572,6 @@ fn load_data(store: &ShardedStore) {
             }
             info!("Binlog riprodotto: {} comandi", count);
         }
-    }
 }
 async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence: Arc<Persistence>) {
     let _ = stream.set_nodelay(true);
@@ -2689,7 +2687,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 in_transaction = false;
                 let mut results = Vec::with_capacity(queued_commands.len());
                 for queued_args in queued_commands.drain(..) {
-                    let queued_cmd = queued_args.get(0).map(|s| s.as_str()).unwrap_or("");
+                    let queued_cmd = queued_args.first().map(|s| s.as_str()).unwrap_or("");
                     if IS_REPLICA.load(Ordering::Relaxed) && is_write_command(queued_cmd) {
                         results.push(RESPValue::Error(
                             "READONLY questa istanza è una Replica in sola lettura".to_string(),
@@ -2753,14 +2751,14 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             let mut my_channels: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
 
-            for channel in args[1..].to_vec() {
+            for channel in args[1..].iter().cloned() {
                 my_channels.insert(channel.clone());
                 persistence
                     .subscriptions
                     .lock()
                     .unwrap()
                     .entry(channel.clone())
-                    .or_insert_with(std::collections::HashSet::new)
+                    .or_default()
                     .insert(sub_id);
                 let count = my_channels.len();
                 let confirm = RESPValue::Array(vec![
@@ -2822,7 +2820,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                             for channel in channels {
                                 if my_channels.insert(channel.clone()) {
                                     persistence.subscriptions.lock().unwrap()
-                                        .entry(channel.clone()).or_insert_with(std::collections::HashSet::new)
+                                        .entry(channel.clone()).or_default()
                                         .insert(sub_id);
                                 }
                                 let count = my_channels.len();
@@ -2898,13 +2896,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
 
         // SYNC
         if cmd == "SYNC" {
-            // Nuovo formato: `SYNC <replid> <offset>`. `replid=0` significa
-            // "non conosco ancora il replication ID del Master" (prima
-            // connessione) e forza sempre un dump completo, così come un
-            // replid che non combacia con quello attuale del Master (segno
-            // che il Master è ripartito da zero da quando la Replica si è
-            // vista l'ultima volta — il suo vecchio offset non ha più senso
-            // qui, anche se il backlog risultasse "vuoto" per coincidenza).
+            // Nuovo formato: `SYNC <replid> <offset>`. `replid=0` 
             let requested_replid: u64 =
                 args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             let requested_offset: u64 =
@@ -2919,9 +2911,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 );
             }
 
-            // Sottoscrizione al canale broadcast prima di leggere backlog/snapshot,
-            // così nessuna scrittura concorrente può sfuggire nella finestra tra
-            // "decido cosa mandare" e "comincio a mandare in tempo reale".
+            // Sottoscrizione al canale broadcast prima di leggere backlog/snapshot
             let mut replica_rx = persistence.replica_tx.subscribe();
 
             // Un resync parziale è possibile SOLO se il replication ID
@@ -2973,11 +2963,9 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                                     .get(1)
                                     .map(|s| s.eq_ignore_ascii_case("ACK"))
                                     .unwrap_or(false)
-                            {
-                                if let Some(off) =
+                                && let Some(off) =
                                     ack_args.get(2).and_then(|s| s.parse::<u64>().ok())
-                                {
-                                    if let Some(status) = persistence_ack
+                                    && let Some(status) = persistence_ack
                                         .replica_status
                                         .lock()
                                         .unwrap()
@@ -2986,8 +2974,6 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                                         status.last_ack_offset = off;
                                         status.last_ack_time = now();
                                     }
-                                }
-                            }
                         }
                         Ok(Some(_)) => continue,
                         Ok(None) | Err(_) => break,
@@ -3202,8 +3188,8 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
 
             TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
             let (mut resp, is_write) = execute_command(&store, &args);
-            if cmd.eq_ignore_ascii_case("INFO") {
-                if let RESPValue::BulkString(Some(ref mut text)) = resp {
+            if cmd.eq_ignore_ascii_case("INFO")
+                && let RESPValue::BulkString(Some(ref mut text)) = resp {
                     let repl_offset = persistence.repl_offset.load(Ordering::SeqCst);
                     let statuses = persistence.replica_status.lock().unwrap();
                     let connected_replicas = statuses.len();
@@ -3226,7 +3212,6 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     }
                     drop(statuses);
                 }
-            }
             if !is_write {
                 match &resp {
                     RESPValue::BulkString(None) => {
@@ -3488,7 +3473,7 @@ async fn persist_and_replicate(
     }
     let _ = persistence.replica_tx.send((new_offset, text_for_replica));
 
-    let cmd_name = normalized_args.get(0).map(|s| s.as_str()).unwrap_or("");
+    let cmd_name = normalized_args.first().map(|s| s.as_str()).unwrap_or("");
     if let Some(binary_record) = command_to_binary_record(cmd_name, &normalized_args, None) {
         let _ = persistence
             .log_tx
@@ -3527,7 +3512,7 @@ async fn execute_obp_command(
         } else {
             (
                 "default".to_string(),
-                args.get(0)
+                args.first()
                     .map(|a| String::from_utf8_lossy(a).to_string())
                     .unwrap_or_default(),
             )
@@ -3558,7 +3543,7 @@ async fn execute_obp_command(
 
     let (value, _is_write) = match cmd {
         0x01 => {
-            if let Some(key) = args.get(0) {
+            if let Some(key) = args.first() {
                 (
                     store
                         .engine
@@ -3588,7 +3573,7 @@ async fn execute_obp_command(
             }
         }
         0x03 => {
-            if let Some(key) = args.get(0) {
+            if let Some(key) = args.first() {
                 let deleted = store.engine.delete(key);
                 if deleted {
                     let key_str = String::from_utf8_lossy(key).to_string();

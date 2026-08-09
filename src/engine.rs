@@ -155,11 +155,10 @@ impl Shard {
     fn get(&mut self, key: &Bytes) -> Option<&DataEntry> {
         let ts = now();
         let entry = self.data.get_mut(key)?;
-        if let Some(exp) = entry.expires_at {
-            if ts >= exp {
+        if let Some(exp) = entry.expires_at
+            && ts >= exp {
                 return None; // scaduto, ma non rimosso qui (lazy)
             }
-        }
         entry.last_accessed = ts;
         Some(&*entry)
     }
@@ -196,7 +195,7 @@ impl Shard {
         let expired: Vec<Bytes> = self
             .data
             .iter()
-            .filter(|(_, entry)| entry.expires_at.map_or(false, |exp| now >= exp))
+            .filter(|(_, entry)| entry.expires_at.is_some_and(|exp| now >= exp))
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -560,7 +559,7 @@ impl OnyxEngine {
         for shard in &self.shards {
             let s = shard.lock().unwrap();
             for (k, entry) in s.data.iter() {
-                let expired = entry.expires_at.map_or(false, |exp| current >= exp);
+                let expired = entry.expires_at.is_some_and(|exp| current >= exp);
                 if !expired {
                     out.push(k.clone());
                 }
@@ -579,7 +578,7 @@ impl OnyxEngine {
         for shard in &self.shards {
             let s = shard.lock().unwrap();
             for (k, entry) in s.data.iter() {
-                let expired = entry.expires_at.map_or(false, |exp| current >= exp);
+                let expired = entry.expires_at.is_some_and(|exp| current >= exp);
                 if !expired {
                     out.push((k.clone(), entry.clone()));
                 }
