@@ -16,7 +16,7 @@ async fn read_reply(reader: &mut BufReader<OwnedReadHalf>) -> std::io::Result<St
     let mut header = String::new();
     let n = reader.read_line(&mut header).await?;
     if n == 0 {
-        return Ok("(connessione chiusa)".to_string());
+        return Ok("(connection closed)".to_string());
     }
     let header = header.trim_end();
     if header.is_empty() {
@@ -90,7 +90,7 @@ async fn connect(addr: &str) -> Option<Connection> {
             })
         }
         Err(e) => {
-            println!("Impossibile connettersi a {}: {}", addr, e);
+            println!("Unable to connect to {}: {}", addr, e);
             None
         }
     }
@@ -99,11 +99,11 @@ async fn connect(addr: &str) -> Option<Connection> {
 async fn send_and_read(conn: &mut Connection, command: &str) -> String {
     let encoded = encode_command(command);
     if conn.writer.write_all(encoded.as_bytes()).await.is_err() {
-        return "(errore di scrittura, connessione persa)".to_string();
+        return "(write error: connection lost)".to_string();
     }
     read_reply(&mut conn.reader)
         .await
-        .unwrap_or_else(|e| format!("(errore di lettura: {})", e))
+        .unwrap_or_else(|e| format!("(read error: {})", e))
 }
 
 #[tokio::main]
@@ -130,7 +130,7 @@ async fn main() {
 
     println!("OnyxDB CLI - Master: {}", master_addr);
     if !replica_addrs.is_empty() {
-        println!("Repliche per le letture: {:?}", replica_addrs);
+        println!("Read replicas: {:?}", replica_addrs);
     }
 
     let mut master_conn = match connect(&master_addr).await {
@@ -150,7 +150,7 @@ async fn main() {
     }
     let mut replica_index = 0usize;
 
-    println!("Connesso! Scrivi 'exit' per uscire.\n");
+    println!("Connected! Type 'exit' to quit.\n");
 
     let stdin = io::stdin();
     loop {
@@ -166,7 +166,7 @@ async fn main() {
             continue;
         }
         if command.eq_ignore_ascii_case("exit") {
-            println!("Arrivederci!");
+            println!("Goodbye!");
             break;
         }
 
@@ -177,7 +177,7 @@ async fn main() {
             replica_index += 1;
             let (target, conn) = &mut replica_conns[idx];
             let reply = send_and_read(conn, command).await;
-            println!("[lettura da replica {}]", target);
+            println!("[reading from replica {}]", target);
             reply
         } else {
             send_and_read(&mut master_conn, command).await

@@ -49,7 +49,7 @@ async fn skip_reply(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> s
 async fn run_worker_sync(thread_id: usize) -> u128 {
     let stream = TcpStream::connect("127.0.0.1:6380")
         .await
-        .expect("Connessione fallita");
+        .expect("Connection failed");
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -73,7 +73,7 @@ async fn run_worker_sync(thread_id: usize) -> u128 {
 async fn run_worker_pipeline(thread_id: usize) -> u128 {
     let stream = TcpStream::connect("127.0.0.1:6380")
         .await
-        .expect("Connessione fallita");
+        .expect("Connection failed");
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -87,7 +87,7 @@ async fn run_worker_pipeline(thread_id: usize) -> u128 {
 
         for j in i..batch_end {
             let key = format!("bench_{}_{}", thread_id, j);
-            let value = format!("valore_{}", j);
+            let value = format!("value_{}", j);
             batch.push_str(&encode_command(&["SET".to_string(), key.clone(), value]));
             batch.push_str(&encode_command(&["GET".to_string(), key]));
             expected_responses += 2;
@@ -111,7 +111,7 @@ async fn run_benchmark(
 ) {
     println!("\n=== {} ===", label);
     println!(
-        "Thread: {} | Operazioni per thread: {}",
+        "Threads: {} | Operations per thread: {}",
         NUM_THREADS, OPS_PER_THREAD
     );
 
@@ -130,23 +130,23 @@ async fn run_benchmark(
     let total_elapsed = total_start.elapsed();
     let total_ops = NUM_THREADS * OPS_PER_THREAD * 2;
 
-    println!("Tempo totale: {} ms", total_elapsed.as_millis());
-    println!("Operazioni totali: {}", total_ops);
+    println!("Total time: {} ms", total_elapsed.as_millis());
+    println!("Total operations: {}", total_ops);
 
     let ops_per_sec = (total_ops as f64) / (total_elapsed.as_secs_f64());
-    println!("Operazioni al secondo: {:.0} ops/sec", ops_per_sec);
+    println!("Operations per second: {:.0} ops/sec", ops_per_sec);
 }
 
 #[tokio::main]
 async fn main() {
-    println!("OnyxDB Benchmark - Confronto Sync vs Pipeline (protocollo RESP)");
-    println!("Connessione al server su 127.0.0.1:6380...");
+    println!("OnyxDB Benchmark - Sync vs Pipeline comparison (RESP protocol)");
+    println!("Connecting to server at 127.0.0.1:6380...");
 
-    run_benchmark("Modalita SINCRONA (una richiesta alla volta)", |t| {
+    run_benchmark("SYNC mode (one request at a time)", |t| {
         Box::pin(run_worker_sync(t))
     })
     .await;
-    run_benchmark("Modalita PIPELINE (batch di comandi)", |t| {
+    run_benchmark("PIPELINE mode (batch of commands)", |t| {
         Box::pin(run_worker_pipeline(t))
     })
     .await;

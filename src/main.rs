@@ -94,7 +94,7 @@ fn open_binlog_file(path: &str) -> File {
         match OpenOptions::new().create(true).append(true).open(path) {
             Ok(f) => return f,
             Err(e) => {
-                error!("Impossibile aprire {} ({}). Ritento tra 3s...", path, e);
+                error!("Unable to open {} ({}). Retrying in 3s...", path, e);
                 std::thread::sleep(Duration::from_secs(3));
             }
         }
@@ -604,7 +604,7 @@ impl ShardedStore {
         path: &str,
         new_value: serde_json::Value,
     ) -> Result<(), &'static str> {
-        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
         let key_b = Bytes::from(key.to_string());
 
         if segments.is_empty() {
@@ -621,15 +621,15 @@ impl ShardedStore {
         match result {
             Some(Some(true)) => Ok(()),
             Some(Some(false)) => {
-                Err("ERR path non raggiungibile (elemento intermedio assente o indice fuori range)")
+                Err("ERR path not reachable (intermediate element missing or index out of bounds)")
             }
-            Some(None) => Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON"),
-            None => Err("ERR chiave inesistente: usa JSON.SET chiave $ {...} per crearla"),
+            Some(None) => Err("WRONGTYPE key exists but does not hold a JSON value"),
+            None => Err("ERR key does not exist: use JSON.SET key $ {...} to create it"),
         }
     }
 
     pub fn json_get(&self, key: &str, path: &str) -> Result<Option<String>, &'static str> {
-        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
         let result = self
             .engine
             .read(&Bytes::from(key.to_string()), move |entry| {
@@ -652,7 +652,7 @@ impl ShardedStore {
     }
 
     pub fn json_del(&self, key: &str, path: &str) -> Result<bool, &'static str> {
-        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
         if segments.is_empty() {
             // DEL sul documento intero: stessa semantica del DEL normale.
             return Ok(self.delete(key));
@@ -664,13 +664,13 @@ impl ShardedStore {
         });
         match result {
             Some(Some(deleted)) => Ok(deleted),
-            Some(None) => Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON"),
+            Some(None) => Err(" WRONGTYPE key exists but does not hold a JSON value"),
             None => Ok(false), // chiave inesistente: nulla da cancellare
         }
     }
 
     pub fn json_type(&self, key: &str, path: &str) -> Result<Option<&'static str>, &'static str> {
-        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
         let result = self
             .engine
             .read(&Bytes::from(key.to_string()), move |entry| {
@@ -696,7 +696,7 @@ impl ShardedStore {
         Ok(result.flatten())
     }
     pub fn json_numincrby(&self, key: &str, path: &str, delta: f64) -> Result<f64, String> {
-        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
         let key_b = Bytes::from(key.to_string());
         let result = self.engine.update_if_exists(&key_b, move |v| match v {
             OnyxValue::Json(root) => Some(numincrby_json_path(root, &segments, delta)),
@@ -706,9 +706,9 @@ impl ShardedStore {
             Some(Some(Ok(new_val))) => Ok(new_val),
             Some(Some(Err(e))) => Err(e.to_string()),
             Some(None) => {
-                Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON".to_string())
+                Err("WRONGTYPE key exists but does not hold a JSON value".to_string())
             }
-            None => Err("ERR chiave inesistente".to_string()),
+            None => Err("ERR key does not exist: use JSON.SET key $ {...} to create it".to_string()),
         }
     }
 
@@ -718,7 +718,7 @@ impl ShardedStore {
         path: &str,
         new_value: serde_json::Value,
     ) -> Result<usize, String> {
-        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
         let key_b = Bytes::from(key.to_string());
         let result = self.engine.update_if_exists(&key_b, move |v| match v {
             OnyxValue::Json(root) => Some(arrappend_json_path(root, &segments, new_value)),
@@ -728,13 +728,13 @@ impl ShardedStore {
             Some(Some(Ok(new_len))) => Ok(new_len),
             Some(Some(Err(e))) => Err(e.to_string()),
             Some(None) => {
-                Err("WRONGTYPE la chiave esiste ma non contiene un valore JSON".to_string())
+                Err("WRONGTYPE key exists but does not hold a JSON value".to_string())
             }
-            None => Err("ERR chiave inesistente".to_string()),
+            None => Err("ERR key does not exist: use JSON.SET key $ {...} to create it".to_string()),
         }
     }
     pub fn json_arrlen(&self, key: &str, path: &str) -> Result<Option<usize>, String> {
-        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
         let result = self
             .engine
             .read(&Bytes::from(key.to_string()), move |entry| {
@@ -754,7 +754,7 @@ impl ShardedStore {
     }
 
     pub fn json_objkeys(&self, key: &str, path: &str) -> Result<Option<Vec<String>>, String> {
-        let segments = parse_json_path(path).ok_or("ERR path JSON non valido")?;
+        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
         let result = self
             .engine
             .read(&Bytes::from(key.to_string()), move |entry| {
@@ -1089,16 +1089,16 @@ fn numincrby_json_path(
     segments: &[JsonPathSegment],
     delta: f64,
 ) -> Result<f64, &'static str> {
-    let node = get_json_path_mut(root, segments).ok_or("ERR path JSON non trovato")?;
+    let node = get_json_path_mut(root, segments).ok_or("ERR path JSON not found")?;
     let current = node
         .as_f64()
-        .ok_or("WRONGTYPE il valore al path non è un numero")?;
+        .ok_or("WRONGTYPE the value at the path is not a number")?;
     let new_val = current + delta;
     let new_number = if new_val.fract() == 0.0 && new_val.abs() < i64::MAX as f64 {
         serde_json::Number::from(new_val as i64)
     } else {
         serde_json::Number::from_f64(new_val)
-            .ok_or("ERR risultato numerico non valido (NaN o infinito)")?
+            .ok_or("ERR invalid numeric result (NaN or infinity)")?
     };
     *node = serde_json::Value::Number(new_number);
     Ok(new_val)
@@ -1111,13 +1111,13 @@ fn arrappend_json_path(
     segments: &[JsonPathSegment],
     new_value: serde_json::Value,
 ) -> Result<usize, &'static str> {
-    let node = get_json_path_mut(root, segments).ok_or("ERR path JSON non trovato")?;
+    let node = get_json_path_mut(root, segments).ok_or("ERR path JSON not found")?;
     match node {
         serde_json::Value::Array(arr) => {
             arr.push(new_value);
             Ok(arr.len())
         }
-        _ => Err("WRONGTYPE il valore al path non è un array"),
+        _ => Err("WRONGTYPE the value at the path is not an array"),
     }
 }
 fn glob_match(pattern: &str, text: &str) -> bool {
@@ -2138,7 +2138,7 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
             let raw_value = args.get(3).map(|s| s.as_str()).unwrap_or("");
             if key.is_empty() || path.is_empty() || raw_value.is_empty() {
                 (
-                    RESPValue::Error("ERR uso: JSON.SET chiave path valore-json".to_string()),
+                    RESPValue::Error("ERR usage: JSON.SET key path json-value".to_string()),
                     false,
                 )
             } else {
@@ -2148,7 +2148,7 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
                         Err(e) => (RESPValue::Error(e.to_string()), false),
                     },
                     Err(_) => (
-                        RESPValue::Error("ERR valore non è JSON valido".to_string()),
+                        RESPValue::Error("ERR value is not valid JSON".to_string()),
                         false,
                     ),
                 }
@@ -2186,7 +2186,7 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
                     Err(e) => (RESPValue::Error(e), false),
                 },
                 Err(_) => (
-                    RESPValue::Error("ERR delta non è un numero valido".to_string()),
+                    RESPValue::Error("ERR delta is not a valid number".to_string()),
                     false,
                 ),
             }
@@ -2200,7 +2200,7 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
                     Err(e) => (RESPValue::Error(e), false),
                 },
                 Err(_) => (
-                    RESPValue::Error("ERR valore non è JSON valido".to_string()),
+                    RESPValue::Error("ERR value is not valid JSON".to_string()),
                     false,
                 ),
             }
@@ -2453,7 +2453,7 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
         }
         "PING" => (RESPValue::SimpleString("PONG".to_string()), false),
         _ => (
-            RESPValue::Error("ERR comando non riconosciuto o sintassi errata".to_string()),
+            RESPValue::Error("ERR unknown command or wrong syntax".to_string()),
             false,
         ),
     }
@@ -2523,7 +2523,7 @@ fn load_data(store: &ShardedStore) {
                 skipped
             );
         }
-        info!("Snapshot caricato: {} elementi attivi", count);
+        info!("Snapshot loaded: {} active entries", count);
     }
 
     const BINLOG_PATH: &str = "onyx.binlog";
@@ -2536,7 +2536,7 @@ fn load_data(store: &ShardedStore) {
         while offset < data.len() {
             if offset + 4 > data.len() {
                 warn!(
-                    "Binlog troncato: avanzo {} byte in coda non formano un record completo, scartati",
+                    "Binlog truncated: {} trailing bytes don't form a complete record, discarded",
                     data.len() - offset
                 );
                 break;
@@ -2549,7 +2549,7 @@ fn load_data(store: &ShardedStore) {
 
             if offset + record_len as usize > data.len() {
                 warn!(
-                    "Binlog troncato: un record dichiara {} byte ma ne restano solo {}, scartato",
+                    "Binlog truncated: a record declares {} bytes but only {} remain, discarded",
                     record_len,
                     data.len() - offset
                 );
@@ -2568,11 +2568,11 @@ fn load_data(store: &ShardedStore) {
         }
         if corrupt_records > 0 {
             warn!(
-                "Binlog: {} record scartati perché corrotti o non riconosciuti",
+                "Binlog: {} records discarded because they are corrupt or not recognized",
                 corrupt_records
             );
         }
-        info!("Binlog riprodotto: {} comandi", count);
+        info!("Binlog replayed: {} commands", count);
     }
 }
 async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence: Arc<Persistence>) {
@@ -2626,12 +2626,12 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 )
             };
             let response = if !auth_required() {
-                RESPValue::Error("ERR nessuna password configurata su questo server".to_string())
+                RESPValue::Error("ERR no password configured on this server".to_string())
             } else if check_credentials(&username, &provided_password) {
                 authenticated = true;
                 RESPValue::SimpleString("OK".to_string())
             } else {
-                RESPValue::Error("WRONGPASS nome utente o password non validi".to_string())
+                RESPValue::Error("WRONGPASS invalid username or password".to_string())
             };
             resp_buf.clear();
             response.encode_into(&mut resp_buf);
@@ -2643,7 +2643,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
         // nessun altro comando è ammesso (nemmeno MULTI/EXEC/SYNC/SUBSCRIBE).
         if !authenticated {
             resp_buf.clear();
-            RESPValue::Error("NOAUTH autenticazione richiesta. Usa AUTH password".to_string())
+            RESPValue::Error("NOAUTH authentication required. Use AUTH password".to_string())
                 .encode_into(&mut resp_buf);
             let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
             let _ = buf_writer.flush().await;
@@ -2669,7 +2669,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 RESPValue::SimpleString("OK".to_string())
             } else {
                 RESPValue::Error(
-                    "ERR DISCARD senza una transazione attiva (usa prima MULTI)".to_string(),
+                    "ERR DISCARD without an active transaction (use MULTI first)".to_string(),
                 )
             };
             resp_buf.clear();
@@ -2683,7 +2683,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
         if cmd.eq_ignore_ascii_case("EXEC") {
             let response = if !in_transaction {
                 RESPValue::Error(
-                    "ERR EXEC senza una transazione attiva (usa prima MULTI)".to_string(),
+                    "ERR EXEC without an active transaction (use MULTI first)".to_string(),
                 )
             } else {
                 in_transaction = false;
@@ -2692,7 +2692,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     let queued_cmd = queued_args.first().map(|s| s.as_str()).unwrap_or("");
                     if IS_REPLICA.load(Ordering::Relaxed) && is_write_command(queued_cmd) {
                         results.push(RESPValue::Error(
-                            "READONLY questa istanza è una Replica in sola lettura".to_string(),
+                            "READONLY this instance is a read-only replica".to_string(),
                         ));
                         continue;
                     }
@@ -2876,7 +2876,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                warn!("Subscriber {} troppo lento, alcuni messaggi persi", sub_id);
+                                warn!("Subscriber {} too slow, some messages lost", sub_id);
                             }
                             Err(_) => break,
                         }
@@ -2908,7 +2908,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
 
             if requested_replid != 0 && !replid_matches {
                 info!(
-                    "Replica {} presenta un replication ID diverso da quello attuale (probabile riavvio del Master): forzo un dump completo",
+                    "Replica {} presents a different replication ID from the current one (likely master restart): forcing a full dump",
                     peer_addr
                 );
             }
@@ -3155,7 +3155,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 .lock()
                 .unwrap()
                 .remove(&replica_id);
-            info!("Replica {} disconnessa", peer_addr);
+            info!("Replica {} disconnected", peer_addr);
             return;
         }
 
@@ -3171,7 +3171,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             // dirette qui la farebbero divergere silenziosamente, e verrebbero
             // pure sovrascritte al prossimo comando replicato — meglio
             // rifiutarle chiaramente, come fa Redis con READONLY.
-            RESPValue::Error("READONLY questa istanza è una Replica in sola lettura".to_string())
+            RESPValue::Error("READONLY this instance is a read-only replica".to_string())
         } else {
             if cmd.eq_ignore_ascii_case("REPLICAOF")
                 && args
@@ -3185,7 +3185,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             {
                 persistence.promote_to_master.store(true, Ordering::Relaxed);
                 IS_REPLICA.store(false, Ordering::Relaxed);
-                info!("Ricevuto REPLICAOF NO ONE: promozione a Master in corso");
+                info!("Received REPLICAOF NO ONE: promoting to master");
             }
 
             TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
@@ -3248,7 +3248,7 @@ async fn active_expiration_task(store: Arc<ShardedStore>) {
         tokio::time::sleep(Duration::from_secs(10)).await;
         let count = store.gc_expired();
         if count > 0 {
-            println!("🧹 GC: rimosse {} chiavi scadute.", count);
+            println!("GC: removed {} expired keys.", count);
         }
     }
 }
@@ -3274,14 +3274,14 @@ async fn do_compact(store: &Arc<ShardedStore>) {
                     let _ = writeln!(writer, "{}", value_to_line(&key, &entry));
                 }
                 if let Err(e) = writer.finish() {
-                    error!("Errore durante la finalizzazione dello snapshot compresso: {}", e);
+                    error!("Error finalizing compressed snapshot: {}", e);
                 }
                 if let Err(e) = fs::rename(&tmp_path, SNAPSHOT_PATH) {
-                    error!("Impossibile sostituire onyx.snapshot ({}). Riprovero alla prossima compattazione.", e);
+                    error!("Unable to replace onyx.snapshot ({}). Will retry at the next compaction.", e);
                 }
             }
             Err(e) => {
-                error!("Impossibile creare lo snapshot temporaneo ({}). Compattazione saltata questa volta.", e);
+                error!("Unable to create temporary snapshot ({}). Skipping this compaction.", e);
             }
         }
 
@@ -3289,12 +3289,12 @@ async fn do_compact(store: &Arc<ShardedStore>) {
             match OpenOptions::new().create(true).write(true).truncate(true).open(LOG_PATH) {
                 Ok(f) => break f,
                 Err(e) => {
-                    eprintln!("Impossibile riaprire onyx.log dopo la compattazione ({}). Ritento tra 3s...", e);
+                    eprintln!("Unable to reopen onyx.log after compaction ({}). Retrying in 3s...", e);
                     std::thread::sleep(Duration::from_secs(3));
                 }
             }
         };
-        info!("Compattazione eseguita: snapshot aggiornato, log svuotato");
+        info!("Compaction complete: snapshot updated, log cleared");
     }).await.unwrap()
 }
 fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) -> String {
@@ -3373,12 +3373,12 @@ async fn run_metrics_server(store: Arc<ShardedStore>, persistence: Arc<Persisten
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            error!("Impossibile avviare il server metriche su {}: {}", addr, e);
+            error!("Unable to start metrics server on {}: {}", addr, e);
             return;
         }
     };
     info!(
-        "Server metriche Prometheus in ascolto su http://{}/metrics",
+        "Prometheus metrics server listening on http://{}/metrics",
         addr
     );
 
@@ -3622,7 +3622,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nanos.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(pid)
     };
     REPL_ID.set(repl_id_val).ok();
-    info!("Replication ID di questa istanza: {}", repl_id_val);
+    info!("This instance's replication ID: {}", repl_id_val);
     let args: Vec<String> = env::args().collect();
     let mut master_addr: Option<String> = None;
     let mut password: Option<String> = None;
@@ -3680,7 +3680,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     USERS.set(users_map).ok();
     if num_users > 0 {
         info!(
-            "Autenticazione richiesta: {} utente/i configurato/i",
+            "Authentication required: {} user(s) configured",
             num_users
         );
     }
@@ -3688,7 +3688,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy = match appendfsync.as_deref() {
         Some(s) => FsyncPolicy::parse(s).unwrap_or_else(|| {
             warn!(
-                "Valore non valido per --appendfsync ('{}'), uso 'everysec' di default",
+                "Invalid value for --appendfsync ('{}'), using 'everysec' as default",
                 s
             );
             FsyncPolicy::EverySec
@@ -3696,7 +3696,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => FsyncPolicy::EverySec,
     };
     FSYNC_POLICY.set(policy).ok();
-    info!("Politica fsync sul binlog: {:?}", policy);
+    info!("Binlog fsync policy: {:?}", policy);
 
     // maxmemory accetta suffissi come Redis: 100mb, 1gb, o un numero puro di byte.
     let maxmemory_val: usize = match maxmemory_arg.as_deref() {
@@ -3852,11 +3852,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         IS_REPLICA.store(true, Ordering::Relaxed);
         if auto_failover {
             warn!(
-                "--auto-failover attivo (timeout {}s): questa istanza si promuoverà da sola a Master \
-                 se perde il contatto col Master per più del timeout. ATTENZIONE: sicuro solo con UNA \
-                 sola Replica per Master — con più Repliche configurate tutte con --auto-failover, più \
-                 di una potrebbe promuoversi in parallelo (split-brain), perché non c'è coordinamento \
-                 tra Repliche in questa versione.",
+                "--auto-failover enabled (timeout {}s): this instance will self-promote to master \
+                 if it loses contact with the master past the timeout. WARNING: only safe with ONE \
+                 replica per master — with multiple replicas all configured with --auto-failover, more \
+                 than one could promote in parallel (split-brain), since there is no cross-replica \
+                 coordination in this version.",
                 failover_timeout_secs
             );
         }
@@ -3882,11 +3882,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let bind_addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&bind_addr).await?;
-    info!("Server in ascolto su {}", bind_addr);
+    info!("Server listening on {}", bind_addr);
     let obp_port = port.parse::<u16>().unwrap_or(6380) + 1;
     let obp_addr = format!("127.0.0.1:{}", obp_port);
     let obp_listener = TcpListener::bind(&obp_addr).await?;
-    info!("Server OBP (binario) in ascolto su {}", obp_addr);
+    info!("OBP (binary) server listening on {}", obp_addr);
 
     let store_obp = Arc::clone(&store);
     let persistence_obp = Arc::clone(&persistence);
@@ -3927,10 +3927,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result?;
         }
         _ = tokio::signal::ctrl_c() => {
-            info!("Segnale di chiusura ricevuto, salvataggio finale in corso...");
+            info!("Shutdown signal received, saving final state...");
             do_compact(&store_shutdown).await;
             persistence_shutdown.write_count.store(0, Ordering::SeqCst);
-            info!("Salvataggio completato, arrivederci!");
+            info!("Save complete, goodbye!");
         }
     }
 
@@ -3973,7 +3973,7 @@ async fn run_replica(
         match unreachable_since {
             Some(since) if since.elapsed().as_secs() >= failover_timeout_secs => {
                 warn!(
-                    "Master irraggiungibile da oltre {}s: auto-promozione a Master (--auto-failover)",
+                    "Master unreachable for over {}s: self-promoting to master (--auto-failover)",
                     failover_timeout_secs
                 );
                 promote_flag.store(true, Ordering::Relaxed);
@@ -3986,10 +3986,10 @@ async fn run_replica(
 
     loop {
         if promote_flag.load(Ordering::Relaxed) {
-            info!("Promozione a Master completata, interrotta la connessione col vecchio Master");
+            info!("Promotion to master complete, disconnecting from old master");
             return;
         }
-        info!("Connessione al Master {}...", master_addr);
+        info!("Connecting to master {}...", master_addr);
 
         match TcpStream::connect(&master_addr).await {
             Ok(stream) => {
@@ -4029,10 +4029,10 @@ async fn run_replica(
                             local_replid.store(replid, Ordering::SeqCst);
                         }
                         if is_full {
-                            info!("Master ha risposto con dump completo");
+                            info!("Master responded with full dump");
                         } else {
                             info!(
-                                "Master ha risposto con resync parziale (offset richiesto: {})",
+                                "Master responded with partial sync (requested offset: {})",
                                 starting_offset
                             );
                         }
@@ -4042,7 +4042,7 @@ async fn run_replica(
                 };
                 if !handshake_ok {
                     warn!(
-                        "Risposta inattesa dal Master al SYNC, riprovo tra {}s",
+                        "Unexpected response from master at SYNC, retrying in {}s",
                         backoff_secs
                     );
                     unreachable_since.get_or_insert_with(std::time::Instant::now);
@@ -4054,7 +4054,7 @@ async fn run_replica(
                     continue;
                 }
 
-                info!("Connesso al Master, ricezione dati in corso...");
+                info!("Connected to master, receiving data...");
                 backoff_secs = MIN_BACKOFF_SECS;
                 unreachable_since = None; // connessione riuscita: azzera il timer del failover
 
@@ -4099,13 +4099,13 @@ async fn run_replica(
                         }
                         Ok(Some(_)) => continue,
                         Ok(None) => {
-                            warn!("Master disconnesso, riprovo tra {}s", backoff_secs);
+                            warn!("Master disconnected, retrying in {}s", backoff_secs);
                             unreachable_since.get_or_insert_with(std::time::Instant::now);
                             break;
                         }
                         Err(_) => {
                             warn!(
-                                "Errore di lettura dal Master, riprovo tra {}s",
+                                "Error reading from master, retrying in {}s",
                                 backoff_secs
                             );
                             unreachable_since.get_or_insert_with(std::time::Instant::now);
@@ -4119,7 +4119,7 @@ async fn run_replica(
                 }
             }
             Err(_) => {
-                warn!("Master non raggiungibile, riprovo tra {}s", backoff_secs);
+                warn!("Master unreachable, retrying in {}s", backoff_secs);
                 unreachable_since.get_or_insert_with(std::time::Instant::now);
                 if maybe_self_promote(&unreachable_since) {
                     return;
