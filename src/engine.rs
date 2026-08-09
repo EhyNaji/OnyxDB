@@ -156,9 +156,10 @@ impl Shard {
         let ts = now();
         let entry = self.data.get_mut(key)?;
         if let Some(exp) = entry.expires_at
-            && ts >= exp {
-                return None; // scaduto, ma non rimosso qui (lazy)
-            }
+            && ts >= exp
+        {
+            return None; // scaduto, ma non rimosso qui (lazy)
+        }
         entry.last_accessed = ts;
         Some(&*entry)
     }

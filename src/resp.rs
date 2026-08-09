@@ -29,10 +29,7 @@ pub async fn read_command(
 
     if first_byte != Some(b'*') {
         // Comando in testo semplice (compatibilita' con vecchi tool)
-        let parts: Vec<String> = scratch
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect();
+        let parts: Vec<String> = scratch.split_whitespace().map(|s| s.to_string()).collect();
         return Ok(Some(parts));
     }
 

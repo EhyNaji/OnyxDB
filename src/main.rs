@@ -1054,11 +1054,10 @@ fn delete_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment]) 
     }
     match (&segments[segments.len() - 1], current) {
         (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => map.remove(f).is_some(),
-        (JsonPathSegment::Index(idx), serde_json::Value::Array(arr))
-            if *idx < arr.len() => {
-                arr.remove(*idx);
-                true
-            }
+        (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) if *idx < arr.len() => {
+            arr.remove(*idx);
+            true
+        }
         _ => false,
     }
 }
@@ -2465,9 +2464,10 @@ fn normalize_for_log(store: &ShardedStore, args: &[String]) -> String {
     let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     if cmd == "EXPIRE"
-        && let Some(exp) = store.get_expiry(key) {
-            return format!("EXPIREAT {} {}", key, exp);
-        }
+        && let Some(exp) = store.get_expiry(key)
+    {
+        return format!("EXPIREAT {} {}", key, exp);
+    }
     if cmd == "SET" && args.len() > 3 {
         // SET con opzioni (EX/PX/NX/XX): NX/XX sono a posto così come sono
         // (existence-based, replay deterministico), ma EX/PX sono relativi
@@ -2494,84 +2494,86 @@ fn load_data(store: &ShardedStore) {
     );
 
     if Path::new(SNAPSHOT_PATH).exists()
-        && let Ok(file) = File::open(SNAPSHOT_PATH) {
-            let decoder = GzDecoder::new(file);
-            let mut count = 0;
-            let mut skipped = 0;
-            for line_result in StdBufReader::new(decoder).lines() {
-                let line = match line_result {
-                    Ok(l) => l,
-                    Err(_) => {
-                        skipped += 1;
-                        continue;
-                    } // riga non UTF-8 valida
-                };
-                match line_to_entry(&line) {
-                    Some((key, entry)) => {
-                        if !is_expired(&entry) {
-                            store.set_raw(key, entry);
-                            count += 1;
-                        }
+        && let Ok(file) = File::open(SNAPSHOT_PATH)
+    {
+        let decoder = GzDecoder::new(file);
+        let mut count = 0;
+        let mut skipped = 0;
+        for line_result in StdBufReader::new(decoder).lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                } // riga non UTF-8 valida
+            };
+            match line_to_entry(&line) {
+                Some((key, entry)) => {
+                    if !is_expired(&entry) {
+                        store.set_raw(key, entry);
+                        count += 1;
                     }
-                    None => skipped += 1, // riga malformata nello snapshot
                 }
+                None => skipped += 1, // riga malformata nello snapshot
             }
-            if skipped > 0 {
-                warn!(
-                    "Snapshot: {} righe scartate perché malformate o illeggibili",
-                    skipped
-                );
-            }
-            info!("Snapshot caricato: {} elementi attivi", count);
         }
+        if skipped > 0 {
+            warn!(
+                "Snapshot: {} righe scartate perché malformate o illeggibili",
+                skipped
+            );
+        }
+        info!("Snapshot caricato: {} elementi attivi", count);
+    }
 
     const BINLOG_PATH: &str = "onyx.binlog";
     if Path::new(BINLOG_PATH).exists()
-        && let Ok(data) = fs::read(BINLOG_PATH) {
-            let mut offset = 0;
-            let mut count = 0;
-            let mut corrupt_records = 0;
-            while offset < data.len() {
-                if offset + 4 > data.len() {
-                    warn!(
-                        "Binlog troncato: avanzo {} byte in coda non formano un record completo, scartati",
-                        data.len() - offset
-                    );
-                    break;
-                }
-                let record_len = ((data[offset] as u32) << 24)
-                    | ((data[offset + 1] as u32) << 16)
-                    | ((data[offset + 2] as u32) << 8)
-                    | (data[offset + 3] as u32);
-                offset += 4;
-
-                if offset + record_len as usize > data.len() {
-                    warn!(
-                        "Binlog troncato: un record dichiara {} byte ma ne restano solo {}, scartato",
-                        record_len,
-                        data.len() - offset
-                    );
-                    break;
-                }
-                let record = &data[offset..offset + record_len as usize];
-                offset += record_len as usize;
-
-                match binary_record_to_args(record) {
-                    Some(args) => {
-                        execute_command(store, &args);
-                        count += 1;
-                    }
-                    None => corrupt_records += 1, // lunghezza ok ma contenuto non decodificabile
-                }
-            }
-            if corrupt_records > 0 {
+        && let Ok(data) = fs::read(BINLOG_PATH)
+    {
+        let mut offset = 0;
+        let mut count = 0;
+        let mut corrupt_records = 0;
+        while offset < data.len() {
+            if offset + 4 > data.len() {
                 warn!(
-                    "Binlog: {} record scartati perché corrotti o non riconosciuti",
-                    corrupt_records
+                    "Binlog troncato: avanzo {} byte in coda non formano un record completo, scartati",
+                    data.len() - offset
                 );
+                break;
             }
-            info!("Binlog riprodotto: {} comandi", count);
+            let record_len = ((data[offset] as u32) << 24)
+                | ((data[offset + 1] as u32) << 16)
+                | ((data[offset + 2] as u32) << 8)
+                | (data[offset + 3] as u32);
+            offset += 4;
+
+            if offset + record_len as usize > data.len() {
+                warn!(
+                    "Binlog troncato: un record dichiara {} byte ma ne restano solo {}, scartato",
+                    record_len,
+                    data.len() - offset
+                );
+                break;
+            }
+            let record = &data[offset..offset + record_len as usize];
+            offset += record_len as usize;
+
+            match binary_record_to_args(record) {
+                Some(args) => {
+                    execute_command(store, &args);
+                    count += 1;
+                }
+                None => corrupt_records += 1, // lunghezza ok ma contenuto non decodificabile
+            }
         }
+        if corrupt_records > 0 {
+            warn!(
+                "Binlog: {} record scartati perché corrotti o non riconosciuti",
+                corrupt_records
+            );
+        }
+        info!("Binlog riprodotto: {} comandi", count);
+    }
 }
 async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence: Arc<Persistence>) {
     let _ = stream.set_nodelay(true);
@@ -2896,7 +2898,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
 
         // SYNC
         if cmd == "SYNC" {
-            // Nuovo formato: `SYNC <replid> <offset>`. `replid=0` 
+            // Nuovo formato: `SYNC <replid> <offset>`. `replid=0`
             let requested_replid: u64 =
                 args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             let requested_offset: u64 =
@@ -2965,15 +2967,15 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                                     .unwrap_or(false)
                                 && let Some(off) =
                                     ack_args.get(2).and_then(|s| s.parse::<u64>().ok())
-                                    && let Some(status) = persistence_ack
-                                        .replica_status
-                                        .lock()
-                                        .unwrap()
-                                        .get_mut(&replica_id)
-                                    {
-                                        status.last_ack_offset = off;
-                                        status.last_ack_time = now();
-                                    }
+                                && let Some(status) = persistence_ack
+                                    .replica_status
+                                    .lock()
+                                    .unwrap()
+                                    .get_mut(&replica_id)
+                            {
+                                status.last_ack_offset = off;
+                                status.last_ack_time = now();
+                            }
                         }
                         Ok(Some(_)) => continue,
                         Ok(None) | Err(_) => break,
@@ -3189,29 +3191,30 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
             let (mut resp, is_write) = execute_command(&store, &args);
             if cmd.eq_ignore_ascii_case("INFO")
-                && let RESPValue::BulkString(Some(ref mut text)) = resp {
-                    let repl_offset = persistence.repl_offset.load(Ordering::SeqCst);
-                    let statuses = persistence.replica_status.lock().unwrap();
-                    let connected_replicas = statuses.len();
-                    let max_lag = statuses
-                        .values()
-                        .map(|s| repl_offset.saturating_sub(s.last_ack_offset))
-                        .max()
-                        .unwrap_or(0);
+                && let RESPValue::BulkString(Some(ref mut text)) = resp
+            {
+                let repl_offset = persistence.repl_offset.load(Ordering::SeqCst);
+                let statuses = persistence.replica_status.lock().unwrap();
+                let connected_replicas = statuses.len();
+                let max_lag = statuses
+                    .values()
+                    .map(|s| repl_offset.saturating_sub(s.last_ack_offset))
+                    .max()
+                    .unwrap_or(0);
+                text.push_str(&format!(
+                    "\nmaster_repl_offset:{}\nconnected_replicas:{}\nmax_replica_lag:{}",
+                    repl_offset, connected_replicas, max_lag
+                ));
+                for (i, status) in statuses.values().enumerate() {
+                    let lag = repl_offset.saturating_sub(status.last_ack_offset);
+                    let last_ack_secs_ago = now().saturating_sub(status.last_ack_time);
                     text.push_str(&format!(
-                        "\nmaster_repl_offset:{}\nconnected_replicas:{}\nmax_replica_lag:{}",
-                        repl_offset, connected_replicas, max_lag
+                        "\nslave{}:addr={},offset={},lag={},last_ack_secs_ago={}",
+                        i, status.addr, status.last_ack_offset, lag, last_ack_secs_ago
                     ));
-                    for (i, status) in statuses.values().enumerate() {
-                        let lag = repl_offset.saturating_sub(status.last_ack_offset);
-                        let last_ack_secs_ago = now().saturating_sub(status.last_ack_time);
-                        text.push_str(&format!(
-                            "\nslave{}:addr={},offset={},lag={},last_ack_secs_ago={}",
-                            i, status.addr, status.last_ack_offset, lag, last_ack_secs_ago
-                        ));
-                    }
-                    drop(statuses);
                 }
+                drop(statuses);
+            }
             if !is_write {
                 match &resp {
                     RESPValue::BulkString(None) => {
