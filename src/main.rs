@@ -705,10 +705,10 @@ impl ShardedStore {
         match result {
             Some(Some(Ok(new_val))) => Ok(new_val),
             Some(Some(Err(e))) => Err(e.to_string()),
-            Some(None) => {
-                Err("WRONGTYPE key exists but does not hold a JSON value".to_string())
+            Some(None) => Err("WRONGTYPE key exists but does not hold a JSON value".to_string()),
+            None => {
+                Err("ERR key does not exist: use JSON.SET key $ {...} to create it".to_string())
             }
-            None => Err("ERR key does not exist: use JSON.SET key $ {...} to create it".to_string()),
         }
     }
 
@@ -727,10 +727,10 @@ impl ShardedStore {
         match result {
             Some(Some(Ok(new_len))) => Ok(new_len),
             Some(Some(Err(e))) => Err(e.to_string()),
-            Some(None) => {
-                Err("WRONGTYPE key exists but does not hold a JSON value".to_string())
+            Some(None) => Err("WRONGTYPE key exists but does not hold a JSON value".to_string()),
+            None => {
+                Err("ERR key does not exist: use JSON.SET key $ {...} to create it".to_string())
             }
-            None => Err("ERR key does not exist: use JSON.SET key $ {...} to create it".to_string()),
         }
     }
     pub fn json_arrlen(&self, key: &str, path: &str) -> Result<Option<usize>, String> {
@@ -3277,25 +3277,41 @@ async fn do_compact(store: &Arc<ShardedStore>) {
                     error!("Error finalizing compressed snapshot: {}", e);
                 }
                 if let Err(e) = fs::rename(&tmp_path, SNAPSHOT_PATH) {
-                    error!("Unable to replace onyx.snapshot ({}). Will retry at the next compaction.", e);
+                    error!(
+                        "Unable to replace onyx.snapshot ({}). Will retry at the next compaction.",
+                        e
+                    );
                 }
             }
             Err(e) => {
-                error!("Unable to create temporary snapshot ({}). Skipping this compaction.", e);
+                error!(
+                    "Unable to create temporary snapshot ({}). Skipping this compaction.",
+                    e
+                );
             }
         }
 
         let _log_file = loop {
-            match OpenOptions::new().create(true).write(true).truncate(true).open(LOG_PATH) {
+            match OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(LOG_PATH)
+            {
                 Ok(f) => break f,
                 Err(e) => {
-                    eprintln!("Unable to reopen onyx.log after compaction ({}). Retrying in 3s...", e);
+                    eprintln!(
+                        "Unable to reopen onyx.log after compaction ({}). Retrying in 3s...",
+                        e
+                    );
                     std::thread::sleep(Duration::from_secs(3));
                 }
             }
         };
         info!("Compaction complete: snapshot updated, log cleared");
-    }).await.unwrap()
+    })
+    .await
+    .unwrap()
 }
 fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) -> String {
     let uptime = now().saturating_sub(START_TIME.load(Ordering::Relaxed));
@@ -3655,7 +3671,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     users_map.insert(name.to_string(), pw.to_string());
                 }
                 None => warn!(
-                    "Formato non valido per --user (atteso nome:password): '{}'",
+                    "Invalid format for --user ( expected name:password): '{}'",
                     args[i + 1]
                 ),
             }
@@ -3679,10 +3695,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_users = users_map.len();
     USERS.set(users_map).ok();
     if num_users > 0 {
-        info!(
-            "Authentication required: {} user(s) configured",
-            num_users
-        );
+        info!("Authentication required: {} user(s) configured", num_users);
     }
 
     let policy = match appendfsync.as_deref() {
@@ -4002,7 +4015,7 @@ async fn run_replica(
                 let sync_cmd = format!("SYNC {} {}\n", known_replid, starting_offset);
                 if writer.write_all(sync_cmd.as_bytes()).await.is_err() {
                     warn!(
-                        "Impossibile inviare SYNC al Master, riprovo tra {}s",
+                        "Failed to send SYNC to master, retrying in{}s",
                         backoff_secs
                     );
                     unreachable_since.get_or_insert_with(std::time::Instant::now);
@@ -4077,9 +4090,7 @@ async fn run_replica(
 
                 loop {
                     if promote_flag.load(Ordering::Relaxed) {
-                        info!(
-                            "Promozione a Master completata, interrotta la connessione col vecchio Master"
-                        );
+                        info!("Master promotion completed, disconnected from previous master");
                         ack_task.abort();
                         return;
                     }
@@ -4104,10 +4115,7 @@ async fn run_replica(
                             break;
                         }
                         Err(_) => {
-                            warn!(
-                                "Error reading from master, retrying in {}s",
-                                backoff_secs
-                            );
+                            warn!("Error reading from master, retrying in {}s", backoff_secs);
                             unreachable_since.get_or_insert_with(std::time::Instant::now);
                             break;
                         }
@@ -4138,69 +4146,69 @@ mod tests {
     #[test]
     fn test_set_and_get() {
         let store = ShardedStore::new();
-        store.set("chiave1".to_string(), "valore1".to_string());
-        assert_eq!(store.get("chiave1"), Some("valore1".to_string()));
+        store.set("key1".to_string(), "value1".to_string());
+        assert_eq!(store.get("key1"), Some("value1".to_string()));
     }
 
     #[test]
-    fn test_get_chiave_inesistente() {
+    fn test_get_key_not_found() {
         let store = ShardedStore::new();
-        assert_eq!(store.get("non_esiste"), None);
+        assert_eq!(store.get("not_found"), None);
     }
 
     #[test]
-    fn test_incr_da_zero() {
+    fn test_incr_from_zero() {
         let store = ShardedStore::new();
-        assert_eq!(store.incr("contatore"), 1);
-        assert_eq!(store.incr("contatore"), 2);
+        assert_eq!(store.incr("counter"), 1);
+        assert_eq!(store.incr("counter"), 2);
     }
 
     #[test]
     fn test_incrby() {
         let store = ShardedStore::new();
-        assert_eq!(store.incrby("c", 5), 5);
-        assert_eq!(store.incrby("c", -2), 3);
+        assert_eq!(store.incrby("counter", 5), 5);
+        assert_eq!(store.incrby("counter", -2), 3);
     }
 
     #[test]
     fn test_delete() {
         let store = ShardedStore::new();
-        store.set("k".to_string(), "v".to_string());
-        assert_eq!(store.delete("k"), true);
-        assert_eq!(store.delete("k"), false);
-        assert_eq!(store.get("k"), None);
+        store.set("key".to_string(), "value".to_string());
+        assert!(store.delete("key"));
+        assert!(!store.delete("key"));
+        assert_eq!(store.get("key"), None);
     }
 
     #[test]
     fn test_lpush_e_lrange() {
         let store = ShardedStore::new();
-        store.lpush("lista", "uno".to_string());
-        store.lpush("lista", "due".to_string());
+        store.lpush("list", "one".to_string());
+        store.lpush("list", "two".to_string());
         assert_eq!(
-            store.lrange("lista", 0, -1),
-            Some(vec!["due".to_string(), "uno".to_string()])
+            store.lrange("list", 0, -1),
+            Some(vec!["two".to_string(), "one".to_string()])
         );
     }
 
     #[test]
     fn test_hash() {
         let store = ShardedStore::new();
-        store.hset("h", "campo", "valore");
-        assert_eq!(store.hget("h", "campo"), Some("valore".to_string()));
-        assert_eq!(store.hget("h", "non_esiste"), None);
+        store.hset("h", "field", "value");
+        assert_eq!(store.hget("h", "field"), Some("value".to_string()));
+        assert_eq!(store.hget("h", "non_existent"), None);
     }
 
     #[test]
     fn test_set_type() {
         let store = ShardedStore::new();
-        assert_eq!(store.sadd("s", "a"), true);
-        assert_eq!(store.sadd("s", "a"), false);
-        assert_eq!(store.sismember("s", "a"), true);
-        assert_eq!(store.sismember("s", "b"), false);
+        assert!(store.sadd("s", "a"));
+        assert!(!store.sadd("s", "a"));
+        assert!(store.sismember("s", "a"));
+        assert!(!store.sismember("s", "b"));
     }
 
     #[test]
-    fn test_ttl_scadenza() {
+    fn test_ttl_expiration() {
         let store = ShardedStore::new();
         store.set("temp".to_string(), "val".to_string());
         assert_eq!(store.ttl("temp"), -1);
@@ -4209,34 +4217,34 @@ mod tests {
     #[test]
     fn test_rename() {
         let store = ShardedStore::new();
-        store.set("vecchio".to_string(), "dato".to_string());
-        assert_eq!(store.rename("vecchio", "nuovo"), true);
-        assert_eq!(store.get("vecchio"), None);
-        assert_eq!(store.get("nuovo"), Some("dato".to_string()));
+        store.set("old".to_string(), "value".to_string());
+        assert!(store.rename("old", "new"));
+        assert_eq!(store.get("old"), None);
+        assert_eq!(store.get("new"), Some("value".to_string()));
     }
 
     #[test]
     fn test_glob_match() {
-        assert!(glob_match("utente:*", "utente:42"));
-        assert!(glob_match("*", "qualsiasi"));
-        assert!(!glob_match("utente:*", "prodotto:1"));
-        assert!(glob_match("esatto", "esatto"));
-        assert!(!glob_match("esatto", "diverso"));
+        assert!(glob_match("user:*", "user:42"));
+        assert!(glob_match("*", "any"));
+        assert!(!glob_match("user:*", "product:1"));
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("exact", "different"));
     }
 
     #[test]
     fn test_append() {
         let store = ShardedStore::new();
-        store.append("s", "ciao");
-        store.append("s", "mondo");
-        assert_eq!(store.get("s"), Some("ciaomondo".to_string()));
+        store.append("s", "hello");
+        store.append("s", "world");
+        assert_eq!(store.get("s"), Some("helloworld".to_string()));
     }
 
     #[test]
     fn test_strlen() {
         let store = ShardedStore::new();
-        store.set("s".to_string(), "ciao".to_string());
-        assert_eq!(store.strlen("s"), 4);
+        store.set("s".to_string(), "hello".to_string());
+        assert_eq!(store.strlen("s"), 5);
         assert_eq!(store.strlen("non_esiste"), 0);
     }
     // ============================================================
@@ -4253,7 +4261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_binlog_roundtrip_set_con_scadenza() {
+    fn test_binlog_roundtrip_set_with_expiration() {
         let args = vec![
             "SET".to_string(),
             "k".to_string(),
@@ -4267,7 +4275,7 @@ mod tests {
     }
 
     #[test]
-    fn test_binlog_roundtrip_set_senza_scadenza_non_include_exat() {
+    fn test_binlog_roundtrip_set_without_expiration_does_not_include_exat() {
         // Un SET senza scadenza non deve risorgere con un EXAT fantasma.
         let args = vec!["SET".to_string(), "k".to_string(), "v".to_string()];
         let record = command_to_binary_record("SET", &args, None).unwrap();
@@ -4291,48 +4299,45 @@ mod tests {
 
     #[test]
     fn test_binlog_roundtrip_del() {
-        let args = vec!["DEL".to_string(), "chiave".to_string()];
+        let args = vec!["DEL".to_string(), "key".to_string()];
         let record = command_to_binary_record("DEL", &args, None).unwrap();
-        assert_eq!(
-            binary_record_to_args(&record).unwrap(),
-            vec!["DEL", "chiave"]
-        );
+        assert_eq!(binary_record_to_args(&record).unwrap(), vec!["DEL", "key"]);
     }
 
     #[test]
-    fn test_binlog_roundtrip_expire_diventa_expireat() {
+    fn test_binlog_roundtrip_expire_becomes_expireat() {
         // EXPIRE (relativo) va persistito come EXPIREAT (assoluto): il
         // record binario stesso è già in forma assoluta.
-        let args = vec!["EXPIRE".to_string(), "k".to_string(), "12345".to_string()];
+        let args = vec!["EXPIRE".to_string(), "key".to_string(), "12345".to_string()];
         let record = command_to_binary_record("EXPIRE", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
-        assert_eq!(decoded, vec!["EXPIREAT", "k", "12345"]);
+        assert_eq!(decoded, vec!["EXPIREAT", "key", "12345"]);
     }
 
     #[test]
     fn test_binlog_roundtrip_lpush_rpush() {
-        let lpush = vec!["LPUSH".to_string(), "lista".to_string(), "x".to_string()];
+        let lpush = vec!["LPUSH".to_string(), "list".to_string(), "x".to_string()];
         let record = command_to_binary_record("LPUSH", &lpush, None).unwrap();
         assert_eq!(
             binary_record_to_args(&record).unwrap(),
-            vec!["LPUSH", "lista", "x"]
+            vec!["LPUSH", "list", "x"]
         );
 
-        let rpush = vec!["RPUSH".to_string(), "lista".to_string(), "y".to_string()];
+        let rpush = vec!["RPUSH".to_string(), "list".to_string(), "y".to_string()];
         let record = command_to_binary_record("RPUSH", &rpush, None).unwrap();
         assert_eq!(
             binary_record_to_args(&record).unwrap(),
-            vec!["RPUSH", "lista", "y"]
+            vec!["RPUSH", "list", "y"]
         );
     }
 
     #[test]
     fn test_binlog_roundtrip_lpop_rpop() {
-        let args = vec!["LPOP".to_string(), "lista".to_string()];
+        let args = vec!["LPOP".to_string(), "list".to_string()];
         let record = command_to_binary_record("LPOP", &args, None).unwrap();
         assert_eq!(
             binary_record_to_args(&record).unwrap(),
-            vec!["LPOP", "lista"]
+            vec!["LPOP", "list"]
         );
     }
 
@@ -4400,15 +4405,11 @@ mod tests {
 
     #[test]
     fn test_binlog_roundtrip_append() {
-        let args = vec![
-            "APPEND".to_string(),
-            "s".to_string(),
-            "suffisso".to_string(),
-        ];
+        let args = vec!["APPEND".to_string(), "s".to_string(), "suffix".to_string()];
         let record = command_to_binary_record("APPEND", &args, None).unwrap();
         assert_eq!(
             binary_record_to_args(&record).unwrap(),
-            vec!["APPEND", "s", "suffisso"]
+            vec!["APPEND", "s", "suffix"]
         );
     }
 
@@ -4435,61 +4436,61 @@ mod tests {
     fn test_binlog_roundtrip_json_set() {
         let args = vec![
             "JSON.SET".to_string(),
-            "utente".to_string(),
+            "user".to_string(),
             "$".to_string(),
-            "{\"nome\":\"Marco\"}".to_string(),
+            "{\"name\":\"Marco\"}".to_string(),
         ];
         let record = command_to_binary_record("JSON.SET", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
         assert_eq!(
             decoded,
-            vec!["JSON.SET", "utente", "$", "{\"nome\":\"Marco\"}"]
+            vec!["JSON.SET", "user", "$", "{\"name\":\"Marco\"}"]
         );
     }
 
     #[test]
-    fn test_binlog_roundtrip_json_set_path_annidato() {
+    fn test_binlog_roundtrip_json_set_nested_path() {
         let args = vec![
             "JSON.SET".to_string(),
-            "utente".to_string(),
-            "$.indirizzo.città".to_string(),
-            "\"Roma\"".to_string(),
+            "user".to_string(),
+            "$.address.city".to_string(),
+            "\"Rome\"".to_string(),
         ];
         let record = command_to_binary_record("JSON.SET", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
         assert_eq!(
             decoded,
-            vec!["JSON.SET", "utente", "$.indirizzo.città", "\"Roma\""]
+            vec!["JSON.SET", "user", "$.address.city", "\"Rome\""]
         );
     }
     #[test]
     fn test_binlog_roundtrip_json_del() {
         let args = vec![
             "JSON.DEL".to_string(),
-            "utente".to_string(),
-            "$.età".to_string(),
+            "user".to_string(),
+            "$.age".to_string(),
         ];
         let record = command_to_binary_record("JSON.DEL", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
-        assert_eq!(decoded, vec!["JSON.DEL", "utente", "$.età"]);
+        assert_eq!(decoded, vec!["JSON.DEL", "user", "$.age"]);
     }
 
     #[test]
-    fn test_binlog_json_set_argomenti_insufficienti_ritorna_none() {
-        let args = vec!["JSON.SET".to_string(), "utente".to_string()];
+    fn test_binlog_json_set_insufficient_args_returns_none() {
+        let args = vec!["JSON.SET".to_string(), "user".to_string()];
         assert!(command_to_binary_record("JSON.SET", &args, None).is_none());
     }
 
     #[test]
-    fn test_binlog_json_del_argomenti_insufficienti_ritorna_none() {
-        let args = vec!["JSON.DEL".to_string(), "utente".to_string()];
+    fn test_binlog_json_del_insufficient_args_returns_none() {
+        let args = vec!["JSON.DEL".to_string(), "user".to_string()];
         assert!(command_to_binary_record("JSON.DEL", &args, None).is_none());
     }
 
     #[test]
     fn test_snapshot_roundtrip_json() {
         let entry = DataEntry {
-            value: OnyxValue::Json(serde_json::json!({"nome": "Marco", "età": 18})),
+            value: OnyxValue::Json(serde_json::json!({"name": "Marco", "age": 18})),
             expires_at: None,
             created_at: 0,
             last_accessed: 0,
@@ -4497,19 +4498,19 @@ mod tests {
         let line = value_to_line("k", &entry);
         let (_, decoded) = line_to_entry(&line).unwrap();
         match decoded.value {
-            OnyxValue::Json(v) => assert_eq!(v, serde_json::json!({"nome": "Marco", "età": 18})),
-            _ => panic!("tipo sbagliato dopo il round-trip"),
+            OnyxValue::Json(v) => assert_eq!(v, serde_json::json!({"name": "Marco", "age": 18})),
+            _ => panic!("wrong type after round-trip"),
         }
     }
 
     #[test]
-    fn test_binlog_comando_sconosciuto_ritorna_none() {
+    fn test_binlog_unknown_command_returns_none() {
         let args = vec!["PING".to_string()];
         assert!(command_to_binary_record("PING", &args, None).is_none());
     }
 
     #[test]
-    fn test_binlog_argomenti_insufficienti_ritorna_none() {
+    fn test_binlog_insufficient_args_returns_none() {
         // Niente panic su un array troppo corto: solo None.
         let args = vec!["SET".to_string()];
         assert!(command_to_binary_record("SET", &args, None).is_none());
@@ -4532,7 +4533,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_troncato_a_meta_valore_non_va_in_panic() {
+    fn truncated_record_mid_value_does_not_panic() {
         // Chiave valida "k", poi dichiara un valore di 1000 byte inesistente.
         let mut record = vec![OP_SET];
         record.extend_from_slice(&[0x00, 0x01]); // key_len = 1
@@ -4581,7 +4582,7 @@ mod tests {
         assert_eq!(key, "k");
         match decoded.value {
             OnyxValue::Blob(b) => assert_eq!(b, Bytes::from("ciao")),
-            _ => panic!("tipo sbagliato dopo il round-trip"),
+            _ => panic!("wrong type after round-trip"),
         }
     }
 
@@ -4599,7 +4600,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_roundtrip_lista_vuota() {
+    fn test_snapshot_roundtrip_empty_list() {
         let entry = DataEntry {
             value: OnyxValue::List(vec![]),
             expires_at: None,
@@ -4610,7 +4611,7 @@ mod tests {
         let (_, decoded) = line_to_entry(&line).unwrap();
         match decoded.value {
             OnyxValue::List(l) => assert!(l.is_empty()),
-            _ => panic!("tipo sbagliato"),
+            _ => panic!("wrong type"),
         }
     }
 
@@ -4628,7 +4629,7 @@ mod tests {
         let (_, decoded) = line_to_entry(&line).unwrap();
         match decoded.value {
             OnyxValue::Hash(m) => assert_eq!(m.get(&Bytes::from("f1")), Some(&Bytes::from("v1"))),
-            _ => panic!("tipo sbagliato"),
+            _ => panic!("wrong type"),
         }
     }
 
@@ -4706,18 +4707,18 @@ mod tests {
     #[test]
     fn test_parse_path_campo_singolo() {
         assert_eq!(
-            parse_json_path("$.nome"),
-            Some(vec![JsonPathSegment::Field("nome".to_string())])
+            parse_json_path("$.name"),
+            Some(vec![JsonPathSegment::Field("name".to_string())])
         );
     }
 
     #[test]
     fn test_parse_path_annidato() {
         assert_eq!(
-            parse_json_path("$.indirizzo.città"),
+            parse_json_path("$.address.city"),
             Some(vec![
-                JsonPathSegment::Field("indirizzo".to_string()),
-                JsonPathSegment::Field("città".to_string()),
+                JsonPathSegment::Field("address".to_string()),
+                JsonPathSegment::Field("city".to_string()),
             ])
         );
     }
@@ -4748,12 +4749,12 @@ mod tests {
 
     #[test]
     fn test_parse_path_senza_dollaro_iniziale_none() {
-        assert_eq!(parse_json_path("nome"), None);
+        assert_eq!(parse_json_path("name"), None);
     }
 
     #[test]
     fn test_parse_path_doppio_punto_none() {
-        assert_eq!(parse_json_path("$..nome"), None);
+        assert_eq!(parse_json_path("$..name"), None);
     }
 
     #[test]
@@ -4768,8 +4769,8 @@ mod tests {
 
     #[test]
     fn test_get_json_path_campo_esistente() {
-        let val: serde_json::Value = serde_json::json!({"nome": "Marco", "età": 18});
-        let path = parse_json_path("$.nome").unwrap();
+        let val: serde_json::Value = serde_json::json!({"name": "Marco", "age": 18});
+        let path = parse_json_path("$.name").unwrap();
         assert_eq!(
             get_json_path(&val, &path),
             Some(&serde_json::json!("Marco"))
@@ -4778,15 +4779,15 @@ mod tests {
 
     #[test]
     fn test_get_json_path_annidato() {
-        let val: serde_json::Value = serde_json::json!({"indirizzo": {"città": "Roma"}});
-        let path = parse_json_path("$.indirizzo.città").unwrap();
-        assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("Roma")));
+        let val: serde_json::Value = serde_json::json!({"address": {"city": "Rome"}});
+        let path = parse_json_path("$.address.city").unwrap();
+        assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("Rome")));
     }
 
     #[test]
     fn test_get_json_path_campo_assente_none() {
-        let val: serde_json::Value = serde_json::json!({"nome": "Marco"});
-        let path = parse_json_path("$.cognome").unwrap();
+        let val: serde_json::Value = serde_json::json!({"name": "Marco"});
+        let path = parse_json_path("$.surname").unwrap();
         assert_eq!(get_json_path(&val, &path), None);
     }
 
@@ -4805,39 +4806,39 @@ mod tests {
     }
 
     #[test]
-    fn test_get_json_path_tipo_sbagliato_none() {
+    fn test_get_json_path_wrong_type_none() {
         // Indice su un oggetto (non un array): non ha senso, deve dare None.
-        let val: serde_json::Value = serde_json::json!({"nome": "Marco"});
-        let path = parse_json_path("$.nome[0]").unwrap();
+        let val: serde_json::Value = serde_json::json!({"name": "Marco"});
+        let path = parse_json_path("$.name[0]").unwrap();
         assert_eq!(get_json_path(&val, &path), None);
     }
 
     #[test]
     fn test_set_json_path_documento_intero() {
-        let mut val: serde_json::Value = serde_json::json!({"vecchio": true});
+        let mut val: serde_json::Value = serde_json::json!({"old": true});
         let path = parse_json_path("$").unwrap();
         assert!(set_json_path(
             &mut val,
             &path,
-            serde_json::json!({"nuovo": true})
+            serde_json::json!({"new": true})
         ));
-        assert_eq!(val, serde_json::json!({"nuovo": true}));
+        assert_eq!(val, serde_json::json!({"new": true}));
     }
 
     #[test]
     fn test_set_json_path_campo_esistente() {
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
-        let path = parse_json_path("$.nome").unwrap();
+        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
+        let path = parse_json_path("$.name").unwrap();
         assert!(set_json_path(&mut val, &path, serde_json::json!("Ahmed")));
-        assert_eq!(val, serde_json::json!({"nome": "Ahmed"}));
+        assert_eq!(val, serde_json::json!({"name": "Ahmed"}));
     }
 
     #[test]
     fn test_set_json_path_campo_nuovo_su_oggetto_esistente() {
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
-        let path = parse_json_path("$.età").unwrap();
+        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
+        let path = parse_json_path("$.age").unwrap();
         assert!(set_json_path(&mut val, &path, serde_json::json!(18)));
-        assert_eq!(val, serde_json::json!({"nome": "Marco", "età": 18}));
+        assert_eq!(val, serde_json::json!({"name": "Marco", "age": 18}));
     }
 
     #[test]
@@ -4873,10 +4874,10 @@ mod tests {
 
     #[test]
     fn test_delete_json_path_campo() {
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco", "età": 18});
-        let path = parse_json_path("$.età").unwrap();
+        let mut val: serde_json::Value = serde_json::json!({"name": "Marco", "age": 18});
+        let path = parse_json_path("$.age").unwrap();
         assert!(delete_json_path(&mut val, &path));
-        assert_eq!(val, serde_json::json!({"nome": "Marco"}));
+        assert_eq!(val, serde_json::json!({"name": "Marco"}));
     }
 
     #[test]
@@ -4889,8 +4890,8 @@ mod tests {
 
     #[test]
     fn test_delete_json_path_campo_assente_fallisce() {
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
-        let path = parse_json_path("$.cognome").unwrap();
+        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
+        let path = parse_json_path("$.surname").unwrap();
         assert!(!delete_json_path(&mut val, &path));
     }
 
@@ -4898,7 +4899,7 @@ mod tests {
     fn test_delete_json_path_radice_fallisce() {
         // DEL su "$" (documento intero) non passa da qui, va gestito
         // separatamente con un DEL normale sulla chiave.
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
+        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
         let path = parse_json_path("$").unwrap();
         assert!(!delete_json_path(&mut val, &path));
     }
@@ -4908,40 +4909,40 @@ mod tests {
 
     #[test]
     fn test_numincrby_json_path_su_intero() {
-        let mut val: serde_json::Value = serde_json::json!({"visite": 5});
-        let path = parse_json_path("$.visite").unwrap();
+        let mut val: serde_json::Value = serde_json::json!({"visits": 5});
+        let path = parse_json_path("$.visits").unwrap();
         let result = numincrby_json_path(&mut val, &path, 3.0);
         assert_eq!(result, Ok(8.0));
-        assert_eq!(val, serde_json::json!({"visite": 8}));
+        assert_eq!(val, serde_json::json!({"visits": 8}));
     }
 
     #[test]
-    fn test_numincrby_json_path_con_delta_negativo() {
-        let mut val: serde_json::Value = serde_json::json!({"saldo": 10});
-        let path = parse_json_path("$.saldo").unwrap();
+    fn test_numincrby_json_path_with_negative_delta() {
+        let mut val: serde_json::Value = serde_json::json!({"balance": 10});
+        let path = parse_json_path("$.balance").unwrap();
         let result = numincrby_json_path(&mut val, &path, -3.0);
         assert_eq!(result, Ok(7.0));
     }
 
     #[test]
-    fn test_numincrby_json_path_su_float() {
-        let mut val: serde_json::Value = serde_json::json!({"prezzo": 9.5});
-        let path = parse_json_path("$.prezzo").unwrap();
+    fn test_numincrby_json_path_with_float_values() {
+        let mut val: serde_json::Value = serde_json::json!({"price": 9.5});
+        let path = parse_json_path("$.price").unwrap();
         let result = numincrby_json_path(&mut val, &path, 0.5);
         assert_eq!(result, Ok(10.0));
     }
 
     #[test]
-    fn test_numincrby_json_path_su_stringa_fallisce() {
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
-        let path = parse_json_path("$.nome").unwrap();
+    fn test_numincrby_json_path_with_string_value_fails() {
+        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
+        let path = parse_json_path("$.name").unwrap();
         assert!(numincrby_json_path(&mut val, &path, 1.0).is_err());
     }
 
     #[test]
     fn test_numincrby_json_path_assente_fallisce() {
         let mut val: serde_json::Value = serde_json::json!({});
-        let path = parse_json_path("$.contatore").unwrap();
+        let path = parse_json_path("$.counter").unwrap();
         assert!(numincrby_json_path(&mut val, &path, 1.0).is_err());
     }
 
@@ -4964,8 +4965,8 @@ mod tests {
 
     #[test]
     fn test_arrappend_json_path_su_non_array_fallisce() {
-        let mut val: serde_json::Value = serde_json::json!({"nome": "Marco"});
-        let path = parse_json_path("$.nome").unwrap();
+        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
+        let path = parse_json_path("$.name").unwrap();
         assert!(arrappend_json_path(&mut val, &path, serde_json::json!("x")).is_err());
     }
 
@@ -4980,46 +4981,45 @@ mod tests {
         let store = ShardedStore::new();
         store
             .json_set(
-                "utente",
+                "user",
                 "$",
-                serde_json::json!({"nome": "Marco", "tag": ["dev", "rust"]}),
+                serde_json::json!({"name": "Marco", "tag": ["dev", "rust"]}),
             )
             .unwrap();
 
-        assert_eq!(store.json_arrlen("utente", "$.tag"), Ok(Some(2)));
+        assert_eq!(store.json_arrlen("user", "$.tag"), Ok(Some(2)));
 
-        let keys = store.json_objkeys("utente", "$").unwrap().unwrap();
+        let keys = store.json_objkeys("user", "$").unwrap().unwrap();
         assert_eq!(keys.len(), 2);
-        assert!(keys.contains(&"nome".to_string()));
+        assert!(keys.contains(&"name".to_string()));
         assert!(keys.contains(&"tag".to_string()));
     }
 
     #[test]
-    fn test_json_arrlen_su_non_array_ritorna_none() {
+    fn test_json_arrlen_on_non_array_returns_none() {
         let store = ShardedStore::new();
         store
-            .json_set("utente", "$", serde_json::json!({"nome": "Marco"}))
+            .json_set("user", "$", serde_json::json!({"name": "Marco"}))
             .unwrap();
-        assert_eq!(store.json_arrlen("utente", "$.nome"), Ok(None));
+        assert_eq!(store.json_arrlen("user", "$.name"), Ok(None));
     }
 
     #[test]
-    fn test_json_objkeys_su_non_oggetto_ritorna_none() {
+    fn test_json_objkeys_on_non_object_returns_none() {
         let store = ShardedStore::new();
         store
-            .json_set("utente", "$", serde_json::json!({"tag": ["dev"]}))
+            .json_set("user", "$", serde_json::json!({"tag": ["dev"]}))
             .unwrap();
-        assert_eq!(store.json_objkeys("utente", "$.tag"), Ok(None));
+        assert_eq!(store.json_objkeys("user", "$.tag"), Ok(None));
     }
-
     #[test]
-    fn test_json_arrlen_chiave_inesistente_ritorna_none() {
+    fn test_json_arrlen_non_existent_key_returns_none() {
         let store = ShardedStore::new();
         assert_eq!(store.json_arrlen("non_esiste", "$"), Ok(None));
     }
 
     #[test]
-    fn test_json_objkeys_chiave_inesistente_ritorna_none() {
+    fn test_json_objkeys_non_existent_key_returns_none() {
         let store = ShardedStore::new();
         assert_eq!(store.json_objkeys("non_esiste", "$"), Ok(None));
     }
@@ -5028,28 +5028,25 @@ mod tests {
     fn test_binlog_roundtrip_json_numincrby() {
         let args = vec![
             "JSON.NUMINCRBY".to_string(),
-            "utente".to_string(),
-            "$.visite".to_string(),
+            "user".to_string(),
+            "$.visits".to_string(),
             "3".to_string(),
         ];
         let record = command_to_binary_record("JSON.NUMINCRBY", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
-        assert_eq!(decoded, vec!["JSON.NUMINCRBY", "utente", "$.visite", "3"]);
+        assert_eq!(decoded, vec!["JSON.NUMINCRBY", "user", "$.visits", "3"]);
     }
 
     #[test]
     fn test_binlog_roundtrip_json_arrappend() {
         let args = vec![
             "JSON.ARRAPPEND".to_string(),
-            "utente".to_string(),
+            "user".to_string(),
             "$.tag".to_string(),
             "\"rust\"".to_string(),
         ];
         let record = command_to_binary_record("JSON.ARRAPPEND", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
-        assert_eq!(
-            decoded,
-            vec!["JSON.ARRAPPEND", "utente", "$.tag", "\"rust\""]
-        );
+        assert_eq!(decoded, vec!["JSON.ARRAPPEND", "user", "$.tag", "\"rust\""]);
     }
 }
