@@ -7,7 +7,7 @@ use engine::{DataEntry, EvictionPolicy, OnyxEngine, OnyxValue};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use protocol::OBPFrame;
+use protocol::{MAX_OBP_FRAME_SIZE, OBPFrame};
 use resp::{RESPValue, read_command, read_command_with_limits};
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -4994,30 +4994,60 @@ async fn handle_obp_client(
     persistence: Arc<Persistence>,
 ) {
     let _ = stream.set_nodelay(true);
+    let peer_address = stream.peer_addr().ok();
     let (reader, writer) = stream.into_split();
     let mut buf_reader = TokioBufReader::with_capacity(65536, reader);
     let mut buf_writer = TokioBufWriter::with_capacity(8192, writer);
     let mut buf = bytes::BytesMut::with_capacity(4096);
+    let mut read_buffer = [0u8; 8192];
     let mut authenticated = !auth_required();
-    loop {
-        match buf_reader.read_buf(&mut buf).await {
+    'connection: loop {
+        match buf_reader.read(&mut read_buffer).await {
             Ok(0) => break,
-            Ok(_) => {}
+            Ok(bytes_read) => {
+                if buf.len().saturating_add(bytes_read) > MAX_OBP_FRAME_SIZE + read_buffer.len() {
+                    warn!("Closing OBP connection with an oversized incomplete frame");
+                    break;
+                }
+                buf.extend_from_slice(&read_buffer[..bytes_read]);
+            }
             Err(_) => break,
         }
 
-        while let Some(frame) = OBPFrame::decode(&mut buf) {
-            let response =
-                execute_obp_command(&store, &persistence, frame, &mut authenticated).await;
+        let mut wrote_response = false;
+        loop {
+            let frame = match OBPFrame::decode(&mut buf) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(
+                        "Closing malformed OBP connection{}: {}",
+                        peer_address
+                            .map(|address| format!(" from {address}"))
+                            .unwrap_or_default(),
+                        error
+                    );
+                    break 'connection;
+                }
+            };
+            let replica_mode = IS_REPLICA.load(Ordering::SeqCst);
+            let response = execute_obp_command(
+                &store,
+                &persistence,
+                frame,
+                &mut authenticated,
+                replica_mode,
+            )
+            .await;
             let mut out = bytes::BytesMut::new();
-            response.encode(&mut out);
-            if buf_writer.write_all(&out).await.is_err() {
+            if response.encode(&mut out).is_err() || buf_writer.write_all(&out).await.is_err() {
                 return;
             }
+            wrote_response = true;
         }
 
-        if buf.len() > 1024 * 1024 {
-            break;
+        if wrote_response && buf_writer.flush().await.is_err() {
+            return;
         }
     }
 
@@ -5321,6 +5351,7 @@ async fn execute_obp_command(
     persistence: &Arc<Persistence>,
     frame: OBPFrame,
     authenticated: &mut bool,
+    replica_mode: bool,
 ) -> OBPFrame {
     let cmd = frame.cmd;
     let args = frame.args;
@@ -5364,10 +5395,20 @@ async fn execute_obp_command(
         };
     }
 
+    if replica_mode && matches!(cmd, 0x02 | 0x03) {
+        return OBPFrame {
+            cmd: 0x00,
+            flags: 0,
+            correlation_id: frame.correlation_id,
+            args: Vec::new(),
+            payload: Some(Bytes::from("READONLY this instance is a read-only replica")),
+        };
+    }
+
     let (value, _is_write) = match cmd {
         0x01 => {
             if let Some(key) = args.first() {
-                let _replication_boundary = if IS_REPLICA.load(Ordering::SeqCst) {
+                let _replication_boundary = if replica_mode {
                     Some(persistence.write_gate.lock().await)
                 } else {
                     None
@@ -5408,10 +5449,38 @@ async fn execute_obp_command(
                     };
                 }
                 let key = args[0].clone();
+                let key_exists = store.engine.peek(&key).is_some();
+                if !key_exists && store.is_full() {
+                    return OBPFrame {
+                        cmd: 0x00,
+                        flags: 0,
+                        correlation_id: frame.correlation_id,
+                        args: Vec::new(),
+                        payload: Some(Bytes::from("ERR database key limit reached")),
+                    };
+                }
                 let before = std::collections::HashMap::from([(
                     key.clone(),
                     store.engine.peek(&key).map(PersistentEntry::from),
                 )]);
+                let evicted_entries = if key_exists {
+                    Vec::new()
+                } else {
+                    match store.make_room_for_write() {
+                        Ok(entries) => entries,
+                        Err(EvictionDenied) => {
+                            return OBPFrame {
+                                cmd: 0x00,
+                                flags: 0,
+                                correlation_id: frame.correlation_id,
+                                args: Vec::new(),
+                                payload: Some(Bytes::from(
+                                    "OOM command not allowed when used memory exceeds maxmemory",
+                                )),
+                            };
+                        }
+                    }
+                };
                 let value = OnyxValue::Blob(args[1].clone());
                 store.engine.set(key.clone(), value, None);
                 let entry = store
@@ -5419,9 +5488,14 @@ async fn execute_obp_command(
                     .peek(&key)
                     .map(PersistentEntry::from)
                     .expect("OBP SET must leave the committed key present");
-                let batch = CommittedBatch {
-                    effects: vec![CommittedEffect::Put { key, entry }],
-                };
+                let mut effects = evicted_entries
+                    .iter()
+                    .map(|(evicted_key, _)| CommittedEffect::Delete {
+                        key: evicted_key.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                effects.push(CommittedEffect::Put { key, entry });
+                let batch = CommittedBatch { effects };
                 let sequence = current_sequence + 1;
                 persistence.repl_offset.store(sequence, Ordering::SeqCst);
                 let persistence_result =
@@ -5432,7 +5506,7 @@ async fn execute_obp_command(
                         schedule_compaction(store, persistence, should_compact);
                     }
                     Err(error) => {
-                        rollback_attempted_mutation(store, &before, &[]);
+                        rollback_attempted_mutation(store, &before, &evicted_entries);
                         persistence
                             .repl_offset
                             .store(current_sequence, Ordering::SeqCst);
@@ -8775,6 +8849,7 @@ mod tests {
                 payload: None,
             },
             &mut authenticated,
+            false,
         )
         .await;
         request_log_flush(&persistence).await.unwrap();
@@ -8799,6 +8874,7 @@ mod tests {
                 payload: None,
             },
             &mut authenticated,
+            false,
         )
         .await;
         request_log_flush(&persistence).await.unwrap();

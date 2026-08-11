@@ -120,6 +120,65 @@ fn encode_command(args: &[&[u8]]) -> Vec<u8> {
     encoded
 }
 
+fn encode_obp_frame(cmd: u8, correlation_id: u32, args: &[&[u8]]) -> Vec<u8> {
+    encode_obp_frame_with_payload(cmd, correlation_id, args, None)
+}
+
+fn encode_obp_frame_with_payload(
+    cmd: u8,
+    correlation_id: u32,
+    args: &[&[u8]],
+    payload: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encoded.push(0x4f);
+    encoded.push(0x01);
+    encoded.push(cmd);
+    encoded.extend_from_slice(&0u16.to_be_bytes());
+    encoded.extend_from_slice(&correlation_id.to_be_bytes());
+    encoded.extend_from_slice(&(args.len() as u16).to_be_bytes());
+    for argument in args {
+        encoded.extend_from_slice(&(argument.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(argument);
+    }
+    let payload = payload.unwrap_or_default();
+    encoded.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(payload);
+    encoded
+}
+
+fn read_obp_response(reader: &mut BufReader<TcpStream>) -> (u32, Vec<u8>) {
+    let mut header = [0u8; 11];
+    reader.read_exact(&mut header).unwrap();
+    assert_eq!(header[0], 0x4f);
+    assert_eq!(header[1], 0x01);
+    let correlation_id = u32::from_be_bytes(header[5..9].try_into().unwrap());
+    let argument_count = u16::from_be_bytes(header[9..11].try_into().unwrap());
+    for _ in 0..argument_count {
+        let mut length = [0u8; 4];
+        reader.read_exact(&mut length).unwrap();
+        let mut argument = vec![0u8; u32::from_be_bytes(length) as usize];
+        reader.read_exact(&mut argument).unwrap();
+    }
+    let mut payload_length = [0u8; 4];
+    reader.read_exact(&mut payload_length).unwrap();
+    let mut payload = vec![0u8; u32::from_be_bytes(payload_length) as usize];
+    reader.read_exact(&mut payload).unwrap();
+    (correlation_id, payload)
+}
+
+fn send_obp_frame(port: u16, cmd: u8, args: &[&[u8]]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port + 1)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(&encode_obp_frame(cmd, 1, args)).unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    response
+}
+
 fn read_line(reader: &mut BufReader<TcpStream>) -> String {
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -382,6 +441,60 @@ fn full_sync_replaces_stale_state_replicates_mutations_and_survives_restart() {
         resp_bulk("5")
     );
     restarted_replica.stop();
+}
+
+#[test]
+fn obp_cannot_mutate_a_read_only_replica() {
+    let master_directory = TestDirectory::new("obp-read-only-master");
+    let replica_directory = TestDirectory::new("obp-read-only-replica");
+    let master_port = choose_port();
+    let replica_port = choose_port();
+    let master = start_server(&master_directory.0, master_port, &[]);
+    let replica = start_server(
+        &replica_directory.0,
+        replica_port,
+        &replica_args(master_port),
+    );
+
+    let response = send_obp_frame(replica_port, 0x02, &[b"divergent", b"local"]);
+    assert!(
+        response
+            .windows(b"READONLY".len())
+            .any(|window| window == b"READONLY"),
+        "OBP replica write was not rejected: {response:?}"
+    );
+    assert_eq!(
+        send_command(replica_port, &[b"GET", b"divergent"]),
+        Resp::Bulk(None)
+    );
+
+    replica.stop();
+    master.stop();
+}
+
+#[test]
+fn obp_payload_frames_pipeline_and_flush_without_client_disconnect() {
+    let directory = TestDirectory::new("obp-framing");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &[]);
+    let mut stream = TcpStream::connect(("127.0.0.1", port + 1)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut request = encode_obp_frame_with_payload(0xf0, 11, &[], Some(b"ignored-payload"));
+    request.extend_from_slice(&encode_obp_frame(0xf0, 12, &[]));
+    stream.write_all(&request).unwrap();
+    stream.flush().unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let first = read_obp_response(&mut reader);
+    let second = read_obp_response(&mut reader);
+    assert_eq!(first.0, 11);
+    assert_eq!(second.0, 12);
+    assert!(first.1.windows(4).any(|window| window == b"PONG"));
+    assert!(second.1.windows(4).any(|window| window == b"PONG"));
+
+    server.stop();
 }
 
 #[test]
