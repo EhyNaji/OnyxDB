@@ -3,7 +3,7 @@ mod protocol;
 mod resp;
 mod storage;
 use bytes::Bytes;
-use engine::{DataEntry, EvictionPolicy, OnyxEngine, OnyxValue};
+use engine::{DataEntry, EntryMutation, EvictionPolicy, OnyxEngine, OnyxValue};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -269,6 +269,19 @@ pub struct ShardedStore {
     maxmemory_policy: EvictionPolicy,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreError {
+    WrongType,
+}
+
+impl StoreError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::WrongType => "WRONGTYPE Operation against a key holding the wrong kind of value",
+        }
+    }
+}
+
 impl Default for ShardedStore {
     fn default() -> Self {
         Self::new()
@@ -299,17 +312,15 @@ impl ShardedStore {
             .set(Bytes::from(key), entry.value, entry.expires_at);
     }
 
-    pub fn get(&self, key: &str) -> Option<String> {
-        self.engine
+    pub fn get(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let result = self
+            .engine
             .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
-                OnyxValue::Blob(b) => Some(String::from_utf8_lossy(b).to_string()),
-                OnyxValue::Int(n) => Some(n.to_string()),
-                OnyxValue::List(l) => Some(format!("{:?}", l)),
-                OnyxValue::Hash(h) => Some(format!("{:?}", h)),
-                OnyxValue::Set(s) => Some(format!("{:?}", s)),
-                _ => None,
-            })
-            .flatten()
+                OnyxValue::Blob(b) => Ok(String::from_utf8_lossy(b).to_string()),
+                OnyxValue::Int(n) => Ok(n.to_string()),
+                _ => Err(StoreError::WrongType),
+            });
+        result.transpose()
     }
 
     pub fn get_raw(&self, key: &str) -> Option<DataEntry> {
@@ -321,7 +332,7 @@ impl ShardedStore {
     }
 
     pub fn exists(&self, key: &str) -> bool {
-        self.get(key).is_some()
+        self.engine.peek(&Bytes::from(key.to_string())).is_some()
     }
 
     pub fn expire_at(&self, key: &str, timestamp: u64) -> bool {
@@ -332,8 +343,7 @@ impl ShardedStore {
     }
 
     pub fn expire(&self, key: &str, seconds: u64) -> bool {
-        let now = now();
-        self.expire_at(key, now + seconds)
+        self.expire_at(key, now().saturating_add(seconds))
     }
 
     pub fn ttl(&self, key: &str) -> i64 {
@@ -341,7 +351,11 @@ impl ShardedStore {
             .read(&Bytes::from(key.to_string()), |entry| {
                 if let Some(exp) = entry.expires_at {
                     let remaining = exp.saturating_sub(now());
-                    if remaining == 0 { -2 } else { remaining as i64 }
+                    if remaining == 0 {
+                        -2
+                    } else {
+                        i64::try_from(remaining).unwrap_or(i64::MAX)
+                    }
                 } else {
                     -1
                 }
@@ -377,7 +391,7 @@ impl ShardedStore {
         )
     }
 
-    pub fn append(&self, key: &str, suffix: &str) -> usize {
+    pub fn append(&self, key: &str, suffix: &str) -> Result<usize, StoreError> {
         let suffix_owned = suffix.to_string();
         // Stesso discorso di incrby: un solo lock, niente APPEND persi sotto
         // concorrenza.
@@ -387,36 +401,36 @@ impl ShardedStore {
             move |v| {
                 let mut s = match v {
                     OnyxValue::Blob(b) => String::from_utf8_lossy(b).to_string(),
-                    _ => String::new(),
+                    OnyxValue::Int(value) => value.to_string(),
+                    _ => return Err(StoreError::WrongType),
                 };
                 s.push_str(&suffix_owned);
                 let len = s.len();
                 *v = OnyxValue::Blob(Bytes::from(s));
-                len
+                Ok(len)
             },
         )
     }
 
-    pub fn strlen(&self, key: &str) -> usize {
-        self.get(key).map(|s| s.len()).unwrap_or(0)
+    pub fn strlen(&self, key: &str) -> Result<usize, StoreError> {
+        self.get(key)
+            .map(|value| value.map_or(0, |value| value.len()))
     }
 
-    pub fn getset(&self, key: &str, new_value: &str) -> Option<String> {
+    pub fn getset(&self, key: &str, new_value: &str) -> Result<Option<String>, StoreError> {
         let new_value_owned = new_value.to_string();
-        self.engine.update_or_insert(
+        self.engine.update_entry_or_insert_with_presence(
             Bytes::from(key.to_string()),
             || OnyxValue::Blob(Bytes::new()),
-            move |v| {
-                let old = match v {
-                    OnyxValue::Blob(b) => Some(String::from_utf8_lossy(b).to_string()),
-                    OnyxValue::Int(n) => Some(n.to_string()),
-                    OnyxValue::List(l) => Some(format!("{:?}", l)),
-                    OnyxValue::Hash(h) => Some(format!("{:?}", h)),
-                    OnyxValue::Set(s) => Some(format!("{:?}", s)),
-                    _ => None,
+            move |entry, existed| {
+                let old = match &entry.value {
+                    OnyxValue::Blob(b) => String::from_utf8_lossy(b).to_string(),
+                    OnyxValue::Int(n) => n.to_string(),
+                    _ => return Err(StoreError::WrongType),
                 };
-                *v = OnyxValue::Blob(Bytes::from(new_value_owned));
-                old
+                entry.value = OnyxValue::Blob(Bytes::from(new_value_owned));
+                entry.expires_at = None;
+                Ok(existed.then_some(old))
             },
         )
     }
@@ -432,7 +446,7 @@ impl ShardedStore {
     }
 
     // --- List operations ---
-    pub fn lpush(&self, key: &str, item: String) -> usize {
+    pub fn lpush(&self, key: &str, item: String) -> Result<usize, StoreError> {
         let item_b = Bytes::from(item);
         self.engine.update_or_insert(
             Bytes::from(key.to_string()),
@@ -440,17 +454,14 @@ impl ShardedStore {
             move |v| match v {
                 OnyxValue::List(l) => {
                     l.insert(0, item_b);
-                    l.len()
+                    Ok(l.len())
                 }
-                _ => {
-                    *v = OnyxValue::List(vec![item_b]);
-                    1
-                }
+                _ => Err(StoreError::WrongType),
             },
         )
     }
 
-    pub fn rpush(&self, key: &str, item: String) -> usize {
+    pub fn rpush(&self, key: &str, item: String) -> Result<usize, StoreError> {
         let item_b = Bytes::from(item);
         self.engine.update_or_insert(
             Bytes::from(key.to_string()),
@@ -458,58 +469,51 @@ impl ShardedStore {
             move |v| match v {
                 OnyxValue::List(l) => {
                     l.push(item_b);
-                    l.len()
+                    Ok(l.len())
                 }
-                _ => {
-                    *v = OnyxValue::List(vec![item_b]);
-                    1
-                }
+                _ => Err(StoreError::WrongType),
             },
         )
     }
 
-    pub fn lpop(&self, key: &str) -> Option<String> {
+    pub fn lpop(&self, key: &str) -> Result<Option<String>, StoreError> {
         let key_b = Bytes::from(key.to_string());
-        let result = self.engine.update_if_exists(&key_b, |v| match v {
-            OnyxValue::List(l) if !l.is_empty() => {
-                let item = l.remove(0);
-                (
-                    Some(String::from_utf8_lossy(&item).to_string()),
-                    l.is_empty(),
-                )
-            }
-            _ => (None, false),
-        });
-        match result {
-            Some((Some(item), true)) => {
-                self.engine.delete(&key_b);
-                Some(item)
-            }
-            Some((Some(item), false)) => Some(item),
-            _ => None,
-        }
+        let result = self
+            .engine
+            .update_if_exists_with_action(&key_b, |v| match v {
+                OnyxValue::List(l) if !l.is_empty() => {
+                    let item = l.remove(0);
+                    let result = Ok(Some(String::from_utf8_lossy(&item).to_string()));
+                    if l.is_empty() {
+                        EntryMutation::Delete(result)
+                    } else {
+                        EntryMutation::Keep(result)
+                    }
+                }
+                OnyxValue::List(_) => EntryMutation::Keep(Ok(None)),
+                _ => EntryMutation::Keep(Err(StoreError::WrongType)),
+            });
+        result.unwrap_or(Ok(None))
     }
 
-    pub fn rpop(&self, key: &str) -> Option<String> {
+    pub fn rpop(&self, key: &str) -> Result<Option<String>, StoreError> {
         let key_b = Bytes::from(key.to_string());
-        let result = self.engine.update_if_exists(&key_b, |v| match v {
-            OnyxValue::List(l) if !l.is_empty() => {
-                let item = l.pop().unwrap();
-                (
-                    Some(String::from_utf8_lossy(&item).to_string()),
-                    l.is_empty(),
-                )
-            }
-            _ => (None, false),
-        });
-        match result {
-            Some((Some(item), true)) => {
-                self.engine.delete(&key_b);
-                Some(item)
-            }
-            Some((Some(item), false)) => Some(item),
-            _ => None,
-        }
+        let result = self
+            .engine
+            .update_if_exists_with_action(&key_b, |v| match v {
+                OnyxValue::List(l) if !l.is_empty() => {
+                    let item = l.pop().unwrap();
+                    let result = Ok(Some(String::from_utf8_lossy(&item).to_string()));
+                    if l.is_empty() {
+                        EntryMutation::Delete(result)
+                    } else {
+                        EntryMutation::Keep(result)
+                    }
+                }
+                OnyxValue::List(_) => EntryMutation::Keep(Ok(None)),
+                _ => EntryMutation::Keep(Err(StoreError::WrongType)),
+            });
+        result.unwrap_or(Ok(None))
     }
 
     /// LRANGE con start/stop stile Redis: indici 0-based inclusivi su
@@ -517,186 +521,174 @@ impl ShardedStore {
     /// ultimo elemento), fuori range vengono "clampati" invece di dare
     /// errore. `LRANGE chiave` (senza indici, dal vecchio comportamento)
     /// continua a funzionare passando start=0, stop=-1 dal chiamante.
-    pub fn lrange(&self, key: &str, start: i64, stop: i64) -> Option<Vec<String>> {
-        self.engine
+    pub fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, StoreError> {
+        let result = self
+            .engine
             .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
                 OnyxValue::List(l) => {
                     let len = l.len() as i64;
                     if len == 0 {
-                        return Some(Vec::new());
+                        return Ok(Vec::new());
                     }
                     let norm = |idx: i64| -> i64 { if idx < 0 { (len + idx).max(0) } else { idx } };
                     let s = norm(start);
                     let mut e = norm(stop);
                     if s > len - 1 || s > e {
-                        return Some(Vec::new());
+                        return Ok(Vec::new());
                     }
                     if e > len - 1 {
                         e = len - 1;
                     }
-                    Some(
-                        l[s as usize..=e as usize]
-                            .iter()
-                            .map(|b| String::from_utf8_lossy(b).to_string())
-                            .collect(),
-                    )
+                    Ok(l[s as usize..=e as usize]
+                        .iter()
+                        .map(|b| String::from_utf8_lossy(b).to_string())
+                        .collect())
                 }
-                _ => None,
-            })
-            .flatten()
+                _ => Err(StoreError::WrongType),
+            });
+        result.unwrap_or(Ok(Vec::new()))
     }
 
-    pub fn llen(&self, key: &str) -> Option<usize> {
-        self.engine
+    pub fn llen(&self, key: &str) -> Result<usize, StoreError> {
+        let result = self
+            .engine
             .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
-                OnyxValue::List(l) => Some(l.len()),
-                _ => None,
-            })
-            .flatten()
+                OnyxValue::List(l) => Ok(l.len()),
+                _ => Err(StoreError::WrongType),
+            });
+        result.unwrap_or(Ok(0))
     }
 
     // --- Hash operations ---
-    pub fn hset(&self, key: &str, field: &str, value: &str) -> bool {
+    pub fn hset(&self, key: &str, field: &str, value: &str) -> Result<bool, StoreError> {
         let field_b = Bytes::from(field.to_string());
         let value_b = Bytes::from(value.to_string());
         self.engine.update_or_insert(
             Bytes::from(key.to_string()),
             || OnyxValue::Hash(std::collections::HashMap::new()),
             move |v| match v {
-                OnyxValue::Hash(h) => h.insert(field_b, value_b).is_none(),
-                _ => {
-                    let mut h = std::collections::HashMap::new();
-                    h.insert(field_b, value_b);
-                    *v = OnyxValue::Hash(h);
-                    true
-                }
+                OnyxValue::Hash(h) => Ok(h.insert(field_b, value_b).is_none()),
+                _ => Err(StoreError::WrongType),
             },
         )
     }
 
-    pub fn hget(&self, key: &str, field: &str) -> Option<String> {
+    pub fn hget(&self, key: &str, field: &str) -> Result<Option<String>, StoreError> {
         let field_b = Bytes::from(field.to_string());
         self.engine
             .read(&Bytes::from(key.to_string()), move |entry| {
                 match &entry.value {
-                    OnyxValue::Hash(h) => h
+                    OnyxValue::Hash(h) => Ok(h
                         .get(&field_b)
-                        .map(|b| String::from_utf8_lossy(b).to_string()),
-                    _ => None,
+                        .map(|b| String::from_utf8_lossy(b).to_string())),
+                    _ => Err(StoreError::WrongType),
                 }
             })
-            .flatten()
+            .unwrap_or(Ok(None))
     }
 
-    pub fn hgetall(&self, key: &str) -> Option<Vec<(String, String)>> {
+    pub fn hgetall(&self, key: &str) -> Result<Vec<(String, String)>, StoreError> {
         self.engine
             .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
-                OnyxValue::Hash(h) => Some(
-                    h.iter()
-                        .map(|(k, v)| {
-                            (
-                                String::from_utf8_lossy(k).to_string(),
-                                String::from_utf8_lossy(v).to_string(),
-                            )
-                        })
-                        .collect(),
-                ),
-                _ => None,
+                OnyxValue::Hash(h) => Ok(h
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            String::from_utf8_lossy(k).to_string(),
+                            String::from_utf8_lossy(v).to_string(),
+                        )
+                    })
+                    .collect()),
+                _ => Err(StoreError::WrongType),
             })
-            .flatten()
+            .unwrap_or(Ok(Vec::new()))
     }
 
-    pub fn hdel(&self, key: &str, field: &str) -> bool {
+    pub fn hdel(&self, key: &str, field: &str) -> Result<bool, StoreError> {
         let field_b = Bytes::from(field.to_string());
         let key_b = Bytes::from(key.to_string());
-        let result = self.engine.update_if_exists(&key_b, move |v| match v {
-            OnyxValue::Hash(h) => {
-                let removed = h.remove(&field_b).is_some();
-                (removed, h.is_empty())
-            }
-            _ => (false, false),
-        });
-        match result {
-            Some((removed, true)) => {
-                self.engine.delete(&key_b);
-                removed
-            }
-            Some((removed, false)) => removed,
-            None => false,
-        }
+        let result = self
+            .engine
+            .update_if_exists_with_action(&key_b, move |v| match v {
+                OnyxValue::Hash(h) => {
+                    let removed = h.remove(&field_b).is_some();
+                    let result = Ok(removed);
+                    if removed && h.is_empty() {
+                        EntryMutation::Delete(result)
+                    } else {
+                        EntryMutation::Keep(result)
+                    }
+                }
+                _ => EntryMutation::Keep(Err(StoreError::WrongType)),
+            });
+        result.unwrap_or(Ok(false))
     }
 
-    pub fn hkeys(&self, key: &str) -> Option<Vec<String>> {
+    pub fn hkeys(&self, key: &str) -> Result<Vec<String>, StoreError> {
         self.hgetall(key)
-            .map(|h| h.into_iter().map(|(k, _)| k).collect())
+            .map(|hash| hash.into_iter().map(|(field, _)| field).collect())
     }
 
-    pub fn hvals(&self, key: &str) -> Option<Vec<String>> {
+    pub fn hvals(&self, key: &str) -> Result<Vec<String>, StoreError> {
         self.hgetall(key)
-            .map(|h| h.into_iter().map(|(_, v)| v).collect())
+            .map(|hash| hash.into_iter().map(|(_, value)| value).collect())
     }
 
     // --- Set operations ---
-    pub fn sadd(&self, key: &str, member: &str) -> bool {
+    pub fn sadd(&self, key: &str, member: &str) -> Result<bool, StoreError> {
         let member_b = Bytes::from(member.to_string());
         self.engine.update_or_insert(
             Bytes::from(key.to_string()),
             || OnyxValue::Set(std::collections::HashSet::new()),
             move |v| match v {
-                OnyxValue::Set(s) => s.insert(member_b),
-                _ => {
-                    let mut s = std::collections::HashSet::new();
-                    s.insert(member_b);
-                    *v = OnyxValue::Set(s);
-                    true
-                }
+                OnyxValue::Set(s) => Ok(s.insert(member_b)),
+                _ => Err(StoreError::WrongType),
             },
         )
     }
 
-    pub fn smembers(&self, key: &str) -> Option<Vec<String>> {
+    pub fn smembers(&self, key: &str) -> Result<Vec<String>, StoreError> {
         self.engine
             .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
-                OnyxValue::Set(s) => Some(
-                    s.iter()
-                        .map(|b| String::from_utf8_lossy(b).to_string())
-                        .collect(),
-                ),
-                _ => None,
+                OnyxValue::Set(s) => Ok(s
+                    .iter()
+                    .map(|b| String::from_utf8_lossy(b).to_string())
+                    .collect()),
+                _ => Err(StoreError::WrongType),
             })
-            .flatten()
+            .unwrap_or(Ok(Vec::new()))
     }
 
-    pub fn srem(&self, key: &str, member: &str) -> bool {
+    pub fn srem(&self, key: &str, member: &str) -> Result<bool, StoreError> {
         let member_b = Bytes::from(member.to_string());
         let key_b = Bytes::from(key.to_string());
-        let result = self.engine.update_if_exists(&key_b, move |v| match v {
-            OnyxValue::Set(s) => {
-                let removed = s.remove(&member_b);
-                (removed, s.is_empty())
-            }
-            _ => (false, false),
-        });
-        match result {
-            Some((removed, true)) => {
-                self.engine.delete(&key_b);
-                removed
-            }
-            Some((removed, false)) => removed,
-            None => false,
-        }
+        let result = self
+            .engine
+            .update_if_exists_with_action(&key_b, move |v| match v {
+                OnyxValue::Set(s) => {
+                    let removed = s.remove(&member_b);
+                    let result = Ok(removed);
+                    if removed && s.is_empty() {
+                        EntryMutation::Delete(result)
+                    } else {
+                        EntryMutation::Keep(result)
+                    }
+                }
+                _ => EntryMutation::Keep(Err(StoreError::WrongType)),
+            });
+        result.unwrap_or(Ok(false))
     }
 
-    pub fn sismember(&self, key: &str, member: &str) -> bool {
+    pub fn sismember(&self, key: &str, member: &str) -> Result<bool, StoreError> {
         let member_b = Bytes::from(member.to_string());
         self.engine
             .read(&Bytes::from(key.to_string()), move |entry| {
                 match &entry.value {
-                    OnyxValue::Set(s) => s.contains(&member_b),
-                    _ => false,
+                    OnyxValue::Set(s) => Ok(s.contains(&member_b)),
+                    _ => Err(StoreError::WrongType),
                 }
             })
-            .unwrap_or(false)
+            .unwrap_or(Ok(false))
     }
     // --- JSON operations ---
 
@@ -713,9 +705,17 @@ impl ShardedStore {
         let key_b = Bytes::from(key.to_string());
 
         if segments.is_empty() {
-            // "$": crea o sovrascrive l'intero documento.
-            self.engine.set(key_b, OnyxValue::Json(new_value), None);
-            return Ok(());
+            return self.engine.update_or_insert_with_presence(
+                key_b,
+                || OnyxValue::Json(serde_json::Value::Null),
+                move |value, _| match value {
+                    OnyxValue::Json(root) => {
+                        *root = new_value;
+                        Ok(())
+                    }
+                    _ => Err(StoreError::WrongType.message()),
+                },
+            );
         }
 
         // Path parziale: la chiave deve già esistere con un valore JSON.
@@ -728,7 +728,7 @@ impl ShardedStore {
             Some(Some(false)) => {
                 Err("ERR path not reachable (intermediate element missing or index out of bounds)")
             }
-            Some(None) => Err("WRONGTYPE key exists but does not hold a JSON value"),
+            Some(None) => Err(StoreError::WrongType.message()),
             None => Err("ERR key does not exist: use JSON.SET key $ {...} to create it"),
         }
     }
@@ -739,28 +739,34 @@ impl ShardedStore {
             .engine
             .read(&Bytes::from(key.to_string()), move |entry| {
                 match &entry.value {
-                    OnyxValue::Json(root) => {
-                        if segments.is_empty() {
-                            Some(root.to_string())
-                        } else {
-                            get_json_path(root, &segments).map(|v| v.to_string())
-                        }
-                    }
-                    _ => None,
+                    OnyxValue::Json(root) => Ok(if segments.is_empty() {
+                        Some(root.to_string())
+                    } else {
+                        get_json_path(root, &segments).map(|v| v.to_string())
+                    }),
+                    _ => Err(StoreError::WrongType.message()),
                 }
             });
         match result {
-            Some(Some(s)) => Ok(Some(s)),
-            Some(None) => Ok(None), // chiave JSON esiste ma il path non trova nulla
-            None => Ok(None),       // chiave inesistente
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
         }
     }
 
     pub fn json_del(&self, key: &str, path: &str) -> Result<bool, &'static str> {
         let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
         if segments.is_empty() {
-            // DEL sul documento intero: stessa semantica del DEL normale.
-            return Ok(self.delete(key));
+            let result =
+                self.engine
+                    .update_if_exists_with_action(
+                        &Bytes::from(key.to_string()),
+                        |value| match value {
+                            OnyxValue::Json(_) => EntryMutation::Delete(Ok(true)),
+                            _ => EntryMutation::Keep(Err(StoreError::WrongType.message())),
+                        },
+                    );
+            return result.unwrap_or(Ok(false));
         }
         let key_b = Bytes::from(key.to_string());
         let result = self.engine.update_if_exists(&key_b, move |v| match v {
@@ -769,7 +775,7 @@ impl ShardedStore {
         });
         match result {
             Some(Some(deleted)) => Ok(deleted),
-            Some(None) => Err(" WRONGTYPE key exists but does not hold a JSON value"),
+            Some(None) => Err(StoreError::WrongType.message()),
             None => Ok(false), // chiave inesistente: nulla da cancellare
         }
     }
@@ -786,19 +792,23 @@ impl ShardedStore {
                         } else {
                             get_json_path(root, &segments)
                         };
-                        node.map(|v| match v {
+                        Ok(node.map(|v| match v {
                             serde_json::Value::Null => "null",
                             serde_json::Value::Bool(_) => "boolean",
                             serde_json::Value::Number(_) => "number",
                             serde_json::Value::String(_) => "string",
                             serde_json::Value::Array(_) => "array",
                             serde_json::Value::Object(_) => "object",
-                        })
+                        }))
                     }
-                    _ => None,
+                    _ => Err(StoreError::WrongType.message()),
                 }
             });
-        Ok(result.flatten())
+        match result {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
     }
     pub fn json_numincrby(&self, key: &str, path: &str, delta: f64) -> Result<f64, String> {
         let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
@@ -810,7 +820,7 @@ impl ShardedStore {
         match result {
             Some(Some(Ok(new_val))) => Ok(new_val),
             Some(Some(Err(e))) => Err(e.to_string()),
-            Some(None) => Err("WRONGTYPE key exists but does not hold a JSON value".to_string()),
+            Some(None) => Err(StoreError::WrongType.message().to_string()),
             None => {
                 Err("ERR key does not exist: use JSON.SET key $ {...} to create it".to_string())
             }
@@ -832,7 +842,7 @@ impl ShardedStore {
         match result {
             Some(Some(Ok(new_len))) => Ok(new_len),
             Some(Some(Err(e))) => Err(e.to_string()),
-            Some(None) => Err("WRONGTYPE key exists but does not hold a JSON value".to_string()),
+            Some(None) => Err(StoreError::WrongType.message().to_string()),
             None => {
                 Err("ERR key does not exist: use JSON.SET key $ {...} to create it".to_string())
             }
@@ -850,12 +860,16 @@ impl ShardedStore {
                         } else {
                             get_json_path(root, &segments)
                         };
-                        node.and_then(|v| v.as_array().map(|a| a.len()))
+                        Ok(node.and_then(|v| v.as_array().map(|a| a.len())))
                     }
-                    _ => None,
+                    _ => Err(StoreError::WrongType.message().to_string()),
                 }
             });
-        Ok(result.flatten())
+        match result {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
     }
 
     pub fn json_objkeys(&self, key: &str, path: &str) -> Result<Option<Vec<String>>, String> {
@@ -870,12 +884,16 @@ impl ShardedStore {
                         } else {
                             get_json_path(root, &segments)
                         };
-                        node.and_then(|v| v.as_object().map(|o| o.keys().cloned().collect()))
+                        Ok(node.and_then(|v| v.as_object().map(|o| o.keys().cloned().collect())))
                     }
-                    _ => None,
+                    _ => Err(StoreError::WrongType.message().to_string()),
                 }
             });
-        Ok(result.flatten())
+        match result {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
     }
     // --- Key operations ---
     pub fn rename(&self, old_key: &str, new_key: &str) -> bool {
@@ -886,20 +904,16 @@ impl ShardedStore {
     }
 
     pub fn copy(&self, src: &str, dst: &str) -> bool {
-        if let Some(entry) = self.engine.get(&Bytes::from(src.to_string())) {
-            self.engine
-                .set(Bytes::from(dst.to_string()), entry.value, entry.expires_at);
-            true
-        } else {
-            false
-        }
+        self.engine
+            .copy(&Bytes::from(src.to_string()), Bytes::from(dst.to_string()))
     }
 
     pub fn value_type(&self, key: &str) -> Option<&'static str> {
         self.engine
             .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
                 OnyxValue::Blob(_) => "string",
-                OnyxValue::Int(_) | OnyxValue::Float(_) => "int",
+                OnyxValue::Int(_) => "int",
+                OnyxValue::Float(_) => "float",
                 OnyxValue::List(_) => "list",
                 OnyxValue::Hash(_) => "hash",
                 OnyxValue::Set(_) => "set",
@@ -947,17 +961,16 @@ impl ShardedStore {
     }
 
     pub fn expire_conditional(&self, key: &str, seconds: u64, condition: &str) -> bool {
-        let has_expiry = self.get_expiry(key).is_some();
-        let allowed = match condition {
-            "NX" => !has_expiry,
-            "XX" => has_expiry,
-            _ => true,
+        let require_expiry = match condition {
+            "NX" => Some(false),
+            "XX" => Some(true),
+            _ => return false,
         };
-        if allowed {
-            self.expire(key, seconds)
-        } else {
-            false
-        }
+        self.engine.set_expiry_conditional(
+            &Bytes::from(key.to_string()),
+            now().saturating_add(seconds),
+            require_expiry,
+        )
     }
 
     pub fn get_expiry(&self, key: &str) -> Option<u64> {
@@ -2412,7 +2425,7 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
     let arg = args.get(2).map(|s| s.as_str()).unwrap_or("");
 
     match cmd {
-        "SET" if !key.is_empty() && !arg.is_empty() => {
+        "SET" if args.len() >= 3 => {
             // Opzioni extra, in qualsiasi ordine come in Redis: EX secondi |
             // PX millisecondi | EXAT timestamp_assoluto (quest'ultima solo
             // per uso interno: è così che persistenza/replica ripropongono
@@ -2425,21 +2438,22 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
             while i < args.len() {
                 match args[i].to_uppercase().as_str() {
                     "EX" => match args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
-                        Some(secs) => {
-                            expires_at = Some(now() + secs);
+                        Some(secs) if secs > 0 => {
+                            expires_at = Some(now().saturating_add(secs));
                             i += 2;
                         }
-                        None => {
+                        Some(_) | None => {
                             valid = false;
                             break;
                         }
                     },
                     "PX" => match args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
-                        Some(millis) => {
-                            expires_at = Some(now() + millis / 1000);
+                        Some(millis) if millis > 0 => {
+                            let seconds = millis.saturating_add(999) / 1000;
+                            expires_at = Some(now().saturating_add(seconds));
                             i += 2;
                         }
-                        None => {
+                        Some(_) | None => {
                             valid = false;
                             break;
                         }
@@ -2486,45 +2500,45 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 }
             }
         }
-        "GET" if !key.is_empty() => (
-            match store.get(key) {
-                Some(v) => RESPValue::BulkString(Some(v)),
-                None => RESPValue::BulkString(None),
-            },
-            false,
-        ),
-        "DEL" if !key.is_empty() => (
+        "GET" if args.len() >= 2 => match store.get(key) {
+            Ok(Some(value)) => (RESPValue::BulkString(Some(value)), false),
+            Ok(None) => (RESPValue::BulkString(None), false),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
+        },
+        "DEL" if args.len() >= 2 => (
             RESPValue::Integer(if store.delete(key) { 1 } else { 0 }),
             true,
         ),
-        "INCR" if !key.is_empty() => match store.incr(key) {
+        "INCR" if args.len() >= 2 => match store.incr(key) {
             Ok(value) => (RESPValue::Integer(value), true),
             Err(message) => (RESPValue::Error(message.to_string()), false),
         },
-        "LPUSH" if !key.is_empty() && !arg.is_empty() => (
-            RESPValue::Integer(store.lpush(key, arg.to_string()) as i64),
-            true,
-        ),
-        "RPUSH" if !key.is_empty() && !arg.is_empty() => (
-            RESPValue::Integer(store.rpush(key, arg.to_string()) as i64),
-            true,
-        ),
-        "LPOP" if !key.is_empty() => match store.lpop(key) {
-            Some(v) => (RESPValue::BulkString(Some(v)), true),
-            None => (RESPValue::BulkString(None), false),
+        "LPUSH" if args.len() >= 3 => match store.lpush(key, arg.to_string()) {
+            Ok(length) => (RESPValue::Integer(length as i64), true),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
         },
-        "RPOP" if !key.is_empty() => match store.rpop(key) {
-            Some(v) => (RESPValue::BulkString(Some(v)), true),
-            None => (RESPValue::BulkString(None), false),
+        "RPUSH" if args.len() >= 3 => match store.rpush(key, arg.to_string()) {
+            Ok(length) => (RESPValue::Integer(length as i64), true),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
         },
-        "LRANGE" if !key.is_empty() => {
+        "LPOP" if args.len() >= 2 => match store.lpop(key) {
+            Ok(Some(value)) => (RESPValue::BulkString(Some(value)), true),
+            Ok(None) => (RESPValue::BulkString(None), false),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
+        },
+        "RPOP" if args.len() >= 2 => match store.rpop(key) {
+            Ok(Some(value)) => (RESPValue::BulkString(Some(value)), true),
+            Ok(None) => (RESPValue::BulkString(None), false),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
+        },
+        "LRANGE" if args.len() >= 2 => {
             let start = args.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
             let stop = args
                 .get(3)
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(-1);
             match store.lrange(key, start, stop) {
-                Some(list) => (
+                Ok(list) => (
                     RESPValue::Array(
                         list.into_iter()
                             .map(|s| RESPValue::BulkString(Some(s)))
@@ -2532,11 +2546,11 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                     ),
                     false,
                 ),
-                None => (RESPValue::Array(Vec::new()), false),
+                Err(error) => (RESPValue::Error(error.message().to_string()), false),
             }
         }
 
-        "EXPIREAT" if !key.is_empty() && !arg.is_empty() => {
+        "EXPIREAT" if args.len() >= 3 => {
             if let Ok(t) = arg.parse::<u64>() {
                 (
                     RESPValue::Integer(if store.expire_at(key, t) { 1 } else { 0 }),
@@ -2546,19 +2560,19 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 (RESPValue::Error("ERR invalid timestamp".to_string()), false)
             }
         }
-        "TTL" if !key.is_empty() => (RESPValue::Integer(store.ttl(key)), false),
-        "EXISTS" if !key.is_empty() => (
+        "TTL" if args.len() >= 2 => (RESPValue::Integer(store.ttl(key)), false),
+        "EXISTS" if args.len() >= 2 => (
             RESPValue::Integer(if store.exists(key) { 1 } else { 0 }),
             false,
         ),
-        "TYPE" if !key.is_empty() => match store.value_type(key) {
+        "TYPE" if args.len() >= 2 => match store.value_type(key) {
             Some(t) => (RESPValue::SimpleString(t.to_string()), false),
             None => (RESPValue::SimpleString("none".to_string()), false),
         },
         "JSON.SET" => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
             let raw_value = args.get(3).map(|s| s.as_str()).unwrap_or("");
-            if key.is_empty() || path.is_empty() || raw_value.is_empty() {
+            if args.len() < 4 || path.is_empty() {
                 (
                     RESPValue::Error("ERR usage: JSON.SET key path json-value".to_string()),
                     false,
@@ -2576,7 +2590,7 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 }
             }
         }
-        "JSON.GET" if !key.is_empty() => {
+        "JSON.GET" if args.len() >= 2 => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
             match store.json_get(key, path) {
                 Ok(Some(s)) => (RESPValue::BulkString(Some(s)), false),
@@ -2584,14 +2598,14 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 Err(e) => (RESPValue::Error(e.to_string()), false),
             }
         }
-        "JSON.DEL" if !key.is_empty() => {
+        "JSON.DEL" if args.len() >= 2 => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
             match store.json_del(key, path) {
                 Ok(deleted) => (RESPValue::Integer(if deleted { 1 } else { 0 }), deleted),
                 Err(e) => (RESPValue::Error(e.to_string()), false),
             }
         }
-        "JSON.TYPE" if !key.is_empty() => {
+        "JSON.TYPE" if args.len() >= 2 => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
             match store.json_type(key, path) {
                 Ok(Some(t)) => (RESPValue::SimpleString(t.to_string()), false),
@@ -2599,7 +2613,7 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 Err(e) => (RESPValue::Error(e.to_string()), false),
             }
         }
-        "JSON.NUMINCRBY" if !key.is_empty() => {
+        "JSON.NUMINCRBY" if args.len() >= 2 => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
             let delta_str = args.get(3).map(|s| s.as_str()).unwrap_or("");
             match delta_str.parse::<f64>() {
@@ -2613,7 +2627,7 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 ),
             }
         }
-        "JSON.ARRAPPEND" if !key.is_empty() => {
+        "JSON.ARRAPPEND" if args.len() >= 2 => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
             let raw_value = args.get(3).map(|s| s.as_str()).unwrap_or("");
             match serde_json::from_str::<serde_json::Value>(raw_value) {
@@ -2627,7 +2641,7 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 ),
             }
         }
-        "JSON.ARRLEN" if !key.is_empty() => {
+        "JSON.ARRLEN" if args.len() >= 2 => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
             match store.json_arrlen(key, path) {
                 Ok(Some(len)) => (RESPValue::Integer(len as i64), false),
@@ -2635,7 +2649,7 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 Err(e) => (RESPValue::Error(e), false),
             }
         }
-        "JSON.OBJKEYS" if !key.is_empty() => {
+        "JSON.OBJKEYS" if args.len() >= 2 => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
             match store.json_objkeys(key, path) {
                 Ok(Some(keys)) => (
@@ -2650,12 +2664,12 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 Err(e) => (RESPValue::Error(e), false),
             }
         }
-        "SADD" if !key.is_empty() && !arg.is_empty() => (
-            RESPValue::Integer(if store.sadd(key, arg) { 1 } else { 0 }),
-            true,
-        ),
-        "SMEMBERS" if !key.is_empty() => match store.smembers(key) {
-            Some(members) => (
+        "SADD" if args.len() >= 3 => match store.sadd(key, arg) {
+            Ok(added) => (RESPValue::Integer(if added { 1 } else { 0 }), true),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
+        },
+        "SMEMBERS" if args.len() >= 2 => match store.smembers(key) {
+            Ok(members) => (
                 RESPValue::Array(
                     members
                         .into_iter()
@@ -2664,21 +2678,21 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 ),
                 false,
             ),
-            None => (RESPValue::Array(Vec::new()), false),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
         },
-        "SREM" if !key.is_empty() && !arg.is_empty() => (
-            RESPValue::Integer(if store.srem(key, arg) { 1 } else { 0 }),
-            true,
-        ),
-        "SISMEMBER" if !key.is_empty() && !arg.is_empty() => (
-            RESPValue::Integer(if store.sismember(key, arg) { 1 } else { 0 }),
-            false,
-        ),
-        "LLEN" if !key.is_empty() => (
-            RESPValue::Integer(store.llen(key).unwrap_or(0) as i64),
-            false,
-        ),
-        "RENAME" if !key.is_empty() && !arg.is_empty() => {
+        "SREM" if args.len() >= 3 => match store.srem(key, arg) {
+            Ok(removed) => (RESPValue::Integer(if removed { 1 } else { 0 }), removed),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
+        },
+        "SISMEMBER" if args.len() >= 3 => match store.sismember(key, arg) {
+            Ok(present) => (RESPValue::Integer(if present { 1 } else { 0 }), false),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
+        },
+        "LLEN" if args.len() >= 2 => match store.llen(key) {
+            Ok(length) => (RESPValue::Integer(length as i64), false),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
+        },
+        "RENAME" if args.len() >= 3 => {
             if store.rename(key, arg) {
                 (RESPValue::SimpleString("OK".to_string()), true)
             } else {
@@ -2701,14 +2715,17 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
             }
         }
         "MGET" => {
-            let results: Vec<RESPValue> = args[1..]
+            let results = args[1..]
                 .iter()
-                .map(|k| match store.get(k) {
-                    Some(v) => RESPValue::BulkString(Some(v)),
-                    None => RESPValue::BulkString(None),
-                })
-                .collect();
-            (RESPValue::Array(results), false)
+                .map(|key| store.get(key))
+                .collect::<Result<Vec<_>, _>>();
+            match results {
+                Ok(values) => (
+                    RESPValue::Array(values.into_iter().map(RESPValue::BulkString).collect()),
+                    false,
+                ),
+                Err(error) => (RESPValue::Error(error.message().to_string()), false),
+            }
         }
         "KEYS" => {
             let pattern = key;
@@ -2722,31 +2739,33 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 false,
             )
         }
-        "HSET" if !key.is_empty() && !arg.is_empty() => {
+        "HSET" if args.len() >= 3 => {
             let field = arg;
             let value = args.get(3).map(|s| s.as_str()).unwrap_or("");
-            if value.is_empty() {
+            if args.len() < 4 {
                 (
                     RESPValue::Error("ERR wrong number of arguments for 'hset'".to_string()),
                     false,
                 )
             } else {
-                let is_new = store.hset(key, field, value);
-                (RESPValue::Integer(if is_new { 1 } else { 0 }), true)
+                match store.hset(key, field, value) {
+                    Ok(is_new) => (RESPValue::Integer(if is_new { 1 } else { 0 }), true),
+                    Err(error) => (RESPValue::Error(error.message().to_string()), false),
+                }
             }
         }
-        "HGET" if !key.is_empty() && !arg.is_empty() => {
+        "HGET" if args.len() >= 3 => {
             let field = arg;
             (
                 match store.hget(key, field) {
-                    Some(v) => RESPValue::BulkString(Some(v)),
-                    None => RESPValue::BulkString(None),
+                    Ok(value) => RESPValue::BulkString(value),
+                    Err(error) => RESPValue::Error(error.message().to_string()),
                 },
                 false,
             )
         }
-        "HGETALL" if !key.is_empty() => match store.hgetall(key) {
-            Some(pairs) => {
+        "HGETALL" if args.len() >= 2 => match store.hgetall(key) {
+            Ok(pairs) => {
                 let mut flat = Vec::with_capacity(pairs.len() * 2);
                 for (f, v) in pairs {
                     flat.push(RESPValue::BulkString(Some(f)));
@@ -2754,19 +2773,19 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 }
                 (RESPValue::Array(flat), false)
             }
-            None => (RESPValue::Array(Vec::new()), false),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
         },
-        "HDEL" if !key.is_empty() && !arg.is_empty() => {
+        "HDEL" if args.len() >= 3 => {
             let field = arg;
-            (
-                RESPValue::Integer(if store.hdel(key, field) { 1 } else { 0 }),
-                true,
-            )
+            match store.hdel(key, field) {
+                Ok(removed) => (RESPValue::Integer(if removed { 1 } else { 0 }), removed),
+                Err(error) => (RESPValue::Error(error.message().to_string()), false),
+            }
         }
         "REPLICAOF" if key.eq_ignore_ascii_case("no") && arg.eq_ignore_ascii_case("one") => {
             (RESPValue::SimpleString("OK".to_string()), false)
         }
-        "INCRBY" if !key.is_empty() && !arg.is_empty() => match arg.parse::<i64>() {
+        "INCRBY" if args.len() >= 3 => match arg.parse::<i64>() {
             Ok(delta) => match store.incrby(key, delta) {
                 Ok(value) => (RESPValue::Integer(value), true),
                 Err(message) => (RESPValue::Error(message.to_string()), false),
@@ -2776,7 +2795,7 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 false,
             ),
         },
-        "DECRBY" if !key.is_empty() && !arg.is_empty() => match arg.parse::<i64>() {
+        "DECRBY" if args.len() >= 3 => match arg.parse::<i64>() {
             Ok(delta) => match delta.checked_neg() {
                 Some(negated) => match store.incrby(key, negated) {
                     Ok(value) => (RESPValue::Integer(value), true),
@@ -2792,14 +2811,18 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 false,
             ),
         },
-        "APPEND" if !key.is_empty() && !arg.is_empty() => {
-            (RESPValue::Integer(store.append(key, arg) as i64), true)
-        }
-        "STRLEN" if !key.is_empty() => (RESPValue::Integer(store.strlen(key) as i64), false),
-        "GETSET" if !key.is_empty() && !arg.is_empty() => {
-            let old = store.getset(key, arg);
-            (RESPValue::BulkString(old), true)
-        }
+        "APPEND" if args.len() >= 3 => match store.append(key, arg) {
+            Ok(length) => (RESPValue::Integer(length as i64), true),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
+        },
+        "STRLEN" if args.len() >= 2 => match store.strlen(key) {
+            Ok(length) => (RESPValue::Integer(length as i64), false),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
+        },
+        "GETSET" if args.len() >= 3 => match store.getset(key, arg) {
+            Ok(old) => (RESPValue::BulkString(old), true),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
+        },
         "INFO" => {
             let uptime = now().saturating_sub(START_TIME.load(Ordering::Relaxed));
             let role = if IS_REPLICA.load(Ordering::Relaxed) {
@@ -2838,12 +2861,12 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
             );
             (RESPValue::BulkString(Some(info_text)), false)
         }
-        "SETNX" if !key.is_empty() && !arg.is_empty() => (
+        "SETNX" if args.len() >= 3 => (
             RESPValue::Integer(if store.setnx(key, arg) { 1 } else { 0 }),
             true,
         ),
-        "HKEYS" if !key.is_empty() => match store.hkeys(key) {
-            Some(fields) => (
+        "HKEYS" if args.len() >= 2 => match store.hkeys(key) {
+            Ok(fields) => (
                 RESPValue::Array(
                     fields
                         .into_iter()
@@ -2852,10 +2875,10 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 ),
                 false,
             ),
-            None => (RESPValue::Array(Vec::new()), false),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
         },
-        "HVALS" if !key.is_empty() => match store.hvals(key) {
-            Some(vals) => (
+        "HVALS" if args.len() >= 2 => match store.hvals(key) {
+            Ok(vals) => (
                 RESPValue::Array(
                     vals.into_iter()
                         .map(|v| RESPValue::BulkString(Some(v)))
@@ -2863,21 +2886,28 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 ),
                 false,
             ),
-            None => (RESPValue::Array(Vec::new()), false),
+            Err(error) => (RESPValue::Error(error.message().to_string()), false),
         },
-        "COPY" if !key.is_empty() && !arg.is_empty() => (
+        "COPY" if args.len() >= 3 => (
             RESPValue::Integer(if store.copy(key, arg) { 1 } else { 0 }),
             true,
         ),
-        "EXPIRE" if !key.is_empty() && !arg.is_empty() => {
+        "EXPIRE" if args.len() >= 3 => {
             let condition = args.get(3).map(|s| s.to_uppercase());
             match arg.parse::<u64>() {
                 Ok(s) => {
-                    let ok = match &condition {
-                        Some(c) => store.expire_conditional(key, s, c),
-                        None => store.expire(key, s),
-                    };
-                    (RESPValue::Integer(if ok { 1 } else { 0 }), true)
+                    if condition
+                        .as_deref()
+                        .is_some_and(|value| !matches!(value, "NX" | "XX"))
+                    {
+                        (RESPValue::Error("ERR syntax error".to_string()), false)
+                    } else {
+                        let ok = match &condition {
+                            Some(c) => store.expire_conditional(key, s, c),
+                            None => store.expire(key, s),
+                        };
+                        (RESPValue::Integer(if ok { 1 } else { 0 }), ok)
+                    }
                 }
                 Err(_) => (
                     RESPValue::Error("ERR invalid expire time".to_string()),
@@ -6763,7 +6793,7 @@ mod tests {
     fn test_set_and_get() {
         let store = ShardedStore::new();
         store.set("key1".to_string(), "value1".to_string());
-        assert_eq!(store.get("key1"), Some("value1".to_string()));
+        assert_eq!(store.get("key1"), Ok(Some("value1".to_string())));
     }
 
     #[test]
@@ -6774,7 +6804,7 @@ mod tests {
     #[test]
     fn test_get_key_not_found() {
         let store = ShardedStore::new();
-        assert_eq!(store.get("not_found"), None);
+        assert_eq!(store.get("not_found"), Ok(None));
     }
 
     #[test]
@@ -6797,35 +6827,314 @@ mod tests {
         store.set("key".to_string(), "value".to_string());
         assert!(store.delete("key"));
         assert!(!store.delete("key"));
-        assert_eq!(store.get("key"), None);
+        assert_eq!(store.get("key"), Ok(None));
     }
 
     #[test]
     fn test_lpush_e_lrange() {
         let store = ShardedStore::new();
-        store.lpush("list", "one".to_string());
-        store.lpush("list", "two".to_string());
+        assert_eq!(store.lpush("list", "one".to_string()), Ok(1));
+        assert_eq!(store.lpush("list", "two".to_string()), Ok(2));
         assert_eq!(
             store.lrange("list", 0, -1),
-            Some(vec!["two".to_string(), "one".to_string()])
+            Ok(vec!["two".to_string(), "one".to_string()])
         );
     }
 
     #[test]
     fn test_hash() {
         let store = ShardedStore::new();
-        store.hset("h", "field", "value");
-        assert_eq!(store.hget("h", "field"), Some("value".to_string()));
-        assert_eq!(store.hget("h", "non_existent"), None);
+        assert_eq!(store.hset("h", "field", "value"), Ok(true));
+        assert_eq!(store.hget("h", "field"), Ok(Some("value".to_string())));
+        assert_eq!(store.hget("h", "non_existent"), Ok(None));
     }
 
     #[test]
     fn test_set_type() {
         let store = ShardedStore::new();
-        assert!(store.sadd("s", "a"));
-        assert!(!store.sadd("s", "a"));
-        assert!(store.sismember("s", "a"));
-        assert!(!store.sismember("s", "b"));
+        assert_eq!(store.sadd("s", "a"), Ok(true));
+        assert_eq!(store.sadd("s", "a"), Ok(false));
+        assert_eq!(store.sismember("s", "a"), Ok(true));
+        assert_eq!(store.sismember("s", "b"), Ok(false));
+    }
+
+    #[test]
+    fn logical_presence_is_independent_of_value_type() {
+        let store = ShardedStore::new();
+        store
+            .json_set("document", "$", serde_json::json!({"value": 1}))
+            .unwrap();
+
+        let (exists, _) = execute_command(&store, &["EXISTS".to_string(), "document".to_string()]);
+        assert!(matches!(exists, RESPValue::Integer(1)));
+
+        let (get, changed) = execute_command(&store, &["GET".to_string(), "document".to_string()]);
+        assert!(matches!(
+            get,
+            RESPValue::Error(ref message) if message.starts_with("WRONGTYPE")
+        ));
+        assert!(!changed);
+    }
+
+    #[test]
+    fn type_specific_mutations_reject_and_preserve_incompatible_values() {
+        let store = ShardedStore::new();
+        assert_eq!(store.lpush("value", "original".to_string()), Ok(1));
+
+        for command in ["APPEND", "HSET", "SADD"] {
+            let args = match command {
+                "HSET" => vec![
+                    command.to_string(),
+                    "value".to_string(),
+                    "field".to_string(),
+                    "replacement".to_string(),
+                ],
+                _ => vec![
+                    command.to_string(),
+                    "value".to_string(),
+                    "replacement".to_string(),
+                ],
+            };
+            let (response, changed) = execute_command(&store, &args);
+            assert!(matches!(
+                response,
+                RESPValue::Error(ref message) if message.starts_with("WRONGTYPE")
+            ));
+            assert!(!changed);
+            assert_eq!(
+                store.lrange("value", 0, -1),
+                Ok(vec!["original".to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn expired_entries_are_absent_to_conditional_and_collection_mutations() {
+        let store = ShardedStore::new();
+        store.engine.set(
+            Bytes::from_static(b"conditional"),
+            OnyxValue::Blob(Bytes::from_static(b"stale")),
+            Some(now()),
+        );
+        assert!(store.setnx("conditional", "fresh"));
+        assert_eq!(store.get("conditional"), Ok(Some("fresh".to_string())));
+
+        store.engine.set(
+            Bytes::from_static(b"list"),
+            OnyxValue::List(vec![Bytes::from_static(b"stale")]),
+            Some(now()),
+        );
+        assert_eq!(store.rpush("list", "fresh".to_string()), Ok(1));
+        assert_eq!(store.lrange("list", 0, -1), Ok(vec!["fresh".to_string()]));
+        assert_eq!(store.get_expiry("list"), None);
+    }
+
+    #[test]
+    fn json_root_replacement_rejects_an_incompatible_existing_value() {
+        let store = ShardedStore::new();
+        store.set("value".to_string(), "original".to_string());
+
+        let (response, changed) = execute_command(
+            &store,
+            &[
+                "JSON.SET".to_string(),
+                "value".to_string(),
+                "$".to_string(),
+                r#"{"replacement":true}"#.to_string(),
+            ],
+        );
+        assert!(matches!(
+            response,
+            RESPValue::Error(ref message) if message.starts_with("WRONGTYPE")
+        ));
+        assert!(!changed);
+        assert_eq!(store.get("value"), Ok(Some("original".to_string())));
+    }
+
+    #[test]
+    fn expired_entries_are_absent_to_all_presence_sensitive_primitives() {
+        let store = ShardedStore::new();
+        let expired = Some(now());
+
+        for key in ["delete", "expire", "rename", "copy", "conditional"] {
+            store.engine.set(
+                Bytes::copy_from_slice(key.as_bytes()),
+                OnyxValue::Blob(Bytes::from_static(b"stale")),
+                expired,
+            );
+        }
+
+        assert!(!store.delete("delete"));
+        assert!(!store.expire("expire", 10));
+        assert!(!store.rename("rename", "renamed"));
+        assert!(!store.copy("copy", "copied"));
+        assert!(!store.engine.set_conditional(
+            Bytes::from_static(b"conditional"),
+            OnyxValue::Blob(Bytes::from_static(b"replacement")),
+            None,
+            Some(false),
+        ));
+        assert_eq!(store.stats().total_keys, 0);
+        assert_eq!(store.used_memory_bytes(), 0);
+    }
+
+    #[test]
+    fn removing_the_last_collection_element_deletes_the_key_atomically() {
+        let store = ShardedStore::new();
+
+        assert_eq!(store.lpush("list", "value".to_string()), Ok(1));
+        assert_eq!(store.lpop("list"), Ok(Some("value".to_string())));
+        assert!(!store.exists("list"));
+
+        assert_eq!(store.hset("hash", "field", "value"), Ok(true));
+        assert_eq!(store.hdel("hash", "field"), Ok(true));
+        assert!(!store.exists("hash"));
+
+        assert_eq!(store.sadd("set", "member"), Ok(true));
+        assert_eq!(store.srem("set", "member"), Ok(true));
+        assert!(!store.exists("set"));
+    }
+
+    #[test]
+    fn empty_collection_deletion_holds_the_shard_lock_through_removal() {
+        let store = Arc::new(ShardedStore::new());
+        assert_eq!(store.lpush("list", "old".to_string()), Ok(1));
+        let (mutation_started_tx, mutation_started_rx) = std::sync::mpsc::channel();
+        let (release_mutation_tx, release_mutation_rx) = std::sync::mpsc::channel();
+        let pop_store = Arc::clone(&store);
+        let pop = std::thread::spawn(move || {
+            pop_store
+                .engine
+                .update_if_exists_with_action(&Bytes::from_static(b"list"), |value| {
+                    let OnyxValue::List(list) = value else {
+                        panic!("test key changed type");
+                    };
+                    assert_eq!(list.pop(), Some(Bytes::from_static(b"old")));
+                    mutation_started_tx.send(()).unwrap();
+                    release_mutation_rx.recv().unwrap();
+                    EntryMutation::Delete(())
+                })
+        });
+        mutation_started_rx.recv().unwrap();
+
+        let (push_started_tx, push_started_rx) = std::sync::mpsc::channel();
+        let (push_complete_tx, push_complete_rx) = std::sync::mpsc::channel();
+        let push_store = Arc::clone(&store);
+        let push = std::thread::spawn(move || {
+            push_started_tx.send(()).unwrap();
+            let result = push_store.rpush("list", "new".to_string());
+            push_complete_tx.send(result).unwrap();
+        });
+        push_started_rx.recv().unwrap();
+        assert!(
+            push_complete_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "a concurrent write entered the shard before deletion completed"
+        );
+
+        release_mutation_tx.send(()).unwrap();
+        assert_eq!(pop.join().unwrap(), Some(()));
+        assert_eq!(push_complete_rx.recv().unwrap(), Ok(1));
+        push.join().unwrap();
+        assert_eq!(store.lrange("list", 0, -1), Ok(vec!["new".to_string()]));
+    }
+
+    #[test]
+    fn getset_clears_ttl_but_wrong_type_preserves_the_original_entry() {
+        let store = ShardedStore::new();
+        store.set("string".to_string(), "old".to_string());
+        assert!(store.expire("string", 60));
+        assert_eq!(store.getset("string", "new"), Ok(Some("old".to_string())));
+        assert_eq!(store.get_expiry("string"), None);
+
+        assert_eq!(store.lpush("list", "value".to_string()), Ok(1));
+        assert_eq!(
+            store.getset("list", "replacement"),
+            Err(StoreError::WrongType)
+        );
+        assert_eq!(store.lrange("list", 0, -1), Ok(vec!["value".to_string()]));
+
+        store.set("long-lived".to_string(), "value".to_string());
+        assert!(store.expire_at("long-lived", u64::MAX));
+        assert_eq!(store.ttl("long-lived"), i64::MAX);
+    }
+
+    #[test]
+    fn empty_values_are_data_and_zero_duration_set_does_not_delete() {
+        let store = ShardedStore::new();
+        let (set, changed) = execute_command(
+            &store,
+            &["SET".to_string(), "empty".to_string(), String::new()],
+        );
+        assert!(matches!(set, RESPValue::SimpleString(ref value) if value == "OK"));
+        assert!(changed);
+        assert_eq!(store.get("empty"), Ok(Some(String::new())));
+
+        store.set("protected".to_string(), "original".to_string());
+        let (invalid, changed) = execute_command(
+            &store,
+            &[
+                "SET".to_string(),
+                "protected".to_string(),
+                "replacement".to_string(),
+                "PX".to_string(),
+                "0".to_string(),
+            ],
+        );
+        assert!(matches!(invalid, RESPValue::Error(_)));
+        assert!(!changed);
+        assert_eq!(store.get("protected"), Ok(Some("original".to_string())));
+    }
+
+    #[test]
+    fn expired_replication_put_cannot_resurrect_or_mask_a_key() {
+        let replica = ShardedStore::new();
+        replica.set("key".to_string(), "live".to_string());
+        let batch = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"key"),
+            entry: PersistentEntry {
+                value: OnyxValue::List(vec![Bytes::from_static(b"stale")]),
+                expires_at: Some(now()),
+            },
+        }])
+        .unwrap();
+
+        apply_committed_batch(&replica, &batch);
+        assert!(!replica.exists("key"));
+        assert_eq!(replica.rpush("key", "fresh".to_string()), Ok(1));
+        assert_eq!(replica.lrange("key", 0, -1), Ok(vec!["fresh".to_string()]));
+    }
+
+    #[test]
+    fn json_observes_the_same_expired_and_wrong_type_boundary() {
+        let store = ShardedStore::new();
+        store.engine.set(
+            Bytes::from_static(b"document"),
+            OnyxValue::Blob(Bytes::from_static(b"stale")),
+            Some(now()),
+        );
+        assert_eq!(
+            store.json_set("document", "$", serde_json::json!({"fresh": true})),
+            Ok(())
+        );
+        assert_eq!(
+            store.json_get("document", "$.fresh"),
+            Ok(Some("true".to_string()))
+        );
+
+        store.set("string".to_string(), "preserve".to_string());
+        assert!(
+            store
+                .json_get("string", "$")
+                .is_err_and(|error| error.starts_with("WRONGTYPE"))
+        );
+        assert!(
+            store
+                .json_del("string", "$")
+                .is_err_and(|error| error.starts_with("WRONGTYPE"))
+        );
+        assert_eq!(store.get("string"), Ok(Some("preserve".to_string())));
     }
 
     #[test]
@@ -6840,8 +7149,8 @@ mod tests {
         let store = ShardedStore::new();
         store.set("old".to_string(), "value".to_string());
         assert!(store.rename("old", "new"));
-        assert_eq!(store.get("old"), None);
-        assert_eq!(store.get("new"), Some("value".to_string()));
+        assert_eq!(store.get("old"), Ok(None));
+        assert_eq!(store.get("new"), Ok(Some("value".to_string())));
     }
 
     #[test]
@@ -6856,17 +7165,17 @@ mod tests {
     #[test]
     fn test_append() {
         let store = ShardedStore::new();
-        store.append("s", "hello");
-        store.append("s", "world");
-        assert_eq!(store.get("s"), Some("helloworld".to_string()));
+        assert_eq!(store.append("s", "hello"), Ok(5));
+        assert_eq!(store.append("s", "world"), Ok(10));
+        assert_eq!(store.get("s"), Ok(Some("helloworld".to_string())));
     }
 
     #[test]
     fn test_strlen() {
         let store = ShardedStore::new();
         store.set("s".to_string(), "hello".to_string());
-        assert_eq!(store.strlen("s"), 5);
-        assert_eq!(store.strlen("non_esiste"), 0);
+        assert_eq!(store.strlen("s"), Ok(5));
+        assert_eq!(store.strlen("non_esiste"), Ok(0));
     }
     // ============================================================
     // Round-trip binlog binario: ogni comando che scrive deve sopravvivere
@@ -7050,12 +7359,12 @@ mod tests {
         let recovered = ShardedStore::new();
         let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
         assert_eq!(state.last_sequence, 9);
-        assert_eq!(recovered.get("plain"), Some("value".to_string()));
-        assert_eq!(recovered.get("counter"), Some("5".to_string()));
-        assert_eq!(recovered.get("text"), Some("alpha-beta".to_string()));
+        assert_eq!(recovered.get("plain"), Ok(Some("value".to_string())));
+        assert_eq!(recovered.get("counter"), Ok(Some("5".to_string())));
+        assert_eq!(recovered.get("text"), Ok(Some("alpha-beta".to_string())));
         assert_eq!(
             recovered.lrange("items", 0, -1),
-            Some(vec!["two".to_string(), "one".to_string()])
+            Ok(vec!["two".to_string(), "one".to_string()])
         );
         let visits = recovered
             .json_get("document", "$.visits")
@@ -7100,11 +7409,11 @@ mod tests {
         let recovered = ShardedStore::new();
         let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
         assert_eq!(state.last_sequence, 10);
-        assert_eq!(recovered.get("counter"), Some("5".to_string()));
-        assert_eq!(recovered.get("text"), Some("alpha-beta".to_string()));
+        assert_eq!(recovered.get("counter"), Ok(Some("5".to_string())));
+        assert_eq!(recovered.get("text"), Ok(Some("alpha-beta".to_string())));
         assert_eq!(
             recovered.lrange("items", 0, -1),
-            Some(vec!["two".to_string(), "one".to_string()])
+            Ok(vec!["two".to_string(), "one".to_string()])
         );
         let visits = recovered
             .json_get("document", "$.visits")
@@ -7164,7 +7473,7 @@ mod tests {
         let recovered = ShardedStore::new();
         let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
         assert_eq!(state.last_sequence, 2);
-        assert_eq!(recovered.get("safe"), Some("old-log".to_string()));
+        assert_eq!(recovered.get("safe"), Ok(Some("old-log".to_string())));
     }
 
     #[tokio::test]
@@ -7203,7 +7512,7 @@ mod tests {
         let recovered = ShardedStore::new();
         let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
         assert_eq!(state.snapshot_watermark, 7);
-        assert_eq!(recovered.get("safe"), Some("new".to_string()));
+        assert_eq!(recovered.get("safe"), Ok(Some("new".to_string())));
     }
 
     #[tokio::test]
@@ -7225,7 +7534,7 @@ mod tests {
         let recovered = ShardedStore::new();
         let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
         assert_eq!(state.snapshot_watermark, 2);
-        assert_eq!(recovered.get("key"), Some("second".to_string()));
+        assert_eq!(recovered.get("key"), Ok(Some("second".to_string())));
     }
 
     #[test]
@@ -7240,7 +7549,7 @@ mod tests {
         let recovered = ShardedStore::new();
         let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
         assert_eq!(state.snapshot_watermark, 3);
-        assert_eq!(recovered.get("safe"), Some("value".to_string()));
+        assert_eq!(recovered.get("safe"), Ok(Some("value".to_string())));
     }
 
     #[test]
@@ -7876,8 +8185,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!error.to_string().is_empty());
-        assert_eq!(store.get("old"), Some("live".to_string()));
-        assert!(store.get("new").is_none());
+        assert_eq!(store.get("old"), Ok(Some("live".to_string())));
+        assert_eq!(store.get("new"), Ok(None));
         assert!(!persistence.replication_ready.load(Ordering::SeqCst));
         assert!(!persistence.promote_to_master.load(Ordering::SeqCst));
         assert!(prepare_replica_promotion(&persistence).await.is_err());
@@ -7897,7 +8206,7 @@ mod tests {
         let recovered = ShardedStore::new();
         let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
         assert_eq!(recovery.last_sequence, 3);
-        assert_eq!(recovered.get("old"), Some("durable".to_string()));
+        assert_eq!(recovered.get("old"), Ok(Some("durable".to_string())));
         assert!(
             load_replica_identity(&directory.paths, 3)
                 .unwrap()
@@ -8064,8 +8373,68 @@ mod tests {
         let recovered = ShardedStore::new();
         let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
         assert_eq!(recovery.last_sequence, 1);
-        assert_eq!(recovered.get("first"), Some("value".to_string()));
-        assert_eq!(recovered.get("second"), Some("1".to_string()));
+        assert_eq!(recovered.get("first"), Ok(Some("value".to_string())));
+        assert_eq!(recovered.get("second"), Ok(Some("1".to_string())));
+    }
+
+    #[tokio::test]
+    async fn wrong_type_transaction_error_preserves_state_and_emits_no_commit() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let store = Arc::new(ShardedStore::new());
+        assert_eq!(store.lpush("list", "original".to_string()), Ok(1));
+
+        let response = execute_transaction(
+            &store,
+            &persistence,
+            vec![vec![
+                "APPEND".to_string(),
+                "list".to_string(),
+                "replacement".to_string(),
+            ]],
+            false,
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            RESPValue::Array(values)
+                if matches!(&values[..], [RESPValue::Error(message)] if message.starts_with("WRONGTYPE"))
+        ));
+        assert_eq!(
+            store.lrange("list", 0, -1),
+            Ok(vec!["original".to_string()])
+        );
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 0);
+        assert!(persistence.backlog.lock().unwrap().is_empty());
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_collection_mutation_and_empty_delete_recover_faithfully() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let store = Arc::new(ShardedStore::new());
+        store.engine.set(
+            Bytes::from_static(b"list"),
+            OnyxValue::List(vec![Bytes::from_static(b"stale")]),
+            Some(now()),
+        );
+
+        apply_test_command(&store, &persistence, &["RPUSH", "list", "fresh"]).await;
+        apply_test_command(&store, &persistence, &["LPOP", "list"]).await;
+        assert!(!store.exists("list"));
+
+        request_log_flush(&persistence).await.unwrap();
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovery.last_sequence, 2);
+        assert!(!recovered.exists("list"));
     }
 
     #[tokio::test]
@@ -8191,8 +8560,8 @@ mod tests {
         .await;
 
         assert!(matches!(response, RESPValue::Error(message) if message.starts_with("MISCONF")));
-        assert_eq!(store.get("existing"), Some("before".to_string()));
-        assert_eq!(store.get("created"), None);
+        assert_eq!(store.get("existing"), Ok(Some("before".to_string())));
+        assert_eq!(store.get("created"), Ok(None));
         assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 0);
         assert!(persistence.backlog.lock().unwrap().is_empty());
         assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
@@ -8242,8 +8611,8 @@ mod tests {
         .await;
 
         assert!(matches!(response, RESPValue::Error(message) if message.starts_with("MISCONF")));
-        assert_eq!(store.get("victim"), Some("original".to_string()));
-        assert_eq!(store.get("created"), None);
+        assert_eq!(store.get("victim"), Ok(Some("original".to_string())));
+        assert_eq!(store.get("created"), Ok(None));
         assert!(store.used_memory_bytes() <= limit);
 
         drop(persistence);
@@ -8280,7 +8649,7 @@ mod tests {
         assert!(persistence.backlog.lock().unwrap().is_empty());
         assert!(live_receiver.try_recv().is_err());
         assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 0);
-        assert_eq!(store.get("key"), None);
+        assert_eq!(store.get("key"), Ok(None));
 
         let second_command = vec![
             "SET".to_string(),
@@ -8290,7 +8659,7 @@ mod tests {
         let (second_response, _) =
             execute_ordered_command(&store, &persistence, &second_command).await;
         assert!(matches!(second_response, RESPValue::Error(_)));
-        assert_eq!(store.get("second"), None);
+        assert_eq!(store.get("second"), Ok(None));
 
         drop(persistence);
         worker.await.unwrap();
@@ -8342,7 +8711,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(binlog_sequences, backlog_sequences);
-        assert_eq!(store.get("counter"), Some(MUTATION_COUNT.to_string()));
+        assert_eq!(store.get("counter"), Ok(Some(MUTATION_COUNT.to_string())));
 
         drop(persistence);
         worker.await.unwrap();
@@ -8393,7 +8762,7 @@ mod tests {
             pop.await.unwrap();
             push.await.unwrap();
 
-            assert_eq!(store.lrange(&key, 0, -1), Some(vec!["new".to_string()]));
+            assert_eq!(store.lrange(&key, 0, -1), Ok(vec!["new".to_string()]));
         }
 
         request_log_flush(&persistence).await.unwrap();
@@ -9225,7 +9594,7 @@ mod tests {
         let recovered = ShardedStore::new();
         let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
         assert_eq!(recovery.last_sequence, 1);
-        assert_eq!(recovered.get("key"), Some("original".to_string()));
+        assert_eq!(recovered.get("key"), Ok(Some("original".to_string())));
     }
 
     #[tokio::test]
@@ -9261,10 +9630,10 @@ mod tests {
 
         let recovered = ShardedStore::new();
         load_data_from_paths(&recovered, &directory.paths).unwrap();
-        assert_eq!(recovered.get("counter"), Some("12".to_string()));
+        assert_eq!(recovered.get("counter"), Ok(Some("12".to_string())));
         assert_eq!(
             recovered.get("maximum"),
-            Some("9223372036854775807".to_string())
+            Ok(Some("9223372036854775807".to_string()))
         );
     }
 
@@ -9510,7 +9879,7 @@ mod tests {
         assert!(
             matches!(response, RESPValue::Error(message) if message.contains("injected sync failure"))
         );
-        assert!(store.get("key").is_none());
+        assert_eq!(store.get("key"), Ok(None));
         drop(persistence);
         worker.await.unwrap();
     }
