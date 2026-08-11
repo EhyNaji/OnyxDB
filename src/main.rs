@@ -35,8 +35,11 @@ const SNAPSHOT_MAGIC: &str = "ONYXSNAP";
 const SNAPSHOT_VERSION: u8 = 2;
 const REPLICA_STATE_MAGIC: &str = "ONYXREPL";
 const REPLICA_STATE_VERSION: u8 = 2;
-const BINLOG_RECORD_MAGIC: &[u8; 4] = b"ONX3";
+const BINLOG_RECORD_MAGIC: &[u8; 4] = b"ONX4";
+const CHECKSUMLESS_BINLOG_RECORD_MAGIC: &[u8; 4] = b"ONX3";
 const PREVIOUS_BINLOG_RECORD_MAGIC: &[u8; 4] = b"ONX2";
+const BINLOG_CHECKSUM_SIZE: usize = std::mem::size_of::<u32>();
+const BINLOG_RECORD_LENGTH_SIZE: usize = std::mem::size_of::<u32>();
 const MAX_BINLOG_RECORD_SIZE: usize = 512 * 1024 * 1024 + 1024;
 const MAX_SNAPSHOT_METADATA_SIZE: usize = 4096;
 const MAX_SNAPSHOT_LINE_SIZE: usize = 512 * 1024 * 1024 + 1024;
@@ -1537,8 +1540,10 @@ fn encode_versioned_binlog_record(
     }
     let record_length = BINLOG_RECORD_MAGIC
         .len()
-        .checked_add(8)
+        .checked_add(BINLOG_RECORD_LENGTH_SIZE)
+        .and_then(|length| length.checked_add(8))
         .and_then(|length| length.checked_add(effect_record.len()))
+        .and_then(|length| length.checked_add(BINLOG_CHECKSUM_SIZE))
         .ok_or_else(|| PersistenceError::new("Binlog record length overflow"))?;
     if record_length > MAX_BINLOG_RECORD_SIZE {
         return Err(PersistenceError::new(
@@ -1547,17 +1552,61 @@ fn encode_versioned_binlog_record(
     }
     let mut record = Vec::with_capacity(record_length);
     record.extend_from_slice(BINLOG_RECORD_MAGIC);
+    write_u32_be(
+        &mut record,
+        u32::try_from(record_length)
+            .map_err(|_| PersistenceError::new("Binlog record length exceeds u32"))?,
+    );
     write_u64_be(&mut record, sequence);
     record.extend_from_slice(effect_record);
+    let checksum = crc32fast::hash(&record);
+    write_u32_be(&mut record, checksum);
     Ok(record)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BinlogRecordIntegrity {
+    Checksummed,
+    ChecksumlessLegacy,
+}
+
+#[derive(Debug)]
 enum DecodedBinlogRecord<'a> {
-    Versioned { sequence: u64, effects: &'a [u8] },
+    Versioned {
+        sequence: u64,
+        effects: &'a [u8],
+        integrity: BinlogRecordIntegrity,
+    },
 }
 
 fn decode_binlog_record(record: &[u8]) -> Result<DecodedBinlogRecord<'_>, PersistenceError> {
-    if !record.starts_with(BINLOG_RECORD_MAGIC) {
+    let (magic, effects_end, integrity) = if record.starts_with(BINLOG_RECORD_MAGIC) {
+        let checksum_offset = record
+            .len()
+            .checked_sub(BINLOG_CHECKSUM_SIZE)
+            .filter(|offset| *offset >= BINLOG_RECORD_MAGIC.len() + BINLOG_RECORD_LENGTH_SIZE + 8)
+            .ok_or_else(|| PersistenceError::new("Truncated checksummed binlog record"))?;
+        let expected_checksum = u32::from_be_bytes(
+            record[checksum_offset..]
+                .try_into()
+                .map_err(|_| PersistenceError::new("Invalid binlog record checksum"))?,
+        );
+        let actual_checksum = crc32fast::hash(&record[..checksum_offset]);
+        if actual_checksum != expected_checksum {
+            return Err(PersistenceError::new("Binlog record checksum mismatch"));
+        }
+        (
+            BINLOG_RECORD_MAGIC.as_slice(),
+            checksum_offset,
+            BinlogRecordIntegrity::Checksummed,
+        )
+    } else if record.starts_with(CHECKSUMLESS_BINLOG_RECORD_MAGIC) {
+        (
+            CHECKSUMLESS_BINLOG_RECORD_MAGIC.as_slice(),
+            record.len(),
+            BinlogRecordIntegrity::ChecksumlessLegacy,
+        )
+    } else {
         let format = if record.starts_with(PREVIOUS_BINLOG_RECORD_MAGIC) {
             "ONX2 command records"
         } else {
@@ -1567,9 +1616,21 @@ fn decode_binlog_record(record: &[u8]) -> Result<DecodedBinlogRecord<'_>, Persis
             "Unsupported unsafe binlog format: {}",
             format
         )));
-    }
+    };
 
-    let mut offset = BINLOG_RECORD_MAGIC.len();
+    let mut offset = magic.len();
+    if integrity == BinlogRecordIntegrity::Checksummed {
+        let embedded_length = read_u32_be(record, &mut offset)
+            .ok_or_else(|| PersistenceError::new("Missing embedded binlog record length"))?
+            as usize;
+        if embedded_length != record.len() {
+            return Err(PersistenceError::new(format!(
+                "Binlog record length mismatch: outer length {}, embedded length {}",
+                record.len(),
+                embedded_length
+            )));
+        }
+    }
     let sequence = read_u64_be(record, &mut offset)
         .ok_or_else(|| PersistenceError::new("Truncated versioned binlog record header"))?;
     if sequence == 0 {
@@ -1578,14 +1639,18 @@ fn decode_binlog_record(record: &[u8]) -> Result<DecodedBinlogRecord<'_>, Persis
         ));
     }
     let effects = record
-        .get(offset..)
+        .get(offset..effects_end)
         .ok_or_else(|| PersistenceError::new("Missing committed-effect payload"))?;
     if effects.is_empty() {
         return Err(PersistenceError::new(
             "Versioned binlog record contains an empty committed-effect payload",
         ));
     }
-    Ok(DecodedBinlogRecord::Versioned { sequence, effects })
+    Ok(DecodedBinlogRecord::Versioned {
+        sequence,
+        effects,
+        integrity,
+    })
 }
 
 /// Converte un comando + entry in record binario per il log
@@ -3219,6 +3284,7 @@ struct BinlogInspection {
     max_sequence: u64,
     valid_len: u64,
     truncated_tail: bool,
+    contains_checksumless_records: bool,
 }
 
 #[derive(Debug, Default)]
@@ -3312,8 +3378,66 @@ fn for_each_binlog_record(
                 record_len
             )));
         }
+        let header_probe_length =
+            record_len.min(BINLOG_RECORD_MAGIC.len() + BINLOG_RECORD_LENGTH_SIZE);
+        let file_len = fs::metadata(path)?.len();
+        let available_length = file_len.saturating_sub(record_start + 4);
+        let readable_header_length = available_length.min(header_probe_length as u64) as usize;
+        let mut header = [0u8; BINLOG_RECORD_MAGIC.len() + BINLOG_RECORD_LENGTH_SIZE];
+        match reader.read_exact(&mut header[..readable_header_length]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok((record_start, true));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let visible_header = &header[..readable_header_length];
+        if readable_header_length < header_probe_length {
+            if visible_header.starts_with(CHECKSUMLESS_BINLOG_RECORD_MAGIC) {
+                return Err(PersistenceError::new(
+                    "Cannot safely truncate an incomplete checksumless ONX3 binlog record",
+                ));
+            }
+            if readable_header_length >= BINLOG_RECORD_MAGIC.len()
+                && !visible_header.starts_with(BINLOG_RECORD_MAGIC)
+            {
+                return Err(PersistenceError::new(
+                    "Cannot safely truncate an incomplete binlog record with unknown framing",
+                ));
+            }
+            return Ok((record_start, true));
+        }
+        if visible_header.starts_with(BINLOG_RECORD_MAGIC)
+            && record_len >= BINLOG_RECORD_MAGIC.len() + BINLOG_RECORD_LENGTH_SIZE
+        {
+            let mut offset = BINLOG_RECORD_MAGIC.len();
+            let embedded_length = read_u32_be(visible_header, &mut offset)
+                .expect("the fixed-size record header was read")
+                as usize;
+            if embedded_length != record_len {
+                return Err(PersistenceError::new(format!(
+                    "Binlog record length mismatch: outer length {}, embedded length {}",
+                    record_len, embedded_length
+                )));
+            }
+        }
+        if available_length < record_len as u64 {
+            if visible_header.starts_with(CHECKSUMLESS_BINLOG_RECORD_MAGIC) {
+                return Err(PersistenceError::new(
+                    "Cannot safely truncate an incomplete checksumless ONX3 binlog record",
+                ));
+            }
+            if !visible_header.starts_with(BINLOG_RECORD_MAGIC) {
+                return Err(PersistenceError::new(
+                    "Cannot safely truncate an incomplete binlog record with unknown framing",
+                ));
+            }
+            return Ok((record_start, true));
+        }
+
         let mut record = vec![0u8; record_len];
-        match reader.read_exact(&mut record) {
+        record[..header_probe_length].copy_from_slice(visible_header);
+        match reader.read_exact(&mut record[header_probe_length..]) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Ok((record_start, true));
@@ -3329,7 +3453,11 @@ fn inspect_binlog(path: &Path) -> Result<BinlogInspection, PersistenceError> {
     let mut inspection = BinlogInspection::default();
     let mut last_sequence: Option<u64> = None;
     let (valid_len, truncated_tail) = for_each_binlog_record(path, |record| {
-        let DecodedBinlogRecord::Versioned { sequence, effects } = decode_binlog_record(record)?;
+        let DecodedBinlogRecord::Versioned {
+            sequence,
+            effects,
+            integrity,
+        } = decode_binlog_record(record)?;
         if let Some(previous) = last_sequence
             && previous.checked_add(1) != Some(sequence)
         {
@@ -3344,6 +3472,8 @@ fn inspect_binlog(path: &Path) -> Result<BinlogInspection, PersistenceError> {
                 sequence, error
             ))
         })?;
+        inspection.contains_checksumless_records |=
+            integrity == BinlogRecordIntegrity::ChecksumlessLegacy;
         inspection.min_sequence.get_or_insert(sequence);
         inspection.max_sequence = sequence;
         last_sequence = Some(sequence);
@@ -3761,6 +3891,11 @@ fn load_data_from_paths(
         ));
     }
     let binlog = inspect_binlog(&paths.binlog)?;
+    if binlog.contains_checksumless_records {
+        warn!(
+            "Recovery accepted structurally valid checksumless ONX3 records; compact the dataset to replace this legacy recovery history"
+        );
+    }
     let snapshot_watermark = match snapshot_format {
         SnapshotFormat::Versioned { watermark } => watermark,
         SnapshotFormat::Missing => 0,
@@ -3774,17 +3909,20 @@ fn load_data_from_paths(
         ));
     }
 
-    let snapshot_count = load_snapshot_entries(store, snapshot_path, snapshot_format)?;
+    let staging = ShardedStore::new();
+    let snapshot_count = load_snapshot_entries(&staging, snapshot_path, snapshot_format)?;
     info!("Snapshot loaded: {} active entries", snapshot_count);
 
     let mut replayed = 0usize;
     for_each_binlog_record(&paths.binlog, |record| {
-        let DecodedBinlogRecord::Versioned { sequence, effects } = decode_binlog_record(record)?;
+        let DecodedBinlogRecord::Versioned {
+            sequence, effects, ..
+        } = decode_binlog_record(record)?;
         if sequence <= snapshot_watermark {
             return Ok(());
         }
         let batch = decode_committed_batch(effects)?;
-        apply_committed_batch(store, &batch);
+        apply_committed_batch(&staging, &batch);
         replayed += 1;
         Ok(())
     })?;
@@ -3798,6 +3936,7 @@ fn load_data_from_paths(
         file.set_len(binlog.valid_len)?;
         file.sync_all()?;
     }
+    store.engine.replace_all(staging.engine.snapshot_all());
     info!("Binlog replayed: {} commands", replayed);
 
     Ok(RecoveryState {
@@ -6744,6 +6883,10 @@ mod tests {
         let effect_record = encode_committed_batch(&batch).expect("encodable committed effect");
         let record = encode_versioned_binlog_record(sequence, &effect_record)
             .expect("encodable versioned binlog record");
+        append_raw_binlog_record(paths, &record);
+    }
+
+    fn append_raw_binlog_record(paths: &PersistencePaths, record: &[u8]) {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -6751,7 +6894,7 @@ mod tests {
             .unwrap();
         file.write_all(&(record.len() as u32).to_be_bytes())
             .unwrap();
-        file.write_all(&record).unwrap();
+        file.write_all(record).unwrap();
         file.sync_all().unwrap();
     }
 
@@ -9692,6 +9835,236 @@ mod tests {
         if usize::BITS > 32 {
             assert!(checked_u32_length(u32::MAX as usize + 1, "Test payload").is_err());
         }
+    }
+
+    #[test]
+    fn structurally_valid_binlog_bit_flip_is_rejected() {
+        let directory = TestPersistenceDirectory::new();
+        let batch = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"integrity-key"),
+            entry: PersistentEntry {
+                value: OnyxValue::Blob(Bytes::from_static(b"original-value")),
+                expires_at: None,
+            },
+        }])
+        .unwrap();
+        let effects = encode_committed_batch(&batch).unwrap();
+        let mut record = encode_versioned_binlog_record(1, &effects).unwrap();
+        let value_offset = record
+            .windows(b"original-value".len())
+            .position(|window| window == b"original-value")
+            .expect("encoded value must be present");
+        record[value_offset] ^= 1;
+
+        append_raw_binlog_record(&directory.paths, &record);
+        let corrupt_length = fs::metadata(&directory.paths.binlog).unwrap().len();
+
+        let error = load_data_from_paths(&ShardedStore::new(), &directory.paths).unwrap_err();
+        assert!(error.to_string().contains("checksum"));
+        assert_eq!(
+            fs::metadata(&directory.paths.binlog).unwrap().len(),
+            corrupt_length,
+            "a complete corrupt record must not be truncated as a torn tail"
+        );
+    }
+
+    #[test]
+    fn binlog_checksum_covers_sequence_payload_and_checksum_bytes() {
+        let batch = CommittedBatch::new(vec![CommittedEffect::Delete {
+            key: Bytes::from_static(b"checksum-key"),
+        }])
+        .unwrap();
+        let effects = encode_committed_batch(&batch).unwrap();
+        let record = encode_versioned_binlog_record(7, &effects).unwrap();
+        assert!(matches!(
+            decode_binlog_record(&record).unwrap(),
+            DecodedBinlogRecord::Versioned {
+                sequence: 7,
+                integrity: BinlogRecordIntegrity::Checksummed,
+                ..
+            }
+        ));
+
+        for offset in [
+            BINLOG_RECORD_MAGIC.len(),
+            BINLOG_RECORD_MAGIC.len() + BINLOG_RECORD_LENGTH_SIZE,
+            BINLOG_RECORD_MAGIC.len() + BINLOG_RECORD_LENGTH_SIZE + 8,
+            record.len() - 1,
+        ] {
+            let mut corrupted = record.clone();
+            corrupted[offset] ^= 1;
+            assert!(
+                decode_binlog_record(&corrupted)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("checksum")
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_outer_binlog_length_is_not_mistaken_for_a_torn_tail() {
+        let directory = TestPersistenceDirectory::new();
+        let batch = CommittedBatch::new(vec![CommittedEffect::Delete {
+            key: Bytes::from_static(b"length-key"),
+        }])
+        .unwrap();
+        let effects = encode_committed_batch(&batch).unwrap();
+        let record = encode_versioned_binlog_record(1, &effects).unwrap();
+        let mut binlog = File::create(&directory.paths.binlog).unwrap();
+        binlog
+            .write_all(&((record.len() as u32) + 1).to_be_bytes())
+            .unwrap();
+        binlog.write_all(&record).unwrap();
+        binlog.sync_all().unwrap();
+        let corrupt_length = fs::metadata(&directory.paths.binlog).unwrap().len();
+
+        let error = load_data_from_paths(&ShardedStore::new(), &directory.paths).unwrap_err();
+        assert!(error.to_string().contains("length"));
+        assert_eq!(
+            fs::metadata(&directory.paths.binlog).unwrap().len(),
+            corrupt_length
+        );
+    }
+
+    #[test]
+    fn ambiguous_checksumless_binlog_tail_is_rejected() {
+        let directory = TestPersistenceDirectory::new();
+        let batch = CommittedBatch::new(vec![CommittedEffect::Delete {
+            key: Bytes::from_static(b"legacy-length-key"),
+        }])
+        .unwrap();
+        let effects = encode_committed_batch(&batch).unwrap();
+        let mut legacy_record = Vec::new();
+        legacy_record.extend_from_slice(CHECKSUMLESS_BINLOG_RECORD_MAGIC);
+        write_u64_be(&mut legacy_record, 1);
+        legacy_record.extend_from_slice(&effects);
+
+        let mut binlog = File::create(&directory.paths.binlog).unwrap();
+        binlog
+            .write_all(&((legacy_record.len() as u32) + 1).to_be_bytes())
+            .unwrap();
+        binlog.write_all(&legacy_record).unwrap();
+        binlog.sync_all().unwrap();
+        let corrupt_length = fs::metadata(&directory.paths.binlog).unwrap().len();
+
+        let error = load_data_from_paths(&ShardedStore::new(), &directory.paths).unwrap_err();
+        assert!(error.to_string().contains("checksumless ONX3"));
+        assert_eq!(
+            fs::metadata(&directory.paths.binlog).unwrap().len(),
+            corrupt_length
+        );
+    }
+
+    #[test]
+    fn incomplete_checksummed_binlog_tail_is_truncated_after_valid_history() {
+        let directory = TestPersistenceDirectory::new();
+        let first_batch = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"durable-key"),
+            entry: PersistentEntry {
+                value: OnyxValue::Blob(Bytes::from_static(b"durable-value")),
+                expires_at: None,
+            },
+        }])
+        .unwrap();
+        let first_effects = encode_committed_batch(&first_batch).unwrap();
+        let first_record = encode_versioned_binlog_record(1, &first_effects).unwrap();
+        append_raw_binlog_record(&directory.paths, &first_record);
+        let valid_length = fs::metadata(&directory.paths.binlog).unwrap().len();
+
+        let second_batch = CommittedBatch::new(vec![CommittedEffect::Delete {
+            key: Bytes::from_static(b"durable-key"),
+        }])
+        .unwrap();
+        let second_effects = encode_committed_batch(&second_batch).unwrap();
+        let second_record = encode_versioned_binlog_record(2, &second_effects).unwrap();
+        let mut binlog = OpenOptions::new()
+            .append(true)
+            .open(&directory.paths.binlog)
+            .unwrap();
+        binlog
+            .write_all(&(second_record.len() as u32).to_be_bytes())
+            .unwrap();
+        binlog
+            .write_all(&second_record[..second_record.len() - 1])
+            .unwrap();
+        binlog.sync_all().unwrap();
+
+        let recovered = ShardedStore::new();
+        let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(state.last_sequence, 1);
+        assert_eq!(
+            recovered.get("durable-key"),
+            Ok(Some("durable-value".to_string()))
+        );
+        assert_eq!(
+            fs::metadata(&directory.paths.binlog).unwrap().len(),
+            valid_length
+        );
+    }
+
+    #[test]
+    fn recovery_accepts_mixed_checksumless_and_checksummed_binlog_history() {
+        let directory = TestPersistenceDirectory::new();
+        let legacy_batch = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"mixed-key"),
+            entry: PersistentEntry {
+                value: OnyxValue::Blob(Bytes::from_static(b"legacy-value")),
+                expires_at: None,
+            },
+        }])
+        .unwrap();
+        let legacy_effects = encode_committed_batch(&legacy_batch).unwrap();
+        let mut legacy_record = Vec::new();
+        legacy_record.extend_from_slice(CHECKSUMLESS_BINLOG_RECORD_MAGIC);
+        write_u64_be(&mut legacy_record, 1);
+        legacy_record.extend_from_slice(&legacy_effects);
+        append_raw_binlog_record(&directory.paths, &legacy_record);
+
+        let current_batch = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"mixed-key"),
+            entry: PersistentEntry {
+                value: OnyxValue::Blob(Bytes::from_static(b"checksummed-value")),
+                expires_at: None,
+            },
+        }])
+        .unwrap();
+        let current_effects = encode_committed_batch(&current_batch).unwrap();
+        let current_record = encode_versioned_binlog_record(2, &current_effects).unwrap();
+        append_raw_binlog_record(&directory.paths, &current_record);
+
+        let inspection = inspect_binlog(&directory.paths.binlog).unwrap();
+        assert!(inspection.contains_checksumless_records);
+        assert_eq!(inspection.min_sequence, Some(1));
+        assert_eq!(inspection.max_sequence, 2);
+
+        let recovered = ShardedStore::new();
+        let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(state.last_sequence, 2);
+        assert_eq!(
+            recovered.get("mixed-key"),
+            Ok(Some("checksummed-value".to_string()))
+        );
+    }
+
+    #[test]
+    fn corrupt_snapshot_is_rejected_without_partially_installing_recovery_state() {
+        let directory = TestPersistenceDirectory::new();
+        let snapshot_store = ShardedStore::new();
+        snapshot_store.set("snapshot-key".to_string(), "snapshot-value".to_string());
+        write_snapshot_file(snapshot_store.engine.snapshot_all(), 1, &directory.paths).unwrap();
+
+        let mut snapshot_bytes = fs::read(&directory.paths.snapshot).unwrap();
+        assert!(snapshot_bytes.len() > 8);
+        let checksum_offset = snapshot_bytes.len() - 8;
+        snapshot_bytes[checksum_offset] ^= 1;
+        fs::write(&directory.paths.snapshot, snapshot_bytes).unwrap();
+
+        let recovered = ShardedStore::new();
+        recovered.set("sentinel".to_string(), "preserved".to_string());
+        assert!(load_data_from_paths(&recovered, &directory.paths).is_err());
+        assert_eq!(recovered.get("sentinel"), Ok(Some("preserved".to_string())));
+        assert_eq!(recovered.get("snapshot-key"), Ok(None));
     }
 
     #[tokio::test]
