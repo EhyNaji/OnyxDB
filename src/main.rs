@@ -48,6 +48,43 @@ const MAX_KEYS: usize = 1_000_000;
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const CLIENT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLICATION_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TRANSACTION_COMMANDS: usize = 1024;
+const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct TransactionQueue {
+    commands: Vec<Vec<String>>,
+    encoded_bytes: usize,
+    failed: bool,
+}
+
+impl TransactionQueue {
+    fn enqueue(&mut self, command: Vec<String>) -> Result<(), &'static str> {
+        if self.failed {
+            return Err("ERR transaction queue is already invalid");
+        }
+        if self.commands.len() >= MAX_TRANSACTION_COMMANDS {
+            self.failed = true;
+            return Err("ERR transaction queue command limit exceeded");
+        }
+        let command_bytes = command.iter().try_fold(16usize, |total, argument| {
+            total.checked_add(argument.len().saturating_add(16))
+        });
+        let Some(projected_bytes) =
+            command_bytes.and_then(|command_bytes| self.encoded_bytes.checked_add(command_bytes))
+        else {
+            self.failed = true;
+            return Err("ERR transaction queue byte limit exceeded");
+        };
+        if projected_bytes > MAX_TRANSACTION_BYTES {
+            self.failed = true;
+            return Err("ERR transaction queue byte limit exceeded");
+        }
+        self.encoded_bytes = projected_bytes;
+        self.commands.push(command);
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 struct PersistencePaths {
@@ -1242,6 +1279,11 @@ struct Persistence {
     write_count: AtomicUsize,
     compaction_pending: AtomicBool,
     accepting_writes: AtomicBool,
+    /// Readers take a shared guard while commands observe state. Mutations,
+    /// replicated batches, and full-sync installation take an exclusive guard
+    /// so no client can observe a partially committed state transition. Code
+    /// that needs both gates must acquire write_gate before visibility_gate.
+    visibility_gate: tokio::sync::RwLock<()>,
     write_gate: tokio::sync::Mutex<()>,
     paths: PersistencePaths,
     // Canale broadcast: ogni comando di scrittura viene trasmesso a tutte le
@@ -3754,8 +3796,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
     let mut scratch = Vec::with_capacity(256);
     let mut resp_buf = String::with_capacity(256);
     let mut authenticated = !auth_required();
-    let mut in_transaction = false;
-    let mut queued_commands: Vec<Vec<String>> = Vec::new();
+    let mut transaction: Option<TransactionQueue> = None;
 
     loop {
         let mut args = match read_command_with_timeouts(
@@ -3835,10 +3876,14 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
         // MULTI
 
         if cmd.eq_ignore_ascii_case("MULTI") {
-            in_transaction = true;
-            queued_commands.clear();
             resp_buf.clear();
-            RESPValue::SimpleString("OK".to_string()).encode_into(&mut resp_buf);
+            if transaction.is_some() {
+                RESPValue::Error("ERR MULTI calls cannot be nested".to_string())
+                    .encode_into(&mut resp_buf);
+            } else {
+                transaction = Some(TransactionQueue::default());
+                RESPValue::SimpleString("OK".to_string()).encode_into(&mut resp_buf);
+            }
             let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
             let _ = buf_writer.flush().await;
             continue;
@@ -3846,9 +3891,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
 
         // DISCARD
         if cmd.eq_ignore_ascii_case("DISCARD") {
-            let response = if in_transaction {
-                in_transaction = false;
-                queued_commands.clear();
+            let response = if transaction.take().is_some() {
                 RESPValue::SimpleString("OK".to_string())
             } else {
                 RESPValue::Error(
@@ -3864,35 +3907,23 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
 
         // EXEC
         if cmd.eq_ignore_ascii_case("EXEC") {
-            let response = if !in_transaction {
-                RESPValue::Error(
+            let response = match transaction.take() {
+                None => RESPValue::Error(
                     "ERR EXEC without an active transaction (use MULTI first)".to_string(),
-                )
-            } else {
-                in_transaction = false;
-                let mut results = Vec::with_capacity(queued_commands.len());
-                let replica_read_guard = if IS_REPLICA.load(Ordering::SeqCst) {
-                    Some(persistence.write_gate.lock().await)
-                } else {
-                    None
-                };
-                for queued_args in queued_commands.drain(..) {
-                    let queued_cmd = queued_args.first().map(|s| s.as_str()).unwrap_or("");
-                    if replica_read_guard.is_some() && is_write_command(queued_cmd) {
-                        results.push(RESPValue::Error(
-                            "READONLY this instance is a read-only replica".to_string(),
-                        ));
-                        continue;
-                    }
-                    let (resp, _) = if replica_read_guard.is_some() {
-                        execute_command(&store, &queued_args)
-                    } else {
-                        execute_ordered_command(&store, &persistence, &queued_args, false).await
-                    };
-                    results.push(resp);
+                ),
+                Some(transaction) if transaction.failed => RESPValue::Error(
+                    "EXECABORT transaction discarded because its queue limit was exceeded"
+                        .to_string(),
+                ),
+                Some(transaction) => {
+                    execute_transaction(
+                        &store,
+                        &persistence,
+                        transaction.commands,
+                        IS_REPLICA.load(Ordering::SeqCst),
+                    )
+                    .await
                 }
-                drop(replica_read_guard);
-                RESPValue::Array(results)
             };
             resp_buf.clear();
             response.encode_into(&mut resp_buf);
@@ -3902,10 +3933,12 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
         }
 
         // Se in transazione, accoda
-        if in_transaction {
-            queued_commands.push(args.clone());
+        if let Some(transaction) = transaction.as_mut() {
             resp_buf.clear();
-            RESPValue::SimpleString("QUEUED".to_string()).encode_into(&mut resp_buf);
+            match transaction.enqueue(args.clone()) {
+                Ok(()) => RESPValue::SimpleString("QUEUED".to_string()).encode_into(&mut resp_buf),
+                Err(message) => RESPValue::Error(message.to_string()).encode_into(&mut resp_buf),
+            }
             let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
             let _ = buf_writer.flush().await;
             continue;
@@ -4444,9 +4477,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             }
         } else {
             TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
-            let serialize_replica_read = IS_REPLICA.load(Ordering::SeqCst);
-            let (mut resp, _is_write) =
-                execute_ordered_command(&store, &persistence, &args, serialize_replica_read).await;
+            let (mut resp, _is_write) = execute_ordered_command(&store, &persistence, &args).await;
             if cmd.eq_ignore_ascii_case("INFO")
                 && let RESPValue::BulkString(Some(ref mut text)) = resp
             {
@@ -5193,6 +5224,7 @@ async fn persist_and_apply_replica_effect(
     batch: &CommittedBatch,
 ) -> Result<(), PersistenceError> {
     let write_guard = persistence.write_gate.lock().await;
+    let _visibility_guard = persistence.visibility_gate.write().await;
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
         return Err(PersistenceError::new(persistence_unavailable_message(
             persistence,
@@ -5271,6 +5303,7 @@ async fn install_full_sync(
         ));
     }
     let _write_guard = persistence.write_gate.lock().await;
+    let _visibility_guard = persistence.visibility_gate.write().await;
     if persistence.promote_to_master.load(Ordering::SeqCst) {
         return Err(PersistenceError::new(
             "Replica promotion started before full synchronization could be installed",
@@ -5330,25 +5363,148 @@ async fn prepare_replica_promotion(persistence: &Arc<Persistence>) -> Result<(),
     Ok(())
 }
 
+async fn execute_transaction(
+    store: &Arc<ShardedStore>,
+    persistence: &Arc<Persistence>,
+    commands: Vec<Vec<String>>,
+    replica_mode: bool,
+) -> RESPValue {
+    let contains_writes = commands.iter().any(|args| {
+        args.first()
+            .is_some_and(|command| is_write_command(command))
+    });
+
+    if !contains_writes {
+        let _visibility_guard = persistence.visibility_gate.read().await;
+        return RESPValue::Array(
+            commands
+                .iter()
+                .map(|args| execute_command(store, args).0)
+                .collect(),
+        );
+    }
+
+    if replica_mode {
+        let _visibility_guard = persistence.visibility_gate.read().await;
+        return RESPValue::Array(
+            commands
+                .iter()
+                .map(|args| {
+                    let command = args.first().map(String::as_str).unwrap_or("");
+                    if is_write_command(command) {
+                        RESPValue::Error(
+                            "READONLY this instance is a read-only replica".to_string(),
+                        )
+                    } else {
+                        execute_command(store, args).0
+                    }
+                })
+                .collect(),
+        );
+    }
+
+    let write_guard = persistence.write_gate.lock().await;
+    let _visibility_guard = persistence.visibility_gate.write().await;
+    if !persistence.accepting_writes.load(Ordering::SeqCst) {
+        return RESPValue::Error(persistence_unavailable_message(persistence));
+    }
+    let current_sequence = persistence.repl_offset.load(Ordering::SeqCst);
+    if current_sequence == u64::MAX {
+        mark_persistence_failed(persistence, "Persistence sequence is exhausted");
+        return RESPValue::Error("MISCONF persistence sequence is exhausted".to_string());
+    }
+
+    let mut baseline = std::collections::HashMap::<Bytes, Option<DataEntry>>::new();
+    let mut changed_keys = Vec::new();
+    let mut changed_key_set = HashSet::new();
+    let mut results = Vec::with_capacity(commands.len());
+
+    for args in &commands {
+        let command = args.first().map(String::as_str).unwrap_or("");
+        if !is_write_command(command) {
+            results.push(execute_command(store, args).0);
+            continue;
+        }
+
+        let affected_keys = persistent_keys_for_command(args);
+        let before = capture_entries(store, &affected_keys);
+        for key in &affected_keys {
+            if changed_key_set.insert(key.clone()) {
+                changed_keys.push(key.clone());
+                baseline.insert(key.clone(), before.get(key).cloned().flatten());
+            }
+        }
+        let memory_before = store.used_memory_bytes();
+        let key_count_before = store.engine.stats().total_keys;
+        let (response, _) = execute_command(store, args);
+        if derive_committed_batch(store, &affected_keys, &before, &[]).is_none() {
+            results.push(response);
+            continue;
+        }
+
+        let protected_keys = affected_keys.iter().cloned().collect::<HashSet<_>>();
+        match enforce_write_admission(store, memory_before, key_count_before, &protected_keys) {
+            Ok(evicted_entries) => {
+                for (key, entry) in evicted_entries {
+                    if changed_key_set.insert(key.clone()) {
+                        changed_keys.push(key.clone());
+                        baseline.insert(key, Some(entry));
+                    }
+                }
+                results.push(response);
+            }
+            Err(error) => {
+                rollback_attempted_mutation(store, &before, &[]);
+                results.push(RESPValue::Error(error.message().to_string()));
+            }
+        }
+    }
+
+    changed_keys.sort();
+    let Some(batch) = derive_committed_batch(store, &changed_keys, &baseline, &[]) else {
+        drop(write_guard);
+        return RESPValue::Array(results);
+    };
+
+    let sequence = current_sequence + 1;
+    persistence.repl_offset.store(sequence, Ordering::SeqCst);
+    match persist_ordered_mutation(persistence, sequence, &batch).await {
+        Ok(should_compact) => {
+            drop(write_guard);
+            schedule_compaction(store, persistence, should_compact);
+            RESPValue::Array(results)
+        }
+        Err(error) => {
+            rollback_attempted_mutation(store, &baseline, &[]);
+            persistence
+                .repl_offset
+                .store(current_sequence, Ordering::SeqCst);
+            mark_persistence_failed(
+                persistence,
+                format!(
+                    "Transaction persistence failed at sequence {}: {}",
+                    sequence, error
+                ),
+            );
+            drop(write_guard);
+            RESPValue::Error(format!("MISCONF transaction persistence failed: {}", error))
+        }
+    }
+}
+
 async fn execute_ordered_command(
     store: &Arc<ShardedStore>,
     persistence: &Arc<Persistence>,
     args: &[String],
-    serialize_replica_read: bool,
 ) -> (RESPValue, bool) {
     let command = args.first().map(|value| value.as_str()).unwrap_or("");
     if !is_write_command(command) {
-        if serialize_replica_read {
-            // A full-sync install holds the same gate while replacing every
-            // shard. Keeping it for the complete command prevents multi-key
-            // reads from combining the old and new replica baselines.
-            let _replication_boundary = persistence.write_gate.lock().await;
-            return execute_command(store, args);
-        }
+        let _visibility_guard = persistence.visibility_gate.read().await;
         return execute_command(store, args);
     }
 
     let write_guard = persistence.write_gate.lock().await;
+    let _visibility_guard = persistence.visibility_gate.write().await;
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
         return (
             RESPValue::Error(persistence_unavailable_message(persistence)),
@@ -5479,11 +5635,7 @@ async fn execute_obp_command(
     let (value, _is_write) = match cmd {
         0x01 => {
             if let Some(key) = args.first() {
-                let _replication_boundary = if replica_mode {
-                    Some(persistence.write_gate.lock().await)
-                } else {
-                    None
-                };
+                let _visibility_guard = persistence.visibility_gate.read().await;
                 (
                     store
                         .engine
@@ -5499,6 +5651,7 @@ async fn execute_obp_command(
         0x02 => {
             if args.len() >= 2 {
                 let write_guard = persistence.write_gate.lock().await;
+                let _visibility_guard = persistence.visibility_gate.write().await;
                 if !persistence.accepting_writes.load(Ordering::SeqCst) {
                     return OBPFrame {
                         cmd: 0x00,
@@ -5600,6 +5753,7 @@ async fn execute_obp_command(
         0x03 => {
             if let Some(key) = args.first() {
                 let write_guard = persistence.write_gate.lock().await;
+                let _visibility_guard = persistence.visibility_gate.write().await;
                 if !persistence.accepting_writes.load(Ordering::SeqCst) {
                     return OBPFrame {
                         cmd: 0x00,
@@ -5848,6 +6002,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         replication_ready: AtomicBool::new(recovered_replica_identity.is_some()),
         accepting_writes: AtomicBool::new(true),
+        visibility_gate: tokio::sync::RwLock::new(()),
         write_gate: tokio::sync::Mutex::new(()),
         paths: paths.clone(),
     });
@@ -6534,6 +6689,7 @@ mod tests {
             upstream_replid: AtomicU64::new(0),
             replication_ready: AtomicBool::new(false),
             accepting_writes: AtomicBool::new(true),
+            visibility_gate: tokio::sync::RwLock::new(()),
             write_gate: tokio::sync::Mutex::new(()),
             paths,
         })
@@ -6595,8 +6751,7 @@ mod tests {
         args: &[&str],
     ) {
         let command: Vec<String> = args.iter().map(|value| (*value).to_string()).collect();
-        let (response, is_write) =
-            execute_ordered_command(store, persistence, &command, false).await;
+        let (response, is_write) = execute_ordered_command(store, persistence, &command).await;
         assert!(is_write, "command was not treated as a mutation: {args:?}");
         assert!(
             !matches!(response, RESPValue::Error(_)),
@@ -7487,7 +7642,7 @@ mod tests {
             None,
         );
 
-        let installation_guard = persistence.write_gate.lock().await;
+        let installation_guard = persistence.visibility_gate.write().await;
         let read_store = Arc::clone(&store);
         let read_persistence = Arc::clone(&persistence);
         let (started_tx, started_rx) = oneshot::channel();
@@ -7501,7 +7656,6 @@ mod tests {
                     "first".to_string(),
                     "second".to_string(),
                 ],
-                true,
             )
             .await
         });
@@ -7866,6 +8020,236 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transaction_queue_rejects_projected_byte_overflow() {
+        let mut queue = TransactionQueue::default();
+        let error = queue
+            .enqueue(vec!["x".repeat(MAX_TRANSACTION_BYTES)])
+            .unwrap_err();
+
+        assert_eq!(error, "ERR transaction queue byte limit exceeded");
+        assert!(queue.failed);
+        assert!(queue.commands.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transaction_persists_and_recovers_as_one_committed_batch() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let store = Arc::new(ShardedStore::new());
+        let response = execute_transaction(
+            &store,
+            &persistence,
+            vec![
+                vec!["SET".to_string(), "first".to_string(), "value".to_string()],
+                vec!["INCR".to_string(), "second".to_string()],
+            ],
+            false,
+        )
+        .await;
+
+        assert!(matches!(response, RESPValue::Array(results) if results.len() == 2));
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        {
+            let backlog = persistence.backlog.lock().unwrap();
+            assert_eq!(backlog.len(), 1);
+            assert_eq!(backlog.front().unwrap().0, 1);
+            assert_eq!(backlog.front().unwrap().1.effects.len(), 2);
+        }
+
+        request_log_flush(&persistence).await.unwrap();
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(recovered.get("first"), Some("value".to_string()));
+        assert_eq!(recovered.get("second"), Some("1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn transaction_state_is_invisible_until_its_batch_is_persisted() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let (append_started_tx, append_started_rx) = oneshot::channel();
+        let (allow_append_tx, allow_append_rx) = oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let mut append_started_tx = Some(append_started_tx);
+            let mut allow_append_rx = Some(allow_append_rx);
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    LogMessage::Append { completion, .. } => {
+                        if let Some(started) = append_started_tx.take() {
+                            let _ = started.send(());
+                        }
+                        if let Some(allow) = allow_append_rx.take() {
+                            let _ = allow.await;
+                        }
+                        let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Flush { completion }
+                    | LogMessage::SyncData { completion }
+                    | LogMessage::Truncate { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        let transaction_store = Arc::clone(&store);
+        let transaction_persistence = Arc::clone(&persistence);
+        let transaction = tokio::spawn(async move {
+            execute_transaction(
+                &transaction_store,
+                &transaction_persistence,
+                vec![
+                    vec!["SET".to_string(), "first".to_string(), "one".to_string()],
+                    vec!["SET".to_string(), "second".to_string(), "two".to_string()],
+                ],
+                false,
+            )
+            .await
+        });
+        append_started_rx.await.unwrap();
+
+        let read_store = Arc::clone(&store);
+        let read_persistence = Arc::clone(&persistence);
+        let mut read = tokio::spawn(async move {
+            execute_ordered_command(
+                &read_store,
+                &read_persistence,
+                &[
+                    "MGET".to_string(),
+                    "first".to_string(),
+                    "second".to_string(),
+                ],
+            )
+            .await
+            .0
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut read)
+                .await
+                .is_err(),
+            "a reader observed transaction state before its batch was persisted"
+        );
+
+        allow_append_tx.send(()).unwrap();
+        assert!(matches!(transaction.await.unwrap(), RESPValue::Array(_)));
+        assert!(matches!(
+            read.await.unwrap(),
+            RESPValue::Array(values) if values.len() == 2
+                && matches!(&values[0], RESPValue::BulkString(Some(value)) if value == "one")
+                && matches!(&values[1], RESPValue::BulkString(Some(value)) if value == "two")
+        ));
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transaction_persistence_failure_rolls_back_every_effect() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    LogMessage::Append { completion, .. } => {
+                        let _ = completion.send(Err("injected transaction failure".to_string()));
+                    }
+                    LogMessage::Flush { completion }
+                    | LogMessage::SyncData { completion }
+                    | LogMessage::Truncate { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        store.set("existing".to_string(), "before".to_string());
+
+        let response = execute_transaction(
+            &store,
+            &persistence,
+            vec![
+                vec![
+                    "SET".to_string(),
+                    "existing".to_string(),
+                    "after".to_string(),
+                ],
+                vec![
+                    "SET".to_string(),
+                    "created".to_string(),
+                    "value".to_string(),
+                ],
+            ],
+            false,
+        )
+        .await;
+
+        assert!(matches!(response, RESPValue::Error(message) if message.starts_with("MISCONF")));
+        assert_eq!(store.get("existing"), Some("before".to_string()));
+        assert_eq!(store.get("created"), None);
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 0);
+        assert!(persistence.backlog.lock().unwrap().is_empty());
+        assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transaction_failure_restores_eviction_victims() {
+        let candidate = ShardedStore::new();
+        candidate.set("created".to_string(), "x".repeat(90));
+        let limit = candidate.used_memory_bytes();
+        let store = Arc::new(ShardedStore::with_maxmemory(
+            limit,
+            EvictionPolicy::AllKeysLru,
+        ));
+        store.set("victim".to_string(), "original".to_string());
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    LogMessage::Append { completion, .. } => {
+                        let _ = completion.send(Err("injected transaction failure".to_string()));
+                    }
+                    LogMessage::Flush { completion }
+                    | LogMessage::SyncData { completion }
+                    | LogMessage::Truncate { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+
+        let response = execute_transaction(
+            &store,
+            &persistence,
+            vec![vec![
+                "SET".to_string(),
+                "created".to_string(),
+                "x".repeat(90),
+            ]],
+            false,
+        )
+        .await;
+
+        assert!(matches!(response, RESPValue::Error(message) if message.starts_with("MISCONF")));
+        assert_eq!(store.get("victim"), Some("original".to_string()));
+        assert_eq!(store.get("created"), None);
+        assert!(store.used_memory_bytes() <= limit);
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
     #[tokio::test]
     async fn binlog_append_failure_is_not_acknowledged_or_replicated() {
         let directory = TestPersistenceDirectory::new();
@@ -7889,8 +8273,7 @@ mod tests {
         let store = Arc::new(ShardedStore::new());
 
         let command = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
-        let (response, is_write) =
-            execute_ordered_command(&store, &persistence, &command, false).await;
+        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
         assert!(!is_write);
         assert!(matches!(response, RESPValue::Error(message) if message.starts_with("MISCONF")));
         assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
@@ -7905,7 +8288,7 @@ mod tests {
             "rejected".to_string(),
         ];
         let (second_response, _) =
-            execute_ordered_command(&store, &persistence, &second_command, false).await;
+            execute_ordered_command(&store, &persistence, &second_command).await;
         assert!(matches!(second_response, RESPValue::Error(_)));
         assert_eq!(store.get("second"), None);
 
@@ -7961,6 +8344,59 @@ mod tests {
         assert_eq!(binlog_sequences, backlog_sequences);
         assert_eq!(store.get("counter"), Some(MUTATION_COUNT.to_string()));
 
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_collection_cleanup_cannot_delete_a_concurrent_write() {
+        const ITERATIONS: usize = 32;
+        let directory = TestPersistenceDirectory::new();
+        let store = Arc::new(ShardedStore::new());
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+
+        for iteration in 0..ITERATIONS {
+            let key = format!("list-{iteration}");
+            store.engine.set(
+                Bytes::copy_from_slice(key.as_bytes()),
+                OnyxValue::List(vec![Bytes::from_static(b"old")]),
+                None,
+            );
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let pop_store = Arc::clone(&store);
+            let pop_persistence = Arc::clone(&persistence);
+            let pop_barrier = Arc::clone(&barrier);
+            let pop_key = key.clone();
+            let pop = tokio::spawn(async move {
+                pop_barrier.wait().await;
+                execute_ordered_command(
+                    &pop_store,
+                    &pop_persistence,
+                    &["LPOP".to_string(), pop_key],
+                )
+                .await
+            });
+            let push_store = Arc::clone(&store);
+            let push_persistence = Arc::clone(&persistence);
+            let push_barrier = Arc::clone(&barrier);
+            let push_key = key.clone();
+            let push = tokio::spawn(async move {
+                push_barrier.wait().await;
+                execute_ordered_command(
+                    &push_store,
+                    &push_persistence,
+                    &["RPUSH".to_string(), push_key, "new".to_string()],
+                )
+                .await
+            });
+            barrier.wait().await;
+            pop.await.unwrap();
+            push.await.unwrap();
+
+            assert_eq!(store.lrange(&key, 0, -1), Some(vec!["new".to_string()]));
+        }
+
+        request_log_flush(&persistence).await.unwrap();
         drop(persistence);
         worker.await.unwrap();
     }
@@ -8776,8 +9212,7 @@ mod tests {
             "key".to_string(),
             "replacement".to_string(),
         ];
-        let (response, is_write) =
-            execute_ordered_command(&store, &persistence, &command, false).await;
+        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
         assert!(matches!(response, RESPValue::Integer(0)));
         assert!(!is_write);
         assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
@@ -8812,8 +9247,7 @@ mod tests {
         .await;
         let offset_before_overflow = persistence.repl_offset.load(Ordering::SeqCst);
         let overflow = vec!["INCR".to_string(), "maximum".to_string()];
-        let (response, is_write) =
-            execute_ordered_command(&store, &persistence, &overflow, false).await;
+        let (response, is_write) = execute_ordered_command(&store, &persistence, &overflow).await;
         assert!(matches!(response, RESPValue::Error(message) if message.contains("overflow")));
         assert!(!is_write);
         assert_eq!(
@@ -9071,8 +9505,7 @@ mod tests {
 
         let store = Arc::new(ShardedStore::new());
         let command = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
-        let (response, is_write) =
-            execute_ordered_command(&store, &persistence, &command, false).await;
+        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
         assert!(!is_write);
         assert!(
             matches!(response, RESPValue::Error(message) if message.contains("injected sync failure"))

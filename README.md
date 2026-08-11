@@ -29,7 +29,7 @@ Persistence — a binary write-ahead log (binlog) for durability plus periodic g
 
 Access control — multi-user authentication (--user name:password, repeatable) with AUTH user pass, plus legacy single-password mode via --requirepass for compatibility.
 
-Transactions — MULTI / EXEC / DISCARD, queuing commands and executing them as a batch.
+Transactions — MULTI / EXEC / DISCARD with queues bounded to 1,024 commands and 16 MiB. Successful mutations in one EXEC become a single visibility, persistence, and replication batch; per-command runtime errors do not roll back other successful queued commands.
 
 Pub/Sub — SUBSCRIBE, UNSUBSCRIBE, PUBLISH, with dynamic channel subscription while a connection is already listening.
 

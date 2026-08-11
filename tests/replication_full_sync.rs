@@ -240,6 +240,16 @@ fn send_command(port: u16, args: &[&[u8]]) -> Resp {
     read_resp(&mut BufReader::new(stream))
 }
 
+fn send_command_on_connection(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    args: &[&[u8]],
+) -> Resp {
+    writer.write_all(&encode_command(args)).unwrap();
+    writer.flush().unwrap();
+    read_resp(reader)
+}
+
 fn assert_protocol_error_and_closed(port: u16, request: &[u8]) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
@@ -770,6 +780,164 @@ fn replica_applies_authoritative_state_even_when_it_exceeds_its_local_maxmemory(
 
     replica.stop();
     master.stop();
+}
+
+#[test]
+fn multi_exec_commits_one_canonical_replication_sequence() {
+    let directory = TestDirectory::new("transaction-sequence");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &[]);
+    let mut writer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    writer
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(writer.try_clone().unwrap());
+
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"MULTI"]),
+        Resp::Simple("OK".to_string())
+    );
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"SET", b"first", b"value"]),
+        Resp::Simple("QUEUED".to_string())
+    );
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"INCR", b"second"]),
+        Resp::Simple("QUEUED".to_string())
+    );
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"EXEC"]),
+        Resp::Array(vec![Resp::Simple("OK".to_string()), Resp::Integer(1)])
+    );
+
+    let info = send_command(port, &[b"INFO"]);
+    let Resp::Bulk(Some(info)) = info else {
+        panic!("expected INFO bulk response, got {info:?}");
+    };
+    let info = String::from_utf8(info).unwrap();
+    assert!(
+        info.lines().any(|line| line == "master_repl_offset:1"),
+        "EXEC must publish one canonical sequence, got {info:?}"
+    );
+
+    server.stop();
+}
+
+#[test]
+fn multi_exec_replicates_and_recovers_as_one_batch() {
+    let master_directory = TestDirectory::new("transaction-master");
+    let replica_directory = TestDirectory::new("transaction-replica");
+    let master_port = choose_port();
+    let replica_port = choose_port();
+    let master = start_server(&master_directory.0, master_port, &[]);
+    let replica = start_server(
+        &replica_directory.0,
+        replica_port,
+        &replica_args(master_port),
+    );
+    wait_for_response(replica_port, &[b"GET", b"first"], &Resp::Bulk(None));
+
+    let mut writer = TcpStream::connect(("127.0.0.1", master_port)).unwrap();
+    writer
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(writer.try_clone().unwrap());
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"MULTI"]),
+        Resp::Simple("OK".to_string())
+    );
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"SET", b"first", b"value"]),
+        Resp::Simple("QUEUED".to_string())
+    );
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"INCR", b"second"]),
+        Resp::Simple("QUEUED".to_string())
+    );
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"EXEC"]),
+        Resp::Array(vec![Resp::Simple("OK".to_string()), Resp::Integer(1)])
+    );
+
+    wait_for_response(replica_port, &[b"GET", b"first"], &resp_bulk("value"));
+    wait_for_response(replica_port, &[b"GET", b"second"], &resp_bulk("1"));
+    replica.stop();
+    master.stop();
+
+    let recovered_master = start_server(&master_directory.0, master_port, &[]);
+    assert_eq!(
+        send_command(master_port, &[b"GET", b"first"]),
+        resp_bulk("value")
+    );
+    assert_eq!(
+        send_command(master_port, &[b"GET", b"second"]),
+        resp_bulk("1")
+    );
+    recovered_master.stop();
+
+    let recovered_replica = start_server(&replica_directory.0, replica_port, &[]);
+    assert_eq!(
+        send_command(replica_port, &[b"GET", b"first"]),
+        resp_bulk("value")
+    );
+    assert_eq!(
+        send_command(replica_port, &[b"GET", b"second"]),
+        resp_bulk("1")
+    );
+    recovered_replica.stop();
+}
+
+#[test]
+fn multi_queue_has_a_deterministic_command_limit() {
+    let directory = TestDirectory::new("transaction-command-limit");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &[]);
+    let mut writer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    writer
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(writer.try_clone().unwrap());
+
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"MULTI"]),
+        Resp::Simple("OK".to_string())
+    );
+    for _ in 0..1024 {
+        assert_eq!(
+            send_command_on_connection(&mut writer, &mut reader, &[b"PING"]),
+            Resp::Simple("QUEUED".to_string())
+        );
+    }
+    let overflow = send_command_on_connection(&mut writer, &mut reader, &[b"PING"]);
+    assert!(
+        matches!(overflow, Resp::Error(ref message) if message.starts_with("ERR transaction queue")),
+        "expected transaction queue rejection, got {overflow:?}"
+    );
+    let exec = send_command_on_connection(&mut writer, &mut reader, &[b"EXEC"]);
+    assert!(
+        matches!(exec, Resp::Error(ref message) if message.starts_with("EXECABORT")),
+        "expected transaction abort after queue overflow, got {exec:?}"
+    );
+
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"MULTI"]),
+        Resp::Simple("OK".to_string())
+    );
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"PING"]),
+        Resp::Simple("QUEUED".to_string())
+    );
+    let nested = send_command_on_connection(&mut writer, &mut reader, &[b"MULTI"]);
+    assert!(
+        matches!(nested, Resp::Error(ref message) if message == "ERR MULTI calls cannot be nested"),
+        "expected nested MULTI rejection, got {nested:?}"
+    );
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"EXEC"]),
+        Resp::Array(vec![Resp::Simple("PONG".to_string())])
+    );
+
+    server.stop();
 }
 
 #[test]
