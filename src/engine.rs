@@ -6,7 +6,7 @@
 //! cadono sullo stesso shard.
 
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // Numero di shard: potenza di 2 per hashing veloce con bitmask
 pub const NUM_SHARDS: usize = 64; // 64 shard, bitmask 0x3F
@@ -62,23 +62,27 @@ pub struct DataEntry {
     pub last_accessed: u64,
 }
 
-/// Stima approssimativa (non esatta: non tiene conto dell'overhead reale di
-/// allocatore/HashMap) dei byte occupati da una entry. Basta per tenere la
-/// memoria complessiva sotto controllo con `--maxmemory`, non è pensata per
-/// essere precisa al byte.
+/// Estimates dataset bytes for admission and eviction. This intentionally does
+/// not model allocator and container capacity overhead, so it is a stable
+/// logical accounting metric rather than a byte-exact process RSS measurement.
 fn approx_entry_size(key: &Bytes, entry: &DataEntry) -> usize {
     let value_size = match &entry.value {
         OnyxValue::Blob(b) => b.len(),
         OnyxValue::Int(_) => 8,
         OnyxValue::Float(_) => 8,
-        OnyxValue::List(l) => l.iter().map(|b| b.len() + 8).sum(),
-        OnyxValue::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len() + 16).sum(),
-        OnyxValue::Set(s) => s.iter().map(|b| b.len() + 8).sum(),
+        OnyxValue::List(l) => l.iter().fold(0usize, |size, value| {
+            size.saturating_add(value.len().saturating_add(8))
+        }),
+        OnyxValue::Hash(h) => h.iter().fold(0usize, |size, (field, value)| {
+            size.saturating_add(field.len().saturating_add(value.len()).saturating_add(16))
+        }),
+        OnyxValue::Set(s) => s.iter().fold(0usize, |size, value| {
+            size.saturating_add(value.len().saturating_add(8))
+        }),
         OnyxValue::Json(j) => j.to_string().len(),
-        OnyxValue::Vector(v) => v.len() * 4,
+        OnyxValue::Vector(v) => v.len().saturating_mul(4),
     };
-    // Overhead fisso per la entry stessa (struct DataEntry, bucket dell'HashMap, ecc.)
-    key.len() + value_size + 64
+    key.len().saturating_add(value_size).saturating_add(64)
 }
 
 /// Politica di eviction quando si supera `--maxmemory`. Stesso vocabolario
@@ -174,7 +178,7 @@ impl Shard {
             let old_size = approx_entry_size(&key, old_entry);
             self.mem_bytes = self.mem_bytes.saturating_sub(old_size);
         }
-        self.mem_bytes += new_size;
+        self.mem_bytes = self.mem_bytes.saturating_add(new_size);
         old
     }
 
@@ -237,7 +241,10 @@ impl Shard {
                 entry.last_accessed = ts;
                 let result = f(&mut entry.value);
                 let new_size = approx_entry_size(key, entry);
-                self.mem_bytes = self.mem_bytes.saturating_sub(old_size) + new_size;
+                self.mem_bytes = self
+                    .mem_bytes
+                    .saturating_sub(old_size)
+                    .saturating_add(new_size);
                 Some(result)
             }
             None => None,
@@ -269,7 +276,10 @@ impl Shard {
         entry.last_accessed = ts;
         let result = f(&mut entry.value);
         let new_size = approx_entry_size(&key, entry);
-        self.mem_bytes = self.mem_bytes.saturating_sub(old_size) + new_size;
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_sub(old_size)
+            .saturating_add(new_size);
         result
     }
 
@@ -298,16 +308,19 @@ impl Shard {
             self.last_modified = now();
             let size = approx_entry_size(&key, &entry);
             self.data.insert(key, entry);
-            self.mem_bytes += size;
+            self.mem_bytes = self.mem_bytes.saturating_add(size);
             true
         }
     }
 
-    /// Propone il miglior candidato locale all'eviction secondo la policy:
-    /// per LRU, la entry con last_accessed più vecchio; per random, una
-    /// entry presa a caso. Per le policy `volatile-*` considera solo le
-    /// chiavi che hanno un TTL impostato (esattamente come in Redis).
-    fn eviction_candidate(&self, policy: EvictionPolicy) -> Option<(Bytes, u64)> {
+    /// Selects the best local eviction candidate while excluding keys whose
+    /// post-command values must be preserved. Volatile policies consider only
+    /// entries with an expiration.
+    fn eviction_candidate(
+        &self,
+        policy: EvictionPolicy,
+        protected_keys: &HashSet<Bytes>,
+    ) -> Option<(Bytes, u64)> {
         let only_volatile = matches!(
             policy,
             EvictionPolicy::VolatileLru | EvictionPolicy::VolatileRandom
@@ -317,22 +330,28 @@ impl Shard {
             EvictionPolicy::AllKeysRandom | EvictionPolicy::VolatileRandom
         );
 
-        let matching: Vec<(&Bytes, &DataEntry)> = self
-            .data
-            .iter()
-            .filter(|(_, e)| !only_volatile || e.expires_at.is_some())
-            .collect();
-        if matching.is_empty() {
-            return None;
-        }
-
         if is_random {
-            let idx = cheap_random_index(matching.len());
-            let (k, _) = matching[idx];
-            Some((k.clone(), 0))
+            let matching_count = self
+                .data
+                .iter()
+                .filter(|(key, entry)| {
+                    !protected_keys.contains(*key) && (!only_volatile || entry.expires_at.is_some())
+                })
+                .count();
+            let index = cheap_random_index(matching_count);
+            self.data
+                .iter()
+                .filter(|(key, entry)| {
+                    !protected_keys.contains(*key) && (!only_volatile || entry.expires_at.is_some())
+                })
+                .nth(index)
+                .map(|(key, _)| (key.clone(), 0))
         } else {
-            matching
-                .into_iter()
+            self.data
+                .iter()
+                .filter(|(key, entry)| {
+                    !protected_keys.contains(*key) && (!only_volatile || entry.expires_at.is_some())
+                })
                 .min_by_key(|(_, e)| e.last_accessed)
                 .map(|(k, e)| (k.clone(), e.last_accessed))
         }
@@ -645,13 +664,11 @@ impl OnyxEngine {
         }
     }
 
-    /// Somma approssimativa dei byte occupati da tutte le entry, su tutti
-    /// gli shard. Usata da `--maxmemory` per decidere quando fare eviction.
+    /// Returns the saturating sum of estimated dataset bytes across all shards.
     pub fn total_memory_bytes(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|s| s.lock().unwrap().mem_bytes)
-            .sum()
+        self.shards.iter().fold(0usize, |total, shard| {
+            total.saturating_add(shard.lock().unwrap().mem_bytes)
+        })
     }
 
     /// Frees memory until usage is at or below `maxmemory_bytes` and returns
@@ -663,21 +680,20 @@ impl OnyxEngine {
         &self,
         maxmemory_bytes: usize,
         policy: EvictionPolicy,
+        protected_keys: &HashSet<Bytes>,
     ) -> Vec<(Bytes, DataEntry)> {
         if policy == EvictionPolicy::NoEviction || maxmemory_bytes == 0 {
             return Vec::new();
         }
         let mut evicted = Vec::new();
-        // Do not loop indefinitely when the selected policy cannot evict any
-        // remaining entry, such as volatile policies with no expiring keys.
-        for _ in 0..10_000 {
+        loop {
             if self.total_memory_bytes() <= maxmemory_bytes {
                 break;
             }
             let mut best: Option<(usize, Bytes, u64)> = None;
             for (idx, shard_lock) in self.shards.iter().enumerate() {
                 let shard = shard_lock.lock().unwrap();
-                if let Some((key, score)) = shard.eviction_candidate(policy) {
+                if let Some((key, score)) = shard.eviction_candidate(policy, protected_keys) {
                     let better = match &best {
                         None => true,
                         Some((_, _, best_score)) => score < *best_score,

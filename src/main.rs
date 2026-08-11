@@ -9,6 +9,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use protocol::{MAX_OBP_FRAME_SIZE, OBPFrame};
 use resp::{RESPValue, read_command, read_command_with_limits};
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader as StdBufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -172,29 +173,12 @@ fn open_binlog_file(path: &Path) -> File {
 }
 
 // ============================================================
-// MEMORY EVICTION — limite di memoria configurabile
+// MEMORY EVICTION — configurable dataset memory limit
 // ============================================================
-// `--maxmemory <bytes>` (0 = nessun limite, default) + `--maxmemory-policy`
-// (default noeviction). Quando configurato, prima di ogni scrittura che
-// creerebbe una nuova chiave si controlla se si è sopra la soglia e, se sì,
-// si libera spazio secondo la policy (o si rifiuta il comando, con
-// noeviction).
-static MAXMEMORY_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MAXMEMORY_POLICY: std::sync::OnceLock<EvictionPolicy> = std::sync::OnceLock::new();
-
-fn maxmemory_bytes() -> usize {
-    *MAXMEMORY_BYTES.get().unwrap_or(&0)
-}
-
-fn maxmemory_policy() -> EvictionPolicy {
-    *MAXMEMORY_POLICY
-        .get()
-        .unwrap_or(&EvictionPolicy::NoEviction)
-}
-
-/// Converte una stringa tipo "100mb", "1gb", "500kb" o un numero puro di
-/// byte nel corrispondente valore in byte.
-/// (`--maxmemory 100mb`), case-insensitive.
+// Admission evaluates the authoritative post-mutation state. A value of zero
+// disables the limit; otherwise the configured policy decides whether the
+// command can evict unrelated keys or must fail without changing state.
+/// Parses memory sizes such as `100mb`, `1gb`, `500kb`, or a raw byte count.
 fn parse_memory_size(s: &str) -> Option<usize> {
     let s = s.trim().to_ascii_lowercase();
     let (number_part, multiplier) = if let Some(n) = s.strip_suffix("gb") {
@@ -212,7 +196,7 @@ fn parse_memory_size(s: &str) -> Option<usize> {
         .trim()
         .parse::<usize>()
         .ok()
-        .map(|n| n * multiplier)
+        .and_then(|n| n.checked_mul(multiplier))
 }
 
 // 2. FAST TIME (Orologio di Sistema Cachato)
@@ -241,10 +225,9 @@ fn now() -> u64 {
 
 pub struct ShardedStore {
     engine: OnyxEngine,
+    maxmemory_bytes: usize,
+    maxmemory_policy: EvictionPolicy,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EvictionDenied;
 
 impl Default for ShardedStore {
     fn default() -> Self {
@@ -254,8 +237,14 @@ impl Default for ShardedStore {
 
 impl ShardedStore {
     pub fn new() -> Self {
+        Self::with_maxmemory(0, EvictionPolicy::NoEviction)
+    }
+
+    pub fn with_maxmemory(maxmemory_bytes: usize, maxmemory_policy: EvictionPolicy) -> Self {
         Self {
             engine: OnyxEngine::new(),
+            maxmemory_bytes,
+            maxmemory_policy,
         }
     }
 
@@ -905,30 +894,16 @@ impl ShardedStore {
             .collect()
     }
 
-    pub fn is_full(&self) -> bool {
-        self.engine.stats().total_keys >= MAX_KEYS
-    }
-
     pub fn used_memory_bytes(&self) -> usize {
         self.engine.total_memory_bytes()
     }
 
-    /// Applies the configured max-memory policy before a write that may create
-    /// a key. Successful eviction returns the exact removed entries so the
-    /// write coordinator can persist them or restore them after a failure.
-    pub fn make_room_for_write(&self) -> Result<Vec<(Bytes, DataEntry)>, EvictionDenied> {
-        let limit = maxmemory_bytes();
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        if self.engine.total_memory_bytes() <= limit {
-            return Ok(Vec::new());
-        }
-        let policy = maxmemory_policy();
-        if policy == EvictionPolicy::NoEviction {
-            return Err(EvictionDenied);
-        }
-        Ok(self.engine.evict_to_fit(limit, policy))
+    pub fn maxmemory_bytes(&self) -> usize {
+        self.maxmemory_bytes
+    }
+
+    pub fn maxmemory_policy(&self) -> EvictionPolicy {
+        self.maxmemory_policy
     }
 
     pub fn expire_conditional(&self, key: &str, seconds: u64, condition: &str) -> bool {
@@ -2227,24 +2202,19 @@ fn persistent_keys_for_command(args: &[String]) -> Vec<Bytes> {
     keys
 }
 
-fn capture_persistent_entries(
+fn capture_entries(
     store: &ShardedStore,
     keys: &[Bytes],
-) -> std::collections::HashMap<Bytes, Option<PersistentEntry>> {
+) -> std::collections::HashMap<Bytes, Option<DataEntry>> {
     keys.iter()
-        .map(|key| {
-            (
-                key.clone(),
-                store.engine.peek(key).map(PersistentEntry::from),
-            )
-        })
+        .map(|key| (key.clone(), store.engine.peek(key)))
         .collect()
 }
 
 fn derive_committed_batch(
     store: &ShardedStore,
     keys: &[Bytes],
-    before: &std::collections::HashMap<Bytes, Option<PersistentEntry>>,
+    before: &std::collections::HashMap<Bytes, Option<DataEntry>>,
     evicted_entries: &[(Bytes, DataEntry)],
 ) -> Option<CommittedBatch> {
     let mut effects = Vec::new();
@@ -2256,7 +2226,11 @@ fn derive_committed_batch(
     }
 
     for key in keys {
-        let previous = before.get(key).cloned().flatten();
+        let previous = before
+            .get(key)
+            .cloned()
+            .flatten()
+            .map(PersistentEntry::from);
         let current = store.engine.peek(key).map(PersistentEntry::from);
         let was_evicted = deleted.contains(key);
         if previous == current && !was_evicted {
@@ -2279,15 +2253,13 @@ fn derive_committed_batch(
 
 fn rollback_attempted_mutation(
     store: &ShardedStore,
-    before: &std::collections::HashMap<Bytes, Option<PersistentEntry>>,
+    before: &std::collections::HashMap<Bytes, Option<DataEntry>>,
     evicted_entries: &[(Bytes, DataEntry)],
 ) {
     for (key, previous) in before {
         match previous {
             Some(entry) => {
-                store
-                    .engine
-                    .apply_entry(key.clone(), entry.clone().into_data_entry());
+                store.engine.apply_entry(key.clone(), entry.clone());
             }
             None => {
                 store.engine.delete(key);
@@ -2331,49 +2303,62 @@ fn partial_resync_possible(
     }
 }
 
-fn execute_command_with_evictions(
-    store: &ShardedStore,
-    args: &[String],
-) -> (RESPValue, bool, Vec<(Bytes, DataEntry)>) {
-    let cmd = args.first().map(|s| s.as_str()).unwrap_or("");
-    let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteAdmissionError {
+    KeyLimit,
+    Maxmemory,
+}
 
-    const CREATE_COMMANDS: &[&str] = &[
-        "SET", "LPUSH", "RPUSH", "HSET", "SADD", "MSET", "APPEND", "GETSET", "INCRBY", "DECRBY",
-        "INCR", "JSON.SET",
-    ];
-    let mut evicted = Vec::new();
-    if CREATE_COMMANDS.contains(&cmd) && !key.is_empty() && !store.exists(key) {
-        if store.is_full() {
-            return (
-                RESPValue::Error(
-                    "ERR database pieno: limite massimo di chiavi raggiunto".to_string(),
-                ),
-                false,
-                evicted,
-            );
-        }
-        match store.make_room_for_write() {
-            Ok(keys) => evicted = keys,
-            Err(EvictionDenied) => {
-                return (
-                    RESPValue::Error(
-                        "OOM command not allowed when used memory > 'maxmemory'".to_string(),
-                    ),
-                    false,
-                    evicted,
-                );
+impl WriteAdmissionError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::KeyLimit => "ERR database key limit reached",
+            Self::Maxmemory => {
+                "OOM command not allowed because the projected memory usage exceeds maxmemory"
             }
         }
     }
+}
 
-    let (response, is_write) = execute_command_dispatch(store, args);
-    (response, is_write, evicted)
+/// Validates the authoritative post-mutation state while the write gate is held.
+/// A pre-existing over-limit state may only move sideways or downward. Growing
+/// mutations must fit after policy-driven eviction without evicting keys involved
+/// in the command itself.
+fn enforce_write_admission(
+    store: &ShardedStore,
+    memory_before: usize,
+    key_count_before: usize,
+    protected_keys: &HashSet<Bytes>,
+) -> Result<Vec<(Bytes, DataEntry)>, WriteAdmissionError> {
+    let key_count_after = store.engine.stats().total_keys;
+    if key_count_after > MAX_KEYS && key_count_after > key_count_before {
+        return Err(WriteAdmissionError::KeyLimit);
+    }
+
+    let limit = store.maxmemory_bytes();
+    let memory_after = store.used_memory_bytes();
+    if limit == 0 || memory_after <= limit || memory_after <= memory_before {
+        return Ok(Vec::new());
+    }
+    if store.maxmemory_policy() == EvictionPolicy::NoEviction {
+        return Err(WriteAdmissionError::Maxmemory);
+    }
+
+    let evicted = store
+        .engine
+        .evict_to_fit(limit, store.maxmemory_policy(), protected_keys);
+    if store.used_memory_bytes() <= limit {
+        return Ok(evicted);
+    }
+
+    for (key, entry) in &evicted {
+        store.engine.apply_entry(key.clone(), entry.clone());
+    }
+    Err(WriteAdmissionError::Maxmemory)
 }
 
 fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
-    let (response, is_write, _) = execute_command_with_evictions(store, args);
-    (response, is_write)
+    execute_command_dispatch(store, args)
 }
 
 fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
@@ -2788,8 +2773,8 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 0.0
             };
             let used_memory = store.used_memory_bytes();
-            let mm_limit = maxmemory_bytes();
-            let mm_policy_str = format!("{:?}", maxmemory_policy());
+            let mm_limit = store.maxmemory_bytes();
+            let mm_policy_str = format!("{:?}", store.maxmemory_policy());
 
             let info_text = format!(
                 "role:{}\nuptime_seconds:{}\nconnected_keys:{}\nmax_keys:{}\nactive_connections:{}\ntotal_commands:{}\ncache_hits:{}\ncache_misses:{}\nhit_rate_percent:{:.1}\nused_memory_bytes:{}\nmaxmemory_bytes:{}\nmaxmemory_policy:{}",
@@ -5311,8 +5296,25 @@ async fn execute_ordered_command(
     }
 
     let affected_keys = persistent_keys_for_command(args);
-    let before = capture_persistent_entries(store, &affected_keys);
-    let (response, _, evicted_entries) = execute_command_with_evictions(store, args);
+    let before = capture_entries(store, &affected_keys);
+    let memory_before = store.used_memory_bytes();
+    let key_count_before = store.engine.stats().total_keys;
+    let (response, _) = execute_command(store, args);
+    if derive_committed_batch(store, &affected_keys, &before, &[]).is_none() {
+        drop(write_guard);
+        return (response, false);
+    }
+
+    let protected_keys = affected_keys.iter().cloned().collect::<HashSet<_>>();
+    let evicted_entries =
+        match enforce_write_admission(store, memory_before, key_count_before, &protected_keys) {
+            Ok(entries) => entries,
+            Err(error) => {
+                rollback_attempted_mutation(store, &before, &[]);
+                drop(write_guard);
+                return (RESPValue::Error(error.message().to_string()), false);
+            }
+        };
     let committed_batch = derive_committed_batch(store, &affected_keys, &before, &evicted_entries);
     let is_write = committed_batch.is_some();
     let mut should_compact = false;
@@ -5449,40 +5451,31 @@ async fn execute_obp_command(
                     };
                 }
                 let key = args[0].clone();
-                let key_exists = store.engine.peek(&key).is_some();
-                if !key_exists && store.is_full() {
-                    return OBPFrame {
-                        cmd: 0x00,
-                        flags: 0,
-                        correlation_id: frame.correlation_id,
-                        args: Vec::new(),
-                        payload: Some(Bytes::from("ERR database key limit reached")),
-                    };
-                }
-                let before = std::collections::HashMap::from([(
-                    key.clone(),
-                    store.engine.peek(&key).map(PersistentEntry::from),
-                )]);
-                let evicted_entries = if key_exists {
-                    Vec::new()
-                } else {
-                    match store.make_room_for_write() {
-                        Ok(entries) => entries,
-                        Err(EvictionDenied) => {
-                            return OBPFrame {
-                                cmd: 0x00,
-                                flags: 0,
-                                correlation_id: frame.correlation_id,
-                                args: Vec::new(),
-                                payload: Some(Bytes::from(
-                                    "OOM command not allowed when used memory exceeds maxmemory",
-                                )),
-                            };
-                        }
-                    }
-                };
+                let before =
+                    std::collections::HashMap::from([(key.clone(), store.engine.peek(&key))]);
+                let memory_before = store.used_memory_bytes();
+                let key_count_before = store.engine.stats().total_keys;
                 let value = OnyxValue::Blob(args[1].clone());
                 store.engine.set(key.clone(), value, None);
+                let protected_keys = HashSet::from([key.clone()]);
+                let evicted_entries = match enforce_write_admission(
+                    store,
+                    memory_before,
+                    key_count_before,
+                    &protected_keys,
+                ) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        rollback_attempted_mutation(store, &before, &[]);
+                        return OBPFrame {
+                            cmd: 0x00,
+                            flags: 0,
+                            correlation_id: frame.correlation_id,
+                            args: Vec::new(),
+                            payload: Some(Bytes::from(error.message())),
+                        };
+                    }
+                };
                 let entry = store
                     .engine
                     .peek(&key)
@@ -5558,10 +5551,8 @@ async fn execute_obp_command(
                         payload: Some(Bytes::from("MISCONF persistence sequence is exhausted")),
                     };
                 }
-                let before = std::collections::HashMap::from([(
-                    key.clone(),
-                    store.engine.peek(key).map(PersistentEntry::from),
-                )]);
+                let before =
+                    std::collections::HashMap::from([(key.clone(), store.engine.peek(key))]);
                 let deleted = store.engine.delete(key);
                 if deleted {
                     let batch = CommittedBatch {
@@ -5715,33 +5706,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     FSYNC_POLICY.set(policy).ok();
     info!("Binlog fsync policy: {:?}", policy);
 
-    // maxmemory accetta suffissi come Redis: 100mb, 1gb, o un numero puro di byte.
+    // maxmemory accepts suffixes such as 100mb and 1gb, or a raw byte count.
     let maxmemory_val: usize = match maxmemory_arg.as_deref() {
         Some(s) => parse_memory_size(s).unwrap_or_else(|| {
             warn!(
-                "Valore non valido per --maxmemory ('{}'), nessun limite applicato",
+                "Invalid value for --maxmemory ('{}'); memory limiting is disabled",
                 s
             );
             0
         }),
         None => 0,
     };
-    MAXMEMORY_BYTES.set(maxmemory_val).ok();
-
     let mm_policy = match maxmemory_policy_arg.as_deref() {
         Some(s) => EvictionPolicy::parse(s).unwrap_or_else(|| {
             warn!(
-                "Valore non valido per --maxmemory-policy ('{}'), uso 'noeviction' di default",
+                "Invalid value for --maxmemory-policy ('{}'); using 'noeviction'",
                 s
             );
             EvictionPolicy::NoEviction
         }),
         None => EvictionPolicy::NoEviction,
     };
-    MAXMEMORY_POLICY.set(mm_policy).ok();
     if maxmemory_val > 0 {
         info!(
-            "Limite di memoria: {} byte, policy {:?}",
+            "Dataset memory limit: {} bytes, policy {:?}",
             maxmemory_val, mm_policy
         );
     }
@@ -5751,7 +5739,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let store = Arc::new(ShardedStore::new());
+    let store = Arc::new(ShardedStore::with_maxmemory(maxmemory_val, mm_policy));
     let paths = PersistencePaths::default();
     let recovery = load_data_from_paths(&store, &paths)?;
     let recovered_replica_identity =
@@ -6488,9 +6476,9 @@ mod tests {
         let recovery =
             load_data_from_paths(&store, paths).expect("existing persistence state must load");
         let keys = persistent_keys_for_command(&command_args);
-        let before = capture_persistent_entries(&store, &keys);
-        let (_, _, evicted) = execute_command_with_evictions(&store, &command_args);
-        let batch = derive_committed_batch(&store, &keys, &before, &evicted).unwrap_or_else(|| {
+        let before = capture_entries(&store, &keys);
+        let _ = execute_command(&store, &command_args);
+        let batch = derive_committed_batch(&store, &keys, &before, &[]).unwrap_or_else(|| {
             assert!(sequence <= recovery.snapshot_watermark);
             CommittedBatch {
                 effects: vec![CommittedEffect::Delete {
@@ -6552,6 +6540,11 @@ mod tests {
         let store = ShardedStore::new();
         store.set("key1".to_string(), "value1".to_string());
         assert_eq!(store.get("key1"), Some("value1".to_string()));
+    }
+
+    #[test]
+    fn memory_size_parser_rejects_overflow() {
+        assert_eq!(parse_memory_size(&format!("{}gb", usize::MAX)), None);
     }
 
     #[test]
@@ -8895,7 +8888,9 @@ mod tests {
         apply_test_command(&store, &persistence, &["SET", "second", "bbbbbbbb"]).await;
 
         let limit = store.engine.total_memory_bytes().saturating_sub(1);
-        let evicted = store.engine.evict_to_fit(limit, EvictionPolicy::AllKeysLru);
+        let evicted = store
+            .engine
+            .evict_to_fit(limit, EvictionPolicy::AllKeysLru, &HashSet::new());
         assert!(!evicted.is_empty());
         let written_key = Bytes::from_static(b"causing-write");
         store.engine.set(
@@ -8949,7 +8944,7 @@ mod tests {
             None,
         );
         let keys = vec![key.clone()];
-        let before = capture_persistent_entries(&store, &keys);
+        let before = capture_entries(&store, &keys);
         let evicted_entry = store.engine.peek(&key).unwrap();
         assert!(store.engine.delete(&key));
         store.engine.set(

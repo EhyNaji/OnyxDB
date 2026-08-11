@@ -110,6 +110,22 @@ fn replica_args(master_port: u16) -> Vec<String> {
     ]
 }
 
+fn maxmemory_args(limit: usize, policy: &str) -> Vec<String> {
+    vec![
+        "--maxmemory".to_string(),
+        limit.to_string(),
+        "--maxmemory-policy".to_string(),
+        policy.to_string(),
+    ]
+}
+
+fn assert_oom(response: Resp) {
+    assert!(
+        matches!(response, Resp::Error(ref message) if message.starts_with("OOM")),
+        "expected an OOM response, got {response:?}"
+    );
+}
+
 fn encode_command(args: &[&[u8]]) -> Vec<u8> {
     let mut encoded = format!("*{}\r\n", args.len()).into_bytes();
     for arg in args {
@@ -495,6 +511,247 @@ fn obp_payload_frames_pipeline_and_flush_without_client_disconnect() {
     assert!(second.1.windows(4).any(|window| window == b"PONG"));
 
     server.stop();
+}
+
+#[test]
+fn maxmemory_noeviction_rejects_new_and_existing_value_growth() {
+    let directory = TestDirectory::new("maxmemory-noeviction-values");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &maxmemory_args(128, "noeviction"));
+
+    assert_eq!(
+        send_command(port, &[b"SET", b"key", b"a"]),
+        Resp::Simple("OK".to_string())
+    );
+    assert_oom(send_command(port, &[b"APPEND", b"key", &[b'x'; 128]]));
+    assert_eq!(send_command(port, &[b"GET", b"key"]), resp_bulk("a"));
+
+    assert_oom(send_command(port, &[b"SET", b"oversized", &[b'y'; 256]]));
+    assert_eq!(
+        send_command(port, &[b"GET", b"oversized"]),
+        Resp::Bulk(None)
+    );
+
+    server.stop();
+    let restarted = start_server(&directory.0, port, &maxmemory_args(128, "noeviction"));
+    assert_eq!(send_command(port, &[b"GET", b"key"]), resp_bulk("a"));
+    assert_eq!(
+        send_command(port, &[b"GET", b"oversized"]),
+        Resp::Bulk(None)
+    );
+    restarted.stop();
+}
+
+#[test]
+fn maxmemory_noeviction_rolls_back_collection_and_multi_key_growth() {
+    let directory = TestDirectory::new("maxmemory-noeviction-aggregate");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &maxmemory_args(192, "noeviction"));
+
+    assert_eq!(
+        send_command(port, &[b"RPUSH", b"items", b"first"]),
+        Resp::Integer(1)
+    );
+    assert_oom(send_command(port, &[b"RPUSH", b"items", &[b'z'; 192]]));
+    assert_eq!(
+        send_command(port, &[b"LRANGE", b"items", b"0", b"-1"]),
+        Resp::Array(vec![resp_bulk("first")])
+    );
+
+    assert_oom(send_command(
+        port,
+        &[b"MSET", b"first", &[b'a'; 128], b"second", &[b'b'; 128]],
+    ));
+    assert_eq!(send_command(port, &[b"GET", b"first"]), Resp::Bulk(None));
+    assert_eq!(send_command(port, &[b"GET", b"second"]), Resp::Bulk(None));
+
+    server.stop();
+}
+
+#[test]
+fn maxmemory_noeviction_rolls_back_json_growth() {
+    let directory = TestDirectory::new("maxmemory-noeviction-json");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &maxmemory_args(192, "noeviction"));
+
+    assert_eq!(
+        send_command(port, &[b"JSON.SET", b"doc", b"$", br#"{"items":[]}"#]),
+        Resp::Simple("OK".to_string())
+    );
+    let large_json_string = format!("\"{}\"", "x".repeat(192));
+    assert_oom(send_command(
+        port,
+        &[
+            b"JSON.ARRAPPEND",
+            b"doc",
+            b"$.items",
+            large_json_string.as_bytes(),
+        ],
+    ));
+    assert_eq!(
+        send_command(port, &[b"JSON.GET", b"doc", b"$.items"]),
+        resp_bulk("[]")
+    );
+
+    server.stop();
+}
+
+#[test]
+fn maxmemory_eviction_uses_projected_usage_and_preserves_the_written_key() {
+    let directory = TestDirectory::new("maxmemory-projected-eviction");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &maxmemory_args(160, "allkeys-lru"));
+
+    assert_eq!(
+        send_command(port, &[b"SET", b"first", &[b'a'; 64]]),
+        Resp::Simple("OK".to_string())
+    );
+    assert_eq!(
+        send_command(port, &[b"SET", b"second", &[b'b'; 64]]),
+        Resp::Simple("OK".to_string())
+    );
+    assert_eq!(send_command(port, &[b"GET", b"first"]), Resp::Bulk(None));
+    assert_eq!(
+        send_command(port, &[b"GET", b"second"]),
+        Resp::Bulk(Some(vec![b'b'; 64]))
+    );
+
+    server.stop();
+    let restarted = start_server(&directory.0, port, &maxmemory_args(160, "allkeys-lru"));
+    assert_eq!(send_command(port, &[b"GET", b"first"]), Resp::Bulk(None));
+    assert_eq!(
+        send_command(port, &[b"GET", b"second"]),
+        Resp::Bulk(Some(vec![b'b'; 64]))
+    );
+    restarted.stop();
+}
+
+#[test]
+fn maxmemory_admission_is_identical_for_obp_writes() {
+    let directory = TestDirectory::new("maxmemory-obp");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &maxmemory_args(128, "noeviction"));
+
+    let response = send_obp_frame(port, 0x02, &[b"oversized", &[b'x'; 256]]);
+    assert!(
+        response.windows(3).any(|window| window == b"OOM"),
+        "expected an OOM response, got {response:?}"
+    );
+    assert_eq!(
+        send_command(port, &[b"GET", b"oversized"]),
+        Resp::Bulk(None)
+    );
+
+    server.stop();
+}
+
+#[test]
+fn maxmemory_failed_eviction_restores_victims_and_rejects_an_unfit_value() {
+    let directory = TestDirectory::new("maxmemory-eviction-rollback");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &maxmemory_args(200, "allkeys-lru"));
+
+    assert_eq!(
+        send_command(port, &[b"SET", b"survivor", &[b's'; 64]]),
+        Resp::Simple("OK".to_string())
+    );
+    assert_oom(send_command(port, &[b"SET", b"unfit", &[b'u'; 256]]));
+    assert_eq!(
+        send_command(port, &[b"GET", b"survivor"]),
+        Resp::Bulk(Some(vec![b's'; 64]))
+    );
+    assert_eq!(send_command(port, &[b"GET", b"unfit"]), Resp::Bulk(None));
+
+    server.stop();
+}
+
+#[test]
+fn maxmemory_volatile_policy_requires_an_eligible_victim() {
+    let directory = TestDirectory::new("maxmemory-volatile-policy");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &maxmemory_args(160, "volatile-lru"));
+
+    assert_eq!(
+        send_command(port, &[b"SET", b"first", &[b'a'; 64]]),
+        Resp::Simple("OK".to_string())
+    );
+    assert_oom(send_command(port, &[b"SET", b"second", &[b'b'; 64]]));
+    assert_eq!(
+        send_command(port, &[b"GET", b"first"]),
+        Resp::Bulk(Some(vec![b'a'; 64]))
+    );
+    assert_eq!(
+        send_command(port, &[b"EXPIRE", b"first", b"600"]),
+        Resp::Integer(1)
+    );
+    assert_eq!(
+        send_command(port, &[b"SET", b"second", &[b'b'; 64]]),
+        Resp::Simple("OK".to_string())
+    );
+    assert_eq!(send_command(port, &[b"GET", b"first"]), Resp::Bulk(None));
+    assert_eq!(
+        send_command(port, &[b"GET", b"second"]),
+        Resp::Bulk(Some(vec![b'b'; 64]))
+    );
+
+    server.stop();
+}
+
+#[test]
+fn maxmemory_recovery_allows_non_growing_mutations_above_the_limit() {
+    let directory = TestDirectory::new("maxmemory-recovered-over-limit");
+    let port = choose_port();
+    let initial = start_server(&directory.0, port, &[]);
+    assert_eq!(
+        send_command(port, &[b"SET", b"key", &[b'a'; 256]]),
+        Resp::Simple("OK".to_string())
+    );
+    initial.stop();
+
+    let limited = start_server(&directory.0, port, &maxmemory_args(128, "noeviction"));
+    assert_eq!(
+        send_command(port, &[b"SET", b"key", &[b'b'; 192]]),
+        Resp::Simple("OK".to_string())
+    );
+    assert_oom(send_command(port, &[b"APPEND", b"key", b"growth"]));
+    assert_eq!(send_command(port, &[b"DEL", b"key"]), Resp::Integer(1));
+    assert_eq!(send_command(port, &[b"GET", b"key"]), Resp::Bulk(None));
+
+    limited.stop();
+}
+
+#[test]
+fn replica_applies_authoritative_state_even_when_it_exceeds_its_local_maxmemory() {
+    let master_directory = TestDirectory::new("maxmemory-replica-master");
+    let replica_directory = TestDirectory::new("maxmemory-replica");
+    let master_port = choose_port();
+    let replica_port = choose_port();
+    let master = start_server(&master_directory.0, master_port, &[]);
+    assert_eq!(
+        send_command(master_port, &[b"SET", b"large", &[b'a'; 256]]),
+        Resp::Simple("OK".to_string())
+    );
+
+    let mut replica_configuration = replica_args(master_port);
+    replica_configuration.extend(maxmemory_args(128, "noeviction"));
+    let replica = start_server(&replica_directory.0, replica_port, &replica_configuration);
+    wait_for_response(
+        replica_port,
+        &[b"GET", b"large"],
+        &Resp::Bulk(Some(vec![b'a'; 256])),
+    );
+    assert_eq!(
+        send_command(master_port, &[b"APPEND", b"large", b"b"]),
+        Resp::Integer(257)
+    );
+    wait_for_response(
+        replica_port,
+        &[b"GET", b"large"],
+        &Resp::Bulk(Some([vec![b'a'; 256], vec![b'b']].concat())),
+    );
+
+    replica.stop();
+    master.stop();
 }
 
 #[test]
