@@ -8,7 +8,7 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use protocol::OBPFrame;
-use resp::{RESPValue, read_command};
+use resp::{RESPValue, read_command, read_command_with_limits};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader as StdBufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -29,14 +29,19 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const SNAPSHOT_PATH: &str = "onyx.snapshot";
 const BINLOG_PATH: &str = "onyx.binlog";
+const REPLICA_STATE_PATH: &str = "onyx.replica";
 const SNAPSHOT_MAGIC: &str = "ONYXSNAP";
 const SNAPSHOT_VERSION: u8 = 2;
+const REPLICA_STATE_MAGIC: &str = "ONYXREPL";
+const REPLICA_STATE_VERSION: u8 = 2;
 const BINLOG_RECORD_MAGIC: &[u8; 4] = b"ONX3";
 const PREVIOUS_BINLOG_RECORD_MAGIC: &[u8; 4] = b"ONX2";
 const MAX_BINLOG_RECORD_SIZE: usize = 512 * 1024 * 1024 + 1024;
 const MAX_SNAPSHOT_METADATA_SIZE: usize = 4096;
 const MAX_SNAPSHOT_LINE_SIZE: usize = 512 * 1024 * 1024 + 1024;
 const MAX_SNAPSHOT_RECORD_SIZE: usize = 512 * 1024 * 1024 + 1024;
+const REPLICATION_CHUNK_SIZE: usize = 256 * 1024;
+const MAX_REPLICATION_FRAME_BULK_SIZE: i64 = (REPLICATION_CHUNK_SIZE * 2 + 64) as i64;
 const COMPACTION_THRESHOLD: usize = 100000;
 const MAX_KEYS: usize = 1_000_000;
 
@@ -46,6 +51,8 @@ struct PersistencePaths {
     snapshot_temp: PathBuf,
     snapshot_backup: PathBuf,
     binlog: PathBuf,
+    replica_state: PathBuf,
+    replica_state_temp: PathBuf,
 }
 
 impl Default for PersistencePaths {
@@ -55,6 +62,8 @@ impl Default for PersistencePaths {
             snapshot_temp: PathBuf::from(format!("{}.tmp", SNAPSHOT_PATH)),
             snapshot_backup: PathBuf::from(format!("{}.previous", SNAPSHOT_PATH)),
             binlog: PathBuf::from(BINLOG_PATH),
+            replica_state: PathBuf::from(REPLICA_STATE_PATH),
+            replica_state_temp: PathBuf::from(format!("{}.tmp", REPLICA_STATE_PATH)),
         }
     }
 }
@@ -1287,6 +1296,8 @@ struct Persistence {
     subscriptions:
         std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<u64>>>,
     failure: std::sync::Mutex<Option<String>>,
+    upstream_replid: AtomicU64,
+    replication_ready: AtomicBool,
 }
 
 fn mark_persistence_failed(persistence: &Persistence, message: impl Into<String>) {
@@ -1297,6 +1308,7 @@ fn mark_persistence_failed(persistence: &Persistence, message: impl Into<String>
         *failure = Some(message.clone());
     }
     persistence.accepting_writes.store(false, Ordering::SeqCst);
+    persistence.replication_ready.store(false, Ordering::SeqCst);
     error!("Persistence entered a failed state: {}", message);
 }
 
@@ -2907,7 +2919,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn hex_decode(encoded: &str) -> Result<Vec<u8>, PersistenceError> {
     if !encoded.len().is_multiple_of(2) {
         return Err(PersistenceError::new(
-            "Hex-encoded committed effect has an odd length",
+            "Hex-encoded payload has an odd length",
         ));
     }
     let nibble = |value: u8| match value {
@@ -2918,25 +2930,208 @@ fn hex_decode(encoded: &str) -> Result<Vec<u8>, PersistenceError> {
     };
     let mut bytes = Vec::with_capacity(encoded.len() / 2);
     for pair in encoded.as_bytes().chunks_exact(2) {
-        let high = nibble(pair[0])
-            .ok_or_else(|| PersistenceError::new("Invalid hexadecimal committed effect"))?;
-        let low = nibble(pair[1])
-            .ok_or_else(|| PersistenceError::new("Invalid hexadecimal committed effect"))?;
+        let high =
+            nibble(pair[0]).ok_or_else(|| PersistenceError::new("Invalid hexadecimal payload"))?;
+        let low =
+            nibble(pair[1]).ok_or_else(|| PersistenceError::new("Invalid hexadecimal payload"))?;
         bytes.push((high << 4) | low);
     }
     Ok(bytes)
 }
 
-fn encode_replication_effect(batch: &CommittedBatch) -> Result<Vec<u8>, PersistenceError> {
-    let payload = hex_encode(&encode_committed_batch(batch)?);
-    Ok(encode_replication_command(&[
-        "APPLYEFFECT".to_string(),
-        payload,
-    ]))
+struct ChunkedReplicationRecord {
+    header: Vec<String>,
+    chunk_command: &'static str,
+    payload: Vec<u8>,
 }
 
-fn decode_replication_effect(encoded: &str) -> Result<CommittedBatch, PersistenceError> {
-    decode_committed_batch(&hex_decode(encoded)?)
+async fn write_chunked_replication_record<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    record: &ChunkedReplicationRecord,
+) -> std::io::Result<()> {
+    writer
+        .write_all(&encode_replication_command(&record.header))
+        .await?;
+    for chunk in record.payload.chunks(REPLICATION_CHUNK_SIZE) {
+        let frame =
+            encode_replication_command(&[record.chunk_command.to_string(), hex_encode(chunk)]);
+        writer.write_all(&frame).await?;
+    }
+    Ok(())
+}
+
+fn encode_replication_effect(
+    sequence: u64,
+    batch: &CommittedBatch,
+) -> Result<ChunkedReplicationRecord, PersistenceError> {
+    if sequence == 0 {
+        return Err(PersistenceError::new(
+            "Replication effects require a non-zero sequence",
+        ));
+    }
+    let payload = encode_committed_batch(batch)?;
+    if payload.len() > MAX_BINLOG_RECORD_SIZE {
+        return Err(PersistenceError::new(
+            "Replication effect exceeds the format limit",
+        ));
+    }
+    Ok(ChunkedReplicationRecord {
+        header: vec![
+            "APPLYEFFECT".to_string(),
+            sequence.to_string(),
+            payload.len().to_string(),
+        ],
+        chunk_command: "EFFECTCHUNK",
+        payload,
+    })
+}
+
+fn decode_replication_effect(
+    sequence: &str,
+    encoded: &[u8],
+) -> Result<(u64, CommittedBatch), PersistenceError> {
+    let sequence = sequence
+        .parse::<u64>()
+        .map_err(|_| PersistenceError::new("Invalid replication effect sequence"))?;
+    if sequence == 0 {
+        return Err(PersistenceError::new(
+            "Replication effects require a non-zero sequence",
+        ));
+    }
+    Ok((sequence, decode_committed_batch(encoded)?))
+}
+
+fn encode_full_sync_entry(
+    key: &[u8],
+    entry: &DataEntry,
+) -> Result<ChunkedReplicationRecord, PersistenceError> {
+    let payload = encode_snapshot_entry(key, entry)?;
+    Ok(ChunkedReplicationRecord {
+        header: vec!["FULLSYNCENTRY".to_string(), payload.len().to_string()],
+        chunk_command: "FULLSYNCCHUNK",
+        payload,
+    })
+}
+
+async fn read_replication_command(
+    reader: &mut TokioBufReader<tokio::net::tcp::OwnedReadHalf>,
+    scratch: &mut String,
+) -> std::io::Result<Option<Vec<String>>> {
+    read_command_with_limits(reader, scratch, 4, MAX_REPLICATION_FRAME_BULK_SIZE, 1024).await
+}
+
+async fn read_chunked_replication_payload(
+    reader: &mut TokioBufReader<tokio::net::tcp::OwnedReadHalf>,
+    scratch: &mut String,
+    expected_length: usize,
+    maximum_length: usize,
+    chunk_command: &str,
+) -> Result<Vec<u8>, PersistenceError> {
+    if expected_length == 0 || expected_length > maximum_length {
+        return Err(PersistenceError::new(
+            "Replication record length exceeds the format limit",
+        ));
+    }
+    let mut payload = Vec::with_capacity(expected_length.min(REPLICATION_CHUNK_SIZE));
+    while payload.len() < expected_length {
+        let frame = match read_replication_command(reader, scratch).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                return Err(PersistenceError::new(
+                    "Master disconnected during a chunked replication record",
+                ));
+            }
+            Err(error) => {
+                return Err(PersistenceError::new(format!(
+                    "Unable to read a replication chunk: {}",
+                    error
+                )));
+            }
+        };
+        if frame.len() != 2 || frame[0] != chunk_command {
+            return Err(PersistenceError::new(
+                "Master sent an unexpected replication chunk frame",
+            ));
+        }
+        let chunk = hex_decode(&frame[1])?;
+        if chunk.is_empty() || chunk.len() > REPLICATION_CHUNK_SIZE {
+            return Err(PersistenceError::new(
+                "Replication chunk length exceeds the protocol limit",
+            ));
+        }
+        let new_length = payload
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| PersistenceError::new("Replication record length overflow"))?;
+        if new_length > expected_length {
+            return Err(PersistenceError::new(
+                "Replication chunks exceed the declared record length",
+            ));
+        }
+        payload.extend_from_slice(&chunk);
+    }
+    Ok(payload)
+}
+
+async fn read_full_sync_entry(
+    reader: &mut TokioBufReader<tokio::net::tcp::OwnedReadHalf>,
+    scratch: &mut String,
+) -> Result<(Bytes, DataEntry), PersistenceError> {
+    let header = match read_replication_command(reader, scratch).await {
+        Ok(Some(header)) => header,
+        Ok(None) => {
+            return Err(PersistenceError::new(
+                "Master disconnected during full synchronization",
+            ));
+        }
+        Err(error) => {
+            return Err(PersistenceError::new(format!(
+                "Unable to read full synchronization entry: {}",
+                error
+            )));
+        }
+    };
+    if header.len() != 2 || header[0] != "FULLSYNCENTRY" {
+        return Err(PersistenceError::new(
+            "Master sent an unexpected full synchronization frame",
+        ));
+    }
+    let expected_length = header[1]
+        .parse::<usize>()
+        .map_err(|_| PersistenceError::new("Invalid full synchronization entry length"))?;
+    let payload = read_chunked_replication_payload(
+        reader,
+        scratch,
+        expected_length,
+        MAX_SNAPSHOT_RECORD_SIZE,
+        "FULLSYNCCHUNK",
+    )
+    .await?;
+    decode_snapshot_entry(&payload)
+}
+
+async fn read_replication_effect(
+    header: &[String],
+    reader: &mut TokioBufReader<tokio::net::tcp::OwnedReadHalf>,
+    scratch: &mut String,
+) -> Result<(u64, CommittedBatch), PersistenceError> {
+    if header.len() != 3 || header[0] != "APPLYEFFECT" {
+        return Err(PersistenceError::new(
+            "Master sent an unexpected replication effect frame",
+        ));
+    }
+    let expected_length = header[2]
+        .parse::<usize>()
+        .map_err(|_| PersistenceError::new("Invalid replication effect length"))?;
+    let payload = read_chunked_replication_payload(
+        reader,
+        scratch,
+        expected_length,
+        MAX_BINLOG_RECORD_SIZE,
+        "EFFECTCHUNK",
+    )
+    .await?;
+    decode_replication_effect(&header[1], &payload)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3652,18 +3847,27 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             } else {
                 in_transaction = false;
                 let mut results = Vec::with_capacity(queued_commands.len());
+                let replica_read_guard = if IS_REPLICA.load(Ordering::SeqCst) {
+                    Some(persistence.write_gate.lock().await)
+                } else {
+                    None
+                };
                 for queued_args in queued_commands.drain(..) {
                     let queued_cmd = queued_args.first().map(|s| s.as_str()).unwrap_or("");
-                    if IS_REPLICA.load(Ordering::Relaxed) && is_write_command(queued_cmd) {
+                    if replica_read_guard.is_some() && is_write_command(queued_cmd) {
                         results.push(RESPValue::Error(
                             "READONLY this instance is a read-only replica".to_string(),
                         ));
                         continue;
                     }
-                    let (resp, _) =
-                        execute_ordered_command(&store, &persistence, &queued_args).await;
+                    let (resp, _) = if replica_read_guard.is_some() {
+                        execute_command(&store, &queued_args)
+                    } else {
+                        execute_ordered_command(&store, &persistence, &queued_args, false).await
+                    };
                     results.push(resp);
                 }
+                drop(replica_read_guard);
                 RESPValue::Array(results)
             };
             resp_buf.clear();
@@ -3858,13 +4062,50 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             return;
         }
 
-        // SYNC
         if cmd == "SYNC" {
-            // Nuovo formato: `SYNC <replid> <offset>`. `replid=0`
-            let requested_replid: u64 =
-                args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            let requested_offset: u64 =
-                args.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            resp_buf.clear();
+            RESPValue::Error(
+                "ERR replication protocol version 3 is required; use SYNC3".to_string(),
+            )
+            .encode_into(&mut resp_buf);
+            let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
+            let _ = buf_writer.flush().await;
+            return;
+        }
+
+        // Versioned replication handshake: SYNC3 <replid> <offset>.
+        if cmd == "SYNC3" {
+            if IS_REPLICA.load(Ordering::SeqCst) {
+                resp_buf.clear();
+                RESPValue::Error("ERR chained replication is not supported".to_string())
+                    .encode_into(&mut resp_buf);
+                let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
+                let _ = buf_writer.flush().await;
+                return;
+            }
+            let (requested_replid, requested_offset) = match args.as_slice() {
+                [_, replid, offset] => match (replid.parse::<u64>(), offset.parse::<u64>()) {
+                    (Ok(replid), Ok(offset)) => (replid, offset),
+                    _ => {
+                        resp_buf.clear();
+                        RESPValue::Error(
+                            "ERR SYNC3 requires numeric replication ID and sequence".to_string(),
+                        )
+                        .encode_into(&mut resp_buf);
+                        let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
+                        let _ = buf_writer.flush().await;
+                        return;
+                    }
+                },
+                _ => {
+                    resp_buf.clear();
+                    RESPValue::Error("ERR usage: SYNC3 replid sequence".to_string())
+                        .encode_into(&mut resp_buf);
+                    let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
+                    let _ = buf_writer.flush().await;
+                    return;
+                }
+            };
             let replid_matches = replid_allows_partial(requested_replid, repl_id());
             let replica_id = persistence.next_replica_id.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -3875,12 +4116,12 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 );
             }
 
-            // Sottoscrizione al canale broadcast prima di leggere backlog/snapshot
+            // Subscribe before capturing backlog or snapshot so concurrent
+            // effects are either included in the boundary or queued afterward.
             let mut replica_rx = persistence.replica_tx.subscribe();
 
-            // Un resync parziale è possibile SOLO se il replication ID
-            // combacia (stesso processo Master) E il backlog copre ancora
-            // tutto da requested_offset+1 in poi (nessun buco).
+            // Partial synchronization is valid only for the same master
+            // identity and a gap-free retained backlog.
             let backlog_snapshot: Option<Vec<(u64, CommittedBatch)>> =
                 if replid_matches && requested_offset > 0 {
                     let _write_guard = persistence.write_gate.lock().await;
@@ -3911,17 +4152,17 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 },
             );
 
-            // Task dedicato a leggere gli ACK della Replica (REPLCONF ACK
-            // <offset>): possiede esclusivamente la metà "lettura" della
-            // connessione. Niente select! qui di proposito — read_line non è
-            // cancel-safe, e in un loop { select! {...} } una riga letta a
-            // metà e poi scartata corromperebbe silenziosamente il flusso.
+            // The ACK task exclusively owns the connection's read half.
+            // read_line is not cancellation-safe, so deliberately avoid a
+            // select loop that could discard half a line and corrupt the
+            // replication stream.
             let persistence_ack = Arc::clone(&persistence);
-            let peer_addr_ack = peer_addr.clone();
             let reader_task = tokio::spawn(async move {
                 let mut ack_scratch = String::new();
                 loop {
-                    match read_command(&mut buf_reader, &mut ack_scratch).await {
+                    match read_command_with_limits(&mut buf_reader, &mut ack_scratch, 3, 64, 128)
+                        .await
+                    {
                         Ok(Some(ack_args)) if !ack_args.is_empty() => {
                             if ack_args[0].eq_ignore_ascii_case("REPLCONF")
                                 && ack_args
@@ -3944,15 +4185,13 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                         Ok(None) | Err(_) => break,
                     }
                 }
-                let _ = peer_addr_ack; // tenuto solo per eventuale futuro logging
             });
 
             let mut last_sent_offset;
 
             if let Some(missing) = backlog_snapshot {
-                // RESYNC PARZIALE
                 last_sent_offset = requested_offset;
-                let marker = format!("+CONTINUE {} {}\r\n", repl_id(), requested_offset);
+                let marker = format!("+CONTINUE3 {} {}\r\n", repl_id(), requested_offset);
                 if buf_writer.write_all(marker.as_bytes()).await.is_err() {
                     reader_task.abort();
                     persistence
@@ -3963,7 +4202,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     return;
                 }
                 for (off, batch) in missing {
-                    let encoded = match encode_replication_effect(&batch) {
+                    let encoded = match encode_replication_effect(off, &batch) {
                         Ok(encoded) => encoded,
                         Err(error) => {
                             error!("Unable to encode replication effect: {}", error);
@@ -3976,7 +4215,10 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                             return;
                         }
                     };
-                    if buf_writer.write_all(&encoded).await.is_err() {
+                    if write_chunked_replication_record(&mut buf_writer, &encoded)
+                        .await
+                        .is_err()
+                    {
                         reader_task.abort();
                         persistence
                             .replica_status
@@ -3988,19 +4230,23 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     last_sent_offset = off;
                 }
                 info!(
-                    "Replica {} risincronizzata parzialmente da offset {}",
+                    "Replica {} partially synchronized from offset {}",
                     peer_addr, requested_offset
                 );
             } else {
-                // FULL RESYNC (comportamento di prima: dump completo di tutte le chiavi)
-                let (full_sync_offset, full_sync_entries) = {
+                let (full_sync_offset, snapshot_entries) = {
                     let _write_guard = persistence.write_gate.lock().await;
                     (
                         persistence.repl_offset.load(Ordering::SeqCst),
-                        store.snapshot_entries(),
+                        store.engine.snapshot_all(),
                     )
                 };
-                let marker = format!("+FULLRESYNC {} {}\r\n", repl_id(), full_sync_offset);
+                let marker = format!(
+                    "+FULLRESYNC3 {} {} {}\r\n",
+                    repl_id(),
+                    full_sync_offset,
+                    snapshot_entries.len()
+                );
                 if buf_writer.write_all(marker.as_bytes()).await.is_err() {
                     reader_task.abort();
                     persistence
@@ -4010,50 +4256,24 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                         .remove(&replica_id);
                     return;
                 }
-
-                for (k, entry) in full_sync_entries {
-                    let restore_cmd = match &entry.value {
-                        OnyxValue::Blob(b) => {
-                            format!("SET {} {}\r\n", k, String::from_utf8_lossy(b))
+                for (key, entry) in snapshot_entries {
+                    let encoded_entry = match encode_full_sync_entry(&key, &entry) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            error!("Unable to encode full synchronization snapshot: {}", error);
+                            reader_task.abort();
+                            persistence
+                                .replica_status
+                                .lock()
+                                .unwrap()
+                                .remove(&replica_id);
+                            return;
                         }
-                        OnyxValue::Int(n) => format!("SET {} {}\r\n", k, n),
-                        OnyxValue::List(list) => {
-                            let mut cmds = String::new();
-                            for item in list.iter().rev() {
-                                cmds.push_str(&format!(
-                                    "LPUSH {} {}\r\n",
-                                    k,
-                                    String::from_utf8_lossy(item)
-                                ));
-                            }
-                            cmds
-                        }
-                        OnyxValue::Hash(map) => {
-                            let mut cmds = String::new();
-                            for (f, v) in map.iter() {
-                                cmds.push_str(&format!(
-                                    "HSET {} {} {}\r\n",
-                                    k,
-                                    String::from_utf8_lossy(f),
-                                    String::from_utf8_lossy(v)
-                                ));
-                            }
-                            cmds
-                        }
-                        OnyxValue::Set(set) => {
-                            let mut cmds = String::new();
-                            for item in set.iter() {
-                                cmds.push_str(&format!(
-                                    "SADD {} {}\r\n",
-                                    k,
-                                    String::from_utf8_lossy(item)
-                                ));
-                            }
-                            cmds
-                        }
-                        _ => String::new(),
                     };
-                    if buf_writer.write_all(restore_cmd.as_bytes()).await.is_err() {
+                    if write_chunked_replication_record(&mut buf_writer, &encoded_entry)
+                        .await
+                        .is_err()
+                    {
                         reader_task.abort();
                         persistence
                             .replica_status
@@ -4065,16 +4285,12 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 }
                 last_sent_offset = full_sync_offset;
                 info!(
-                    "Replica {} sincronizzata con dump completo (offset {})",
+                    "Replica {} received a full synchronization snapshot at offset {}",
                     peer_addr, full_sync_offset
                 );
             }
 
-            // Marcatore esplicito di "fine sincronizzazione iniziale": senza
-            // questo la Replica non potrebbe distinguere in modo affidabile
-            // tra righe del dump/backlog (che non corrispondono 1:1 a un
-            // offset) e comandi live (che sì) — le direbbe come contare da qui.
-            let syncdone_marker = format!("+SYNCDONE {}\r\n", last_sent_offset);
+            let syncdone_marker = format!("+SYNCDONE3 {} {}\r\n", repl_id(), last_sent_offset);
             if buf_writer
                 .write_all(syncdone_marker.as_bytes())
                 .await
@@ -4091,7 +4307,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             let _ = buf_writer.flush().await;
 
             info!(
-                "Replica {} in streaming in tempo reale (offset corrente: {})",
+                "Replica {} entered live streaming at sequence {}",
                 peer_addr, last_sent_offset
             );
 
@@ -4099,31 +4315,32 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 match replica_rx.recv().await {
                     Ok((offset, batch)) => {
                         if offset <= last_sent_offset {
-                            // Già coperto dal backlog/dump iniziale: evita doppioni
-                            // nella stretta finestra tra subscribe() e l'inizio dell'invio.
+                            // The initial backlog or snapshot already covers
+                            // this effect from the subscribe/capture window.
                             continue;
                         }
-                        let encoded = match encode_replication_effect(&batch) {
+                        let encoded = match encode_replication_effect(offset, &batch) {
                             Ok(encoded) => encoded,
                             Err(error) => {
                                 error!("Unable to encode live replication effect: {}", error);
                                 break;
                             }
                         };
-                        if buf_writer.write_all(&encoded).await.is_err() {
+                        if write_chunked_replication_record(&mut buf_writer, &encoded)
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                         let _ = buf_writer.flush().await;
                         last_sent_offset = offset;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // La Replica non riesce a stare al passo: il canale
-                        // broadcast ha già scartato messaggi non ancora
-                        // consegnati. Meglio chiudere e forzare un resync
-                        // completo alla prossima riconnessione, piuttosto che
-                        // lasciare un buco silenzioso nel flusso replicato.
+                        // A lagged broadcast receiver has an irrecoverable gap
+                        // in this stream. Disconnect and negotiate from the
+                        // durable sequence again.
                         warn!(
-                            "Replica {} troppo lenta, disconnessione forzata (richiederà un nuovo SYNC)",
+                            "Replica {} lagged behind the live stream; forcing resynchronization",
                             peer_addr
                         );
                         break;
@@ -4142,37 +4359,40 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             return;
         }
 
-        // Comando normale
+        // Normal client command.
         let response = if cmd == "SAVE" {
             match compact_store(&store, &persistence).await {
                 Ok(_) => RESPValue::SimpleString("OK".to_string()),
                 Err(error) => RESPValue::Error(format!("ERR snapshot failed: {}", error)),
             }
         } else if IS_REPLICA.load(Ordering::Relaxed) && is_write_command(cmd) {
-            // Una Replica non deve accettare scritture dirette dai client: i
-            // suoi dati arrivano SOLO dal Master via replica_tx. Scritture
-            // dirette qui la farebbero divergere silenziosamente, e verrebbero
-            // pure sovrascritte al prossimo comando replicato — meglio
-            // rifiutarle chiaramente, come fa Redis con READONLY.
+            // Replicas accept mutations only from their ordered upstream
+            // stream. Direct client writes would silently diverge.
             RESPValue::Error("READONLY this instance is a read-only replica".to_string())
-        } else {
-            if cmd.eq_ignore_ascii_case("REPLICAOF")
-                && args
-                    .get(1)
-                    .map(|s| s.eq_ignore_ascii_case("no"))
-                    .unwrap_or(false)
-                && args
-                    .get(2)
-                    .map(|s| s.eq_ignore_ascii_case("one"))
-                    .unwrap_or(false)
-            {
-                persistence.promote_to_master.store(true, Ordering::Relaxed);
-                IS_REPLICA.store(false, Ordering::Relaxed);
-                info!("Received REPLICAOF NO ONE: promoting to master");
-            }
-
+        } else if IS_REPLICA.load(Ordering::SeqCst)
+            && cmd.eq_ignore_ascii_case("REPLICAOF")
+            && args
+                .get(1)
+                .map(|s| s.eq_ignore_ascii_case("no"))
+                .unwrap_or(false)
+            && args
+                .get(2)
+                .map(|s| s.eq_ignore_ascii_case("one"))
+                .unwrap_or(false)
+        {
             TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
-            let (mut resp, _is_write) = execute_ordered_command(&store, &persistence, &args).await;
+            match prepare_replica_promotion(&persistence).await {
+                Ok(()) => {
+                    info!("Received REPLICAOF NO ONE: promoting to master");
+                    RESPValue::SimpleString("OK".to_string())
+                }
+                Err(error) => RESPValue::Error(format!("MISCONF promotion failed: {}", error)),
+            }
+        } else {
+            TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
+            let serialize_replica_read = IS_REPLICA.load(Ordering::SeqCst);
+            let (mut resp, _is_write) =
+                execute_ordered_command(&store, &persistence, &args, serialize_replica_read).await;
             if cmd.eq_ignore_ascii_case("INFO")
                 && let RESPValue::BulkString(Some(ref mut text)) = resp
             {
@@ -4298,6 +4518,155 @@ fn durable_rename(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(not(windows))]
 fn durable_rename(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::rename(from, to)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplicaIdentity {
+    replid: u64,
+    baseline_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DurableReplicaState {
+    Detached,
+    Installing,
+    Ready(ReplicaIdentity),
+}
+
+fn load_durable_replica_state(
+    paths: &PersistencePaths,
+    snapshot_watermark: u64,
+) -> Result<Option<DurableReplicaState>, PersistenceError> {
+    if !paths.replica_state.exists() {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(&paths.replica_state)?;
+    if metadata.len() > MAX_SNAPSHOT_METADATA_SIZE as u64 {
+        return Err(PersistenceError::new(
+            "Replica identity metadata exceeds the format limit",
+        ));
+    }
+    let contents = fs::read_to_string(&paths.replica_state)?;
+    let fields: Vec<&str> = contents.trim_end().split('\t').collect();
+    if fields.len() != 5 || fields[0] != REPLICA_STATE_MAGIC {
+        return Err(PersistenceError::new("Malformed durable replica state"));
+    }
+    let version = fields[1]
+        .parse::<u8>()
+        .map_err(|_| PersistenceError::new("Invalid durable replica state version"))?;
+    if version != REPLICA_STATE_VERSION {
+        return Err(PersistenceError::new(format!(
+            "Unsupported durable replica state version: {}",
+            version
+        )));
+    }
+    let replid = fields[3]
+        .parse::<u64>()
+        .map_err(|_| PersistenceError::new("Invalid upstream replication ID"))?;
+    let baseline_sequence = fields[4]
+        .parse::<u64>()
+        .map_err(|_| PersistenceError::new("Invalid replica baseline sequence"))?;
+    match fields[2] {
+        "DETACHED" if replid == 0 && baseline_sequence == 0 => {
+            Ok(Some(DurableReplicaState::Detached))
+        }
+        "INSTALLING" if replid == 0 && baseline_sequence == 0 => {
+            Ok(Some(DurableReplicaState::Installing))
+        }
+        "READY" if replid != 0 => {
+            if baseline_sequence != snapshot_watermark {
+                warn!(
+                    "Replica identity does not match the installed snapshot; forcing a full synchronization"
+                );
+                Ok(Some(DurableReplicaState::Installing))
+            } else {
+                Ok(Some(DurableReplicaState::Ready(ReplicaIdentity {
+                    replid,
+                    baseline_sequence,
+                })))
+            }
+        }
+        _ => Err(PersistenceError::new(
+            "Invalid durable replica state fields",
+        )),
+    }
+}
+
+fn write_durable_replica_state(
+    paths: &PersistencePaths,
+    state: DurableReplicaState,
+) -> Result<(), PersistenceError> {
+    let (status, replid, baseline_sequence) = match state {
+        DurableReplicaState::Detached => ("DETACHED", 0, 0),
+        DurableReplicaState::Installing => ("INSTALLING", 0, 0),
+        DurableReplicaState::Ready(identity) => {
+            ("READY", identity.replid, identity.baseline_sequence)
+        }
+    };
+    let mut file = File::create(&paths.replica_state_temp)?;
+    writeln!(
+        file,
+        "{}\t{}\t{}\t{}\t{}",
+        REPLICA_STATE_MAGIC, REPLICA_STATE_VERSION, status, replid, baseline_sequence
+    )?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    durable_rename(&paths.replica_state_temp, &paths.replica_state)?;
+    sync_parent_directory(&paths.replica_state)?;
+    Ok(())
+}
+
+fn write_replica_identity(
+    paths: &PersistencePaths,
+    identity: ReplicaIdentity,
+) -> Result<(), PersistenceError> {
+    write_durable_replica_state(paths, DurableReplicaState::Ready(identity))
+}
+
+fn write_replica_installing(paths: &PersistencePaths) -> Result<(), PersistenceError> {
+    write_durable_replica_state(paths, DurableReplicaState::Installing)
+}
+
+fn write_replica_detached(paths: &PersistencePaths) -> Result<(), PersistenceError> {
+    write_durable_replica_state(paths, DurableReplicaState::Detached)
+}
+
+#[cfg(test)]
+fn load_replica_identity(
+    paths: &PersistencePaths,
+    snapshot_watermark: u64,
+) -> Result<Option<ReplicaIdentity>, PersistenceError> {
+    Ok(
+        match load_durable_replica_state(paths, snapshot_watermark)? {
+            Some(DurableReplicaState::Ready(identity)) => Some(identity),
+            Some(DurableReplicaState::Detached | DurableReplicaState::Installing) | None => None,
+        },
+    )
+}
+
+fn prepare_replication_startup(
+    paths: &PersistencePaths,
+    snapshot_watermark: u64,
+    configured_as_replica: bool,
+) -> Result<Option<ReplicaIdentity>, PersistenceError> {
+    let state = load_durable_replica_state(paths, snapshot_watermark)?;
+    if configured_as_replica {
+        return Ok(match state {
+            Some(DurableReplicaState::Ready(identity)) => Some(identity),
+            Some(DurableReplicaState::Detached | DurableReplicaState::Installing) | None => None,
+        });
+    }
+    match state {
+        Some(DurableReplicaState::Installing) => Err(PersistenceError::new(
+            "Cannot start as master while replica baseline installation is incomplete",
+        )),
+        Some(DurableReplicaState::Ready(_)) => {
+            write_replica_detached(paths)?;
+            Ok(None)
+        }
+        Some(DurableReplicaState::Detached) | None => Ok(None),
+    }
 }
 
 fn write_snapshot_file(
@@ -4491,6 +4860,16 @@ async fn compact_store(
     request_log_truncate(persistence)
         .await
         .map_err(|error| PersistenceError::new(format!("Binlog rotation failed: {}", error)))?;
+    let upstream_replid = persistence.upstream_replid.load(Ordering::SeqCst);
+    if upstream_replid != 0 {
+        write_replica_identity(
+            &persistence.paths,
+            ReplicaIdentity {
+                replid: upstream_replid,
+                baseline_sequence: watermark,
+            },
+        )?;
+    }
     persistence.write_count.store(0, Ordering::SeqCst);
     info!(
         "Compaction complete at sequence {}: snapshot installed and binlog truncated",
@@ -4645,13 +5024,11 @@ async fn handle_obp_client(
     let _ = buf_writer.flush().await;
 }
 
-/// Persists and publishes one already-applied mutation at its assigned
-/// sequence. The caller must hold the authoritative write gate.
-async fn persist_ordered_mutation(
+async fn append_committed_batch(
     persistence: &Persistence,
     sequence: u64,
     batch: &CommittedBatch,
-) -> Result<bool, PersistenceError> {
+) -> Result<(), PersistenceError> {
     let effect_record = encode_committed_batch(batch)?;
 
     let (completion_tx, completion_rx) = oneshot::channel();
@@ -4668,6 +5045,25 @@ async fn persist_ordered_mutation(
         .await
         .map_err(|_| PersistenceError::new("Binlog append completion was dropped"))?
         .map_err(PersistenceError::new)?;
+    Ok(())
+}
+
+fn record_persisted_write(persistence: &Persistence) -> bool {
+    persistence.write_count.fetch_add(1, Ordering::SeqCst) + 1 >= COMPACTION_THRESHOLD
+        && persistence
+            .compaction_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+}
+
+/// Persists and publishes one already-applied mutation at its assigned
+/// sequence. The caller must hold the authoritative write gate.
+async fn persist_ordered_mutation(
+    persistence: &Persistence,
+    sequence: u64,
+    batch: &CommittedBatch,
+) -> Result<bool, PersistenceError> {
+    append_committed_batch(persistence, sequence, batch).await?;
     // The exact same committed batch is published to the backlog and live
     // replication only after its binlog append has been acknowledged.
     {
@@ -4679,13 +5075,7 @@ async fn persist_ordered_mutation(
     }
     let _ = persistence.replica_tx.send((sequence, batch.clone()));
 
-    let should_compact = persistence.write_count.fetch_add(1, Ordering::SeqCst) + 1
-        >= COMPACTION_THRESHOLD
-        && persistence
-            .compaction_pending
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok();
-    Ok(should_compact)
+    Ok(record_persisted_write(persistence))
 }
 
 fn schedule_compaction(
@@ -4712,13 +5102,165 @@ fn schedule_compaction(
     });
 }
 
+async fn persist_and_apply_replica_effect(
+    store: &Arc<ShardedStore>,
+    persistence: &Arc<Persistence>,
+    sequence: u64,
+    batch: &CommittedBatch,
+) -> Result<(), PersistenceError> {
+    let write_guard = persistence.write_gate.lock().await;
+    if !persistence.accepting_writes.load(Ordering::SeqCst) {
+        return Err(PersistenceError::new(persistence_unavailable_message(
+            persistence,
+        )));
+    }
+    if !persistence.replication_ready.load(Ordering::SeqCst) {
+        return Err(PersistenceError::new(
+            "Replica has no installed durable synchronization baseline",
+        ));
+    }
+    let current = persistence.repl_offset.load(Ordering::SeqCst);
+    let expected = current
+        .checked_add(1)
+        .ok_or_else(|| PersistenceError::new("Replica sequence is exhausted"))?;
+    if sequence != expected {
+        return Err(PersistenceError::new(format!(
+            "Replication sequence mismatch: expected {}, received {}",
+            expected, sequence
+        )));
+    }
+    if let Err(error) = append_committed_batch(persistence, sequence, batch).await {
+        mark_persistence_failed(
+            persistence,
+            format!(
+                "Unable to persist replicated effect at sequence {}: {}",
+                sequence, error
+            ),
+        );
+        return Err(error);
+    }
+    apply_committed_batch(store, batch);
+    persistence.repl_offset.store(sequence, Ordering::SeqCst);
+    let should_compact = record_persisted_write(persistence);
+    drop(write_guard);
+    schedule_compaction(store, persistence, should_compact);
+    Ok(())
+}
+
+async fn begin_full_sync_reception(persistence: &Arc<Persistence>) -> Result<(), PersistenceError> {
+    let _write_guard = persistence.write_gate.lock().await;
+    if persistence.promote_to_master.load(Ordering::SeqCst) {
+        return Err(PersistenceError::new(
+            "Replica promotion started before full synchronization could begin",
+        ));
+    }
+    if !persistence.accepting_writes.load(Ordering::SeqCst) {
+        return Err(PersistenceError::new(persistence_unavailable_message(
+            persistence,
+        )));
+    }
+    if let Err(error) = write_replica_installing(&persistence.paths) {
+        mark_persistence_failed(
+            persistence,
+            format!(
+                "Unable to invalidate the previous replica baseline before full synchronization: {}",
+                error
+            ),
+        );
+        return Err(error);
+    }
+    persistence.replication_ready.store(false, Ordering::SeqCst);
+    persistence.upstream_replid.store(0, Ordering::SeqCst);
+    Ok(())
+}
+
+async fn install_full_sync(
+    store: &Arc<ShardedStore>,
+    persistence: &Arc<Persistence>,
+    replid: u64,
+    sequence: u64,
+    staging: ShardedStore,
+) -> Result<(), PersistenceError> {
+    if replid == 0 {
+        return Err(PersistenceError::new(
+            "Full synchronization requires a non-zero replication ID",
+        ));
+    }
+    let _write_guard = persistence.write_gate.lock().await;
+    if persistence.promote_to_master.load(Ordering::SeqCst) {
+        return Err(PersistenceError::new(
+            "Replica promotion started before full synchronization could be installed",
+        ));
+    }
+    if !persistence.accepting_writes.load(Ordering::SeqCst) {
+        return Err(PersistenceError::new(persistence_unavailable_message(
+            persistence,
+        )));
+    }
+    persistence.replication_ready.store(false, Ordering::SeqCst);
+    request_log_flush(persistence).await?;
+    // Invalidate promotability durably before truncating the old incremental
+    // history. A crash from this point until the new identity is installed
+    // must force another full synchronization rather than promote an older
+    // snapshot whose post-boundary log may already be gone.
+    write_replica_installing(&persistence.paths)?;
+    request_log_truncate(persistence).await?;
+    let entries = staging.engine.snapshot_all();
+    let snapshot_entries = entries.clone();
+    let paths = persistence.paths.clone();
+    tokio::task::spawn_blocking(move || write_snapshot_file(snapshot_entries, sequence, &paths))
+        .await
+        .map_err(|error| {
+            PersistenceError::new(format!("Replica snapshot task failed: {}", error))
+        })??;
+    write_replica_identity(
+        &persistence.paths,
+        ReplicaIdentity {
+            replid,
+            baseline_sequence: sequence,
+        },
+    )?;
+
+    store.engine.replace_all(entries);
+    persistence.repl_offset.store(sequence, Ordering::SeqCst);
+    persistence.upstream_replid.store(replid, Ordering::SeqCst);
+    persistence.replication_ready.store(true, Ordering::SeqCst);
+    persistence.write_count.store(0, Ordering::SeqCst);
+    persistence.backlog.lock().unwrap().clear();
+    Ok(())
+}
+
+async fn prepare_replica_promotion(persistence: &Arc<Persistence>) -> Result<(), PersistenceError> {
+    let _write_guard = persistence.write_gate.lock().await;
+    if !persistence.replication_ready.load(Ordering::SeqCst) {
+        return Err(PersistenceError::new(
+            "Replica is not durably synchronized and cannot be promoted",
+        ));
+    }
+    request_log_flush(persistence).await?;
+    write_replica_detached(&persistence.paths)?;
+    persistence.upstream_replid.store(0, Ordering::SeqCst);
+    persistence.replication_ready.store(false, Ordering::SeqCst);
+    persistence.promote_to_master.store(true, Ordering::SeqCst);
+    IS_REPLICA.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
 async fn execute_ordered_command(
     store: &Arc<ShardedStore>,
     persistence: &Arc<Persistence>,
     args: &[String],
+    serialize_replica_read: bool,
 ) -> (RESPValue, bool) {
     let command = args.first().map(|value| value.as_str()).unwrap_or("");
     if !is_write_command(command) {
+        if serialize_replica_read {
+            // A full-sync install holds the same gate while replacing every
+            // shard. Keeping it for the complete command prevents multi-key
+            // reads from combining the old and new replica baselines.
+            let _replication_boundary = persistence.write_gate.lock().await;
+            return execute_command(store, args);
+        }
         return execute_command(store, args);
     }
 
@@ -4825,6 +5367,11 @@ async fn execute_obp_command(
     let (value, _is_write) = match cmd {
         0x01 => {
             if let Some(key) = args.first() {
+                let _replication_boundary = if IS_REPLICA.load(Ordering::SeqCst) {
+                    Some(persistence.write_gate.lock().await)
+                } else {
+                    None
+                };
                 (
                     store
                         .engine
@@ -5132,11 +5679,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = Arc::new(ShardedStore::new());
     let paths = PersistencePaths::default();
-    let recovery = if master_addr.is_none() {
-        load_data_from_paths(&store, &paths)?
-    } else {
-        RecoveryState::default()
-    };
+    let recovery = load_data_from_paths(&store, &paths)?;
+    let recovered_replica_identity =
+        prepare_replication_startup(&paths, recovery.snapshot_watermark, master_addr.is_some())?;
     info!(
         "Persistence recovery complete at sequence {} (snapshot watermark {})",
         recovery.last_sequence, recovery.snapshot_watermark
@@ -5165,6 +5710,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_subscriber_id: AtomicU64::new(0),
         subscriptions: std::sync::Mutex::new(std::collections::HashMap::new()),
         failure: std::sync::Mutex::new(None),
+        upstream_replid: AtomicU64::new(
+            recovered_replica_identity
+                .map(|identity| identity.replid)
+                .unwrap_or(0),
+        ),
+        replication_ready: AtomicBool::new(recovered_replica_identity.is_some()),
         accepting_writes: AtomicBool::new(true),
         write_gate: tokio::sync::Mutex::new(()),
         paths: paths.clone(),
@@ -5206,13 +5757,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let store_replica = Arc::clone(&store);
         let promote_flag_replica = Arc::clone(&promote_flag);
+        let persistence_replica = Arc::clone(&persistence);
+        let initial_offset = recovered_replica_identity
+            .map(|_| recovery.last_sequence)
+            .unwrap_or(0);
+        let initial_replid = recovered_replica_identity
+            .map(|identity| identity.replid)
+            .unwrap_or(0);
         tokio::spawn(async move {
             run_replica(
-                addr,
                 store_replica,
+                persistence_replica,
                 promote_flag_replica,
-                auto_failover,
-                failover_timeout_secs,
+                ReplicaRuntimeConfig {
+                    master_addr: addr,
+                    auto_failover,
+                    failover_timeout_secs,
+                    initial_replid,
+                    initial_offset,
+                },
             )
             .await;
         });
@@ -5281,56 +5844,154 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_replica(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplicaSyncHandshake {
+    Full {
+        replid: u64,
+        sequence: u64,
+        entry_count: usize,
+    },
+    Partial {
+        replid: u64,
+        requested_sequence: u64,
+    },
+}
+
+struct ReplicaRuntimeConfig {
     master_addr: String,
-    store: Arc<ShardedStore>,
-    promote_flag: Arc<AtomicBool>,
     auto_failover: bool,
     failover_timeout_secs: u64,
+    initial_replid: u64,
+    initial_offset: u64,
+}
+
+fn parse_replica_sync_handshake(
+    marker: &[String],
+) -> Result<ReplicaSyncHandshake, PersistenceError> {
+    let parse_replid = |value: &str| {
+        let replid = value
+            .parse::<u64>()
+            .map_err(|_| PersistenceError::new("Invalid master replication ID"))?;
+        if replid == 0 {
+            return Err(PersistenceError::new(
+                "Master replication ID must be non-zero",
+            ));
+        }
+        Ok(replid)
+    };
+    match marker.first().map(String::as_str) {
+        Some("+FULLRESYNC3") if marker.len() == 4 => {
+            let replid = parse_replid(&marker[1])?;
+            let sequence = marker[2]
+                .parse::<u64>()
+                .map_err(|_| PersistenceError::new("Invalid full synchronization sequence"))?;
+            let entry_count = marker[3]
+                .parse::<usize>()
+                .map_err(|_| PersistenceError::new("Invalid full synchronization entry count"))?;
+            if entry_count > MAX_KEYS {
+                return Err(PersistenceError::new(
+                    "Full synchronization entry count exceeds the configured key limit",
+                ));
+            }
+            Ok(ReplicaSyncHandshake::Full {
+                replid,
+                sequence,
+                entry_count,
+            })
+        }
+        Some("+CONTINUE3") if marker.len() == 3 => {
+            let replid = parse_replid(&marker[1])?;
+            let requested_sequence = marker[2]
+                .parse::<u64>()
+                .map_err(|_| PersistenceError::new("Invalid partial synchronization sequence"))?;
+            Ok(ReplicaSyncHandshake::Partial {
+                replid,
+                requested_sequence,
+            })
+        }
+        _ => Err(PersistenceError::new(
+            "Unexpected or malformed replication handshake",
+        )),
+    }
+}
+
+fn parse_replica_sync_done(
+    marker: &[String],
+    expected_replid: u64,
+) -> Result<u64, PersistenceError> {
+    if marker.len() != 3 || marker[0] != "+SYNCDONE3" {
+        return Err(PersistenceError::new(
+            "Missing or malformed synchronization completion marker",
+        ));
+    }
+    let replid = marker[1]
+        .parse::<u64>()
+        .map_err(|_| PersistenceError::new("Invalid completion replication ID"))?;
+    if replid != expected_replid {
+        return Err(PersistenceError::new(
+            "Synchronization completion replication ID does not match the handshake",
+        ));
+    }
+    marker[2]
+        .parse::<u64>()
+        .map_err(|_| PersistenceError::new("Invalid synchronization completion sequence"))
+}
+
+async fn maybe_auto_promote_replica(
+    persistence: &Arc<Persistence>,
+    unreachable_since: &Option<std::time::Instant>,
+    auto_failover: bool,
+    failover_timeout_secs: u64,
+) -> bool {
+    if !auto_failover
+        || !matches!(
+            unreachable_since,
+            Some(since) if since.elapsed().as_secs() >= failover_timeout_secs
+        )
+    {
+        return false;
+    }
+    match prepare_replica_promotion(persistence).await {
+        Ok(()) => {
+            warn!(
+                "Master unreachable for over {}s: self-promoting the durably synchronized replica",
+                failover_timeout_secs
+            );
+            true
+        }
+        Err(error) => {
+            error!(
+                "Automatic promotion refused because the replica is not safely promotable: {}",
+                error
+            );
+            false
+        }
+    }
+}
+
+async fn run_replica(
+    store: Arc<ShardedStore>,
+    persistence: Arc<Persistence>,
+    promote_flag: Arc<AtomicBool>,
+    config: ReplicaRuntimeConfig,
 ) {
+    let ReplicaRuntimeConfig {
+        master_addr,
+        auto_failover,
+        failover_timeout_secs,
+        initial_replid,
+        initial_offset,
+    } = config;
     const MIN_BACKOFF_SECS: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 30;
     let mut backoff_secs = MIN_BACKOFF_SECS;
-
-    // Offset dell'ultimo comando live applicato con successo. Sopravvive
-    // alle riconnessioni: è quello che permette il resync parziale invece
-    // di un dump completo ogni volta che la connessione col Master cade.
-    let local_offset = Arc::new(AtomicU64::new(0));
-    // Replication ID dell'ultimo Master a cui ci siamo sincronizzati con
-    // successo. 0 = sconosciuto (prima connessione, o dopo un dump completo
-    // di cui non abbiamo ancora ricevuto il marker). Sopravvive alle
-    // riconnessioni nello stesso avvio della Replica.
-    let local_replid = Arc::new(AtomicU64::new(0));
-
-    // Da quando il Master è irraggiungibile senza interruzioni. None finché
-    // siamo connessi correttamente; si azzera appena la connessione torna a
-    // funzionare. Usato solo se --auto-failover è attivo.
+    let local_offset = Arc::new(AtomicU64::new(initial_offset));
+    let local_replid = Arc::new(AtomicU64::new(initial_replid));
     let mut unreachable_since: Option<std::time::Instant> = None;
 
-    // Se il Master resta irraggiungibile più del timeout configurato,
-    // promuove questa istanza a Master da sola. Ritorna true se ha
-    // promosso (il chiamante deve fermarsi subito dopo).
-    let maybe_self_promote = |unreachable_since: &Option<std::time::Instant>| -> bool {
-        if !auto_failover {
-            return false;
-        }
-        match unreachable_since {
-            Some(since) if since.elapsed().as_secs() >= failover_timeout_secs => {
-                warn!(
-                    "Master unreachable for over {}s: self-promoting to master (--auto-failover)",
-                    failover_timeout_secs
-                );
-                promote_flag.store(true, Ordering::Relaxed);
-                IS_REPLICA.store(false, Ordering::Relaxed);
-                true
-            }
-            _ => false,
-        }
-    };
-
     loop {
-        if promote_flag.load(Ordering::Relaxed) {
-            info!("Promotion to master complete, disconnecting from old master");
+        if promote_flag.load(Ordering::SeqCst) {
+            info!("Promotion to master complete, disconnecting from the previous master");
             return;
         }
         info!("Connecting to master {}...", master_addr);
@@ -5340,57 +6001,25 @@ async fn run_replica(
                 let _ = stream.set_nodelay(true);
                 let (reader, mut writer) = stream.into_split();
                 let mut buf_reader = TokioBufReader::with_capacity(65536, reader);
+                let mut scratch = String::new();
 
                 let starting_offset = local_offset.load(Ordering::SeqCst);
                 let known_replid = local_replid.load(Ordering::SeqCst);
-                let sync_cmd = format!("SYNC {} {}\n", known_replid, starting_offset);
+                let sync_cmd = format!("SYNC3 {} {}\n", known_replid, starting_offset);
                 if writer.write_all(sync_cmd.as_bytes()).await.is_err() {
                     warn!(
-                        "Failed to send SYNC to master, retrying in{}s",
+                        "Failed to send SYNC3 to master, retrying in {}s",
                         backoff_secs
                     );
                     unreachable_since.get_or_insert_with(std::time::Instant::now);
-                    if maybe_self_promote(&unreachable_since) {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-                    continue;
-                }
-
-                let mut scratch = String::new();
-
-                // Prima riga di risposta: +FULLRESYNC <offset> o +CONTINUE
-                // <offset>. Se manca o è malformata, meglio riprovare da capo
-                // che procedere alla cieca.
-                let handshake_ok = match read_command(&mut buf_reader, &mut scratch).await {
-                    Ok(Some(marker))
-                        if !marker.is_empty()
-                            && (marker[0] == "+FULLRESYNC" || marker[0] == "+CONTINUE") =>
+                    if maybe_auto_promote_replica(
+                        &persistence,
+                        &unreachable_since,
+                        auto_failover,
+                        failover_timeout_secs,
+                    )
+                    .await
                     {
-                        let is_full = marker[0] == "+FULLRESYNC";
-                        if let Some(replid) = marker.get(1).and_then(|s| s.parse::<u64>().ok()) {
-                            local_replid.store(replid, Ordering::SeqCst);
-                        }
-                        if is_full {
-                            info!("Master responded with full dump");
-                        } else {
-                            info!(
-                                "Master responded with partial sync (requested offset: {})",
-                                starting_offset
-                            );
-                        }
-                        true
-                    }
-                    _ => false,
-                };
-                if !handshake_ok {
-                    warn!(
-                        "Unexpected response from master at SYNC, retrying in {}s",
-                        backoff_secs
-                    );
-                    unreachable_since.get_or_insert_with(std::time::Instant::now);
-                    if maybe_self_promote(&unreachable_since) {
                         return;
                     }
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
@@ -5398,14 +6027,80 @@ async fn run_replica(
                     continue;
                 }
 
-                info!("Connected to master, receiving data...");
-                backoff_secs = MIN_BACKOFF_SECS;
-                unreachable_since = None; // connessione riuscita: azzera il timer del failover
+                let handshake = match read_replication_command(&mut buf_reader, &mut scratch).await
+                {
+                    Ok(Some(marker)) => parse_replica_sync_handshake(&marker),
+                    Ok(None) => Err(PersistenceError::new(
+                        "Master disconnected before the replication handshake",
+                    )),
+                    Err(error) => Err(PersistenceError::new(format!(
+                        "Unable to read the replication handshake: {}",
+                        error
+                    ))),
+                };
+                let handshake = match handshake {
+                    Ok(handshake) => handshake,
+                    Err(error) => {
+                        warn!(
+                            "Replication handshake failed: {}; retrying in {}s",
+                            error, backoff_secs
+                        );
+                        unreachable_since.get_or_insert_with(std::time::Instant::now);
+                        if maybe_auto_promote_replica(
+                            &persistence,
+                            &unreachable_since,
+                            auto_failover,
+                            failover_timeout_secs,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                        continue;
+                    }
+                };
 
-                // Task separato che manda periodicamente REPLCONF ACK
-                // <offset>, così il Master può monitorare quanto siamo
-                // indietro (lag). Possiede la metà "scrittura" della
-                // connessione da qui in poi.
+                if let ReplicaSyncHandshake::Partial {
+                    replid,
+                    requested_sequence,
+                } = handshake
+                    && (replid != known_replid || requested_sequence != starting_offset)
+                {
+                    warn!(
+                        "Master returned a partial synchronization boundary that does not match the request"
+                    );
+                    unreachable_since.get_or_insert_with(std::time::Instant::now);
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    continue;
+                }
+
+                if matches!(handshake, ReplicaSyncHandshake::Full { .. }) {
+                    if let Err(error) = begin_full_sync_reception(&persistence).await {
+                        warn!(
+                            "Unable to begin full synchronization safely: {}; retrying in {}s",
+                            error, backoff_secs
+                        );
+                        unreachable_since.get_or_insert_with(std::time::Instant::now);
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                        continue;
+                    }
+                    // The previous identity is no longer eligible for partial
+                    // synchronization or promotion once FULLRESYNC3 is accepted.
+                    local_replid.store(0, Ordering::SeqCst);
+                    local_offset.store(0, Ordering::SeqCst);
+                }
+
+                info!("Connected to master, receiving synchronization data...");
+                backoff_secs = MIN_BACKOFF_SECS;
+                unreachable_since = None;
+
+                // ACKs report only the last effect that is installed locally.
+                // During a full transfer this remains the previous durable
+                // boundary until the replacement snapshot is committed.
                 let ack_offset = Arc::clone(&local_offset);
                 let ack_task = tokio::spawn(async move {
                     loop {
@@ -5417,51 +6112,183 @@ async fn run_replica(
                         }
                     }
                 });
-                let mut receiving_initial_sync = true;
+
+                let initial_sync_result: Result<(u64, u64), PersistenceError> = async {
+                    match handshake {
+                    ReplicaSyncHandshake::Full {
+                        replid,
+                        sequence,
+                        entry_count,
+                    } => {
+                        let staging = ShardedStore::new();
+                        let mut seen_keys = std::collections::HashSet::new();
+                        let mut receive_result = Ok(());
+                        for _ in 0..entry_count {
+                            let (key, entry) = match read_full_sync_entry(
+                                &mut buf_reader,
+                                &mut scratch,
+                            )
+                            .await
+                            {
+                                Ok(entry) => entry,
+                                Err(error) => {
+                                    receive_result = Err(PersistenceError::new(format!(
+                                        "Master sent an invalid full synchronization entry: {}",
+                                        error
+                                    )));
+                                    break;
+                                }
+                            };
+                            if !seen_keys.insert(key.clone()) {
+                                receive_result = Err(PersistenceError::new(
+                                    "Master sent a duplicate key in the full synchronization snapshot",
+                                ));
+                                break;
+                            }
+                            staging.engine.apply_entry(key, entry);
+                        }
+                        if let Err(error) = receive_result {
+                            Err(error)
+                        } else {
+                            let done = match read_replication_command(&mut buf_reader, &mut scratch).await {
+                                Ok(Some(marker)) => parse_replica_sync_done(&marker, replid),
+                                Ok(None) => Err(PersistenceError::new(
+                                    "Master disconnected before completing full synchronization",
+                                )),
+                                Err(error) => Err(PersistenceError::new(format!(
+                                    "Unable to read full synchronization completion: {}",
+                                    error
+                                ))),
+                            }?;
+                            if done != sequence {
+                                Err(PersistenceError::new(
+                                    "Full synchronization completion sequence does not match its snapshot boundary",
+                                ))
+                            } else {
+                                install_full_sync(
+                                    &store,
+                                    &persistence,
+                                    replid,
+                                    sequence,
+                                    staging,
+                                )
+                                .await?;
+                                local_replid.store(replid, Ordering::SeqCst);
+                                local_offset.store(sequence, Ordering::SeqCst);
+                                info!(
+                                    "Installed full synchronization at sequence {} with {} entries",
+                                    sequence, entry_count
+                                );
+                                Ok((replid, sequence))
+                            }
+                        }
+                    }
+                    ReplicaSyncHandshake::Partial {
+                        replid,
+                        requested_sequence: _,
+                    } => loop {
+                        let frame = match read_replication_command(&mut buf_reader, &mut scratch).await {
+                            Ok(Some(frame)) => frame,
+                            Ok(None) => {
+                                break Err(PersistenceError::new(
+                                    "Master disconnected during partial synchronization",
+                                ));
+                            }
+                            Err(error) => {
+                                break Err(PersistenceError::new(format!(
+                                    "Unable to read partial synchronization data: {}",
+                                    error
+                                )));
+                            }
+                        };
+                        if frame.first().map(String::as_str) == Some("+SYNCDONE3") {
+                            let done = parse_replica_sync_done(&frame, replid)?;
+                            let installed = local_offset.load(Ordering::SeqCst);
+                            if done != installed {
+                                break Err(PersistenceError::new(
+                                    "Partial synchronization completion sequence does not match the installed sequence",
+                                ));
+                            }
+                            info!("Completed partial synchronization at sequence {}", done);
+                            break Ok((replid, done));
+                        }
+                        let (effect_sequence, batch) =
+                            read_replication_effect(&frame, &mut buf_reader, &mut scratch).await?;
+                        persist_and_apply_replica_effect(
+                            &store,
+                            &persistence,
+                            effect_sequence,
+                            &batch,
+                        )
+                        .await?;
+                        local_offset.store(effect_sequence, Ordering::SeqCst);
+                    },
+                }
+                }
+                .await;
+
+                let (stream_replid, stream_offset) = match initial_sync_result {
+                    Ok(boundary) => boundary,
+                    Err(error) => {
+                        warn!("Initial replication synchronization failed: {}", error);
+                        ack_task.abort();
+                        unreachable_since.get_or_insert_with(std::time::Instant::now);
+                        if maybe_auto_promote_replica(
+                            &persistence,
+                            &unreachable_since,
+                            auto_failover,
+                            failover_timeout_secs,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                        continue;
+                    }
+                };
+                local_replid.store(stream_replid, Ordering::SeqCst);
+                local_offset.store(stream_offset, Ordering::SeqCst);
 
                 loop {
-                    if promote_flag.load(Ordering::Relaxed) {
-                        info!("Master promotion completed, disconnected from previous master");
+                    if promote_flag.load(Ordering::SeqCst) {
+                        info!("Master promotion completed, disconnecting from the previous master");
                         ack_task.abort();
                         return;
                     }
-                    match read_command(&mut buf_reader, &mut scratch).await {
-                        Ok(Some(args)) if !args.is_empty() => {
-                            if receiving_initial_sync && args[0] == "+SYNCDONE" {
-                                if let Some(off) = args.get(1).and_then(|s| s.parse::<u64>().ok()) {
-                                    local_offset.store(off, Ordering::SeqCst);
-                                }
-                                receiving_initial_sync = false;
-                                continue;
+                    match read_replication_command(&mut buf_reader, &mut scratch).await {
+                        Ok(Some(frame)) if !frame.is_empty() => {
+                            if promote_flag.load(Ordering::SeqCst) {
+                                ack_task.abort();
+                                return;
                             }
-                            if args[0] == "APPLYEFFECT" {
-                                let Some(payload) = args.get(1) else {
-                                    warn!("Master sent a replication effect without a payload");
-                                    break;
-                                };
-                                match decode_replication_effect(payload) {
-                                    Ok(batch) => apply_committed_batch(&store, &batch),
-                                    Err(error) => {
-                                        warn!(
-                                            "Master sent an invalid replication effect: {}",
-                                            error
-                                        );
-                                        break;
-                                    }
-                                }
-                            } else {
-                                execute_command(&store, &args);
-                            }
-                            if !receiving_initial_sync
-                                && local_offset
-                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |offset| {
-                                        offset.checked_add(1)
-                                    })
-                                    .is_err()
+                            let (effect_sequence, batch) = match read_replication_effect(
+                                &frame,
+                                &mut buf_reader,
+                                &mut scratch,
+                            )
+                            .await
                             {
-                                warn!("Replication offset overflow");
+                                Ok(effect) => effect,
+                                Err(error) => {
+                                    warn!("Master sent an invalid replication effect: {}", error);
+                                    unreachable_since.get_or_insert_with(std::time::Instant::now);
+                                    break;
+                                }
+                            };
+                            if let Err(error) = persist_and_apply_replica_effect(
+                                &store,
+                                &persistence,
+                                effect_sequence,
+                                &batch,
+                            )
+                            .await
+                            {
+                                warn!("Unable to install replicated effect: {}", error);
                                 break;
                             }
+                            local_offset.store(effect_sequence, Ordering::SeqCst);
                         }
                         Ok(Some(_)) => continue,
                         Ok(None) => {
@@ -5469,22 +6296,42 @@ async fn run_replica(
                             unreachable_since.get_or_insert_with(std::time::Instant::now);
                             break;
                         }
-                        Err(_) => {
-                            warn!("Error reading from master, retrying in {}s", backoff_secs);
+                        Err(error) => {
+                            warn!(
+                                "Error reading from master: {}; retrying in {}s",
+                                error, backoff_secs
+                            );
                             unreachable_since.get_or_insert_with(std::time::Instant::now);
                             break;
                         }
                     }
                 }
                 ack_task.abort();
-                if maybe_self_promote(&unreachable_since) {
+                if maybe_auto_promote_replica(
+                    &persistence,
+                    &unreachable_since,
+                    auto_failover,
+                    failover_timeout_secs,
+                )
+                .await
+                {
                     return;
                 }
             }
-            Err(_) => {
-                warn!("Master unreachable, retrying in {}s", backoff_secs);
+            Err(error) => {
+                warn!(
+                    "Master {} is unreachable: {}; retrying in {}s",
+                    master_addr, error, backoff_secs
+                );
                 unreachable_since.get_or_insert_with(std::time::Instant::now);
-                if maybe_self_promote(&unreachable_since) {
+                if maybe_auto_promote_replica(
+                    &persistence,
+                    &unreachable_since,
+                    auto_failover,
+                    failover_timeout_secs,
+                )
+                .await
+                {
                     return;
                 }
             }
@@ -5519,6 +6366,8 @@ mod tests {
                 snapshot_temp: root.join("onyx.snapshot.tmp"),
                 snapshot_backup: root.join("onyx.snapshot.previous"),
                 binlog: root.join("onyx.binlog"),
+                replica_state: root.join("onyx.replica"),
+                replica_state_temp: root.join("onyx.replica.tmp"),
             };
             Self { root, paths }
         }
@@ -5551,6 +6400,8 @@ mod tests {
             next_subscriber_id: AtomicU64::new(0),
             subscriptions: std::sync::Mutex::new(std::collections::HashMap::new()),
             failure: std::sync::Mutex::new(None),
+            upstream_replid: AtomicU64::new(0),
+            replication_ready: AtomicBool::new(false),
             accepting_writes: AtomicBool::new(true),
             write_gate: tokio::sync::Mutex::new(()),
             paths,
@@ -5613,7 +6464,8 @@ mod tests {
         args: &[&str],
     ) {
         let command: Vec<String> = args.iter().map(|value| (*value).to_string()).collect();
-        let (response, is_write) = execute_ordered_command(store, persistence, &command).await;
+        let (response, is_write) =
+            execute_ordered_command(store, persistence, &command, false).await;
         assert!(is_write, "command was not treated as a mutation: {args:?}");
         assert!(
             !matches!(response, RESPValue::Error(_)),
@@ -5825,6 +6677,51 @@ mod tests {
         sender.await.unwrap();
 
         assert_eq!(decoded, args);
+    }
+
+    #[tokio::test]
+    async fn replication_reader_rejects_oversized_lines_before_buffering_the_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let oversized_line = format!("+{}\r\n", "x".repeat(1024));
+
+        let sender = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(oversized_line.as_bytes()).await.unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, _) = stream.into_split();
+        let mut reader = TokioBufReader::new(reader);
+        let mut scratch = String::new();
+        let error = read_replication_command(&mut reader, &mut scratch)
+            .await
+            .unwrap_err();
+        sender.await.unwrap();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn replication_reader_rejects_bulk_strings_without_crlf_terminators() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let sender = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(b"*1\r\n$3\r\nSETxx").await.unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, _) = stream.into_split();
+        let mut reader = TokioBufReader::new(reader);
+        let mut scratch = String::new();
+        let error = read_replication_command(&mut reader, &mut scratch)
+            .await
+            .unwrap_err();
+        sender.await.unwrap();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
@@ -6163,6 +7060,641 @@ mod tests {
         assert!(matches!(set_entry.value, OnyxValue::Set(values) if values == set));
     }
 
+    #[tokio::test]
+    async fn full_sync_wire_preserves_binary_keys_ttls_and_all_native_types() {
+        let mut hash = std::collections::HashMap::new();
+        hash.insert(
+            Bytes::from_static(b"field\0\xff"),
+            Bytes::from_static(b"hash-value\n\x80"),
+        );
+        let set = [
+            Bytes::from_static(b"member\0one"),
+            Bytes::from_static(b"\xffmember"),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        let mut cases = vec![
+            (
+                Bytes::from_static(b"blob-key\0\xff"),
+                DataEntry {
+                    value: OnyxValue::Blob(Bytes::from_static(b"blob-value\r\n\0\xff")),
+                    expires_at: Some(u64::MAX),
+                    created_at: 1,
+                    last_accessed: 2,
+                },
+            ),
+            (
+                Bytes::from_static(b"integer"),
+                DataEntry {
+                    value: OnyxValue::Int(i64::MIN),
+                    expires_at: None,
+                    created_at: 1,
+                    last_accessed: 2,
+                },
+            ),
+            (
+                Bytes::from_static(b"float"),
+                DataEntry {
+                    value: OnyxValue::Float(-0.0),
+                    expires_at: None,
+                    created_at: 1,
+                    last_accessed: 2,
+                },
+            ),
+            (
+                Bytes::from_static(b"list"),
+                DataEntry {
+                    value: OnyxValue::List(vec![
+                        Bytes::from_static(b"left\0"),
+                        Bytes::from_static(b"right\xff"),
+                    ]),
+                    expires_at: None,
+                    created_at: 1,
+                    last_accessed: 2,
+                },
+            ),
+            (
+                Bytes::from_static(b"hash"),
+                DataEntry {
+                    value: OnyxValue::Hash(hash),
+                    expires_at: None,
+                    created_at: 1,
+                    last_accessed: 2,
+                },
+            ),
+            (
+                Bytes::from_static(b"set"),
+                DataEntry {
+                    value: OnyxValue::Set(set),
+                    expires_at: None,
+                    created_at: 1,
+                    last_accessed: 2,
+                },
+            ),
+            (
+                Bytes::from_static(b"json"),
+                DataEntry {
+                    value: OnyxValue::Json(serde_json::json!({
+                        "nested": [1, true, null, "binary-safe framing"]
+                    })),
+                    expires_at: None,
+                    created_at: 1,
+                    last_accessed: 2,
+                },
+            ),
+            (
+                Bytes::from_static(b"vector"),
+                DataEntry {
+                    value: OnyxValue::Vector(vec![1.25, -3.5, f32::INFINITY]),
+                    expires_at: None,
+                    created_at: 1,
+                    last_accessed: 2,
+                },
+            ),
+        ];
+        cases.push((
+            Bytes::from_static(b"multi-chunk"),
+            DataEntry {
+                value: OnyxValue::Blob(Bytes::from(vec![0xa5; REPLICATION_CHUNK_SIZE + 17])),
+                expires_at: None,
+                created_at: 1,
+                last_accessed: 2,
+            },
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        for (expected_key, expected_entry) in cases {
+            let record = encode_full_sync_entry(&expected_key, &expected_entry).unwrap();
+            let sender = tokio::spawn(async move {
+                let mut stream = TcpStream::connect(address).await.unwrap();
+                write_chunked_replication_record(&mut stream, &record)
+                    .await
+                    .unwrap();
+            });
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, _) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut scratch = String::new();
+            let (actual_key, actual_entry) = read_full_sync_entry(&mut reader, &mut scratch)
+                .await
+                .unwrap();
+            sender.await.unwrap();
+            assert_eq!(actual_key, expected_key);
+            assert_eq!(actual_entry.value, expected_entry.value);
+            assert_eq!(actual_entry.expires_at, expected_entry.expires_at);
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_replication_chunks_large_committed_effects() {
+        let batch = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"large-effect"),
+            entry: PersistentEntry {
+                value: OnyxValue::Blob(Bytes::from(vec![0x5a; REPLICATION_CHUNK_SIZE + 17])),
+                expires_at: Some(u64::MAX),
+            },
+        }])
+        .unwrap();
+        let record = encode_replication_effect(19, &batch).unwrap();
+        assert!(record.payload.len() > REPLICATION_CHUNK_SIZE);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let sender = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            write_chunked_replication_record(&mut stream, &record)
+                .await
+                .unwrap();
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, _) = stream.into_split();
+        let mut reader = TokioBufReader::new(reader);
+        let mut scratch = String::new();
+        let header = read_replication_command(&mut reader, &mut scratch)
+            .await
+            .unwrap()
+            .unwrap();
+        let decoded = read_replication_effect(&header, &mut reader, &mut scratch)
+            .await
+            .unwrap();
+        sender.await.unwrap();
+
+        assert_eq!(decoded, (19, batch));
+    }
+
+    #[tokio::test]
+    async fn installed_full_sync_is_exact_durable_and_sequence_checked() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let store = Arc::new(ShardedStore::new());
+        store.engine.set(
+            Bytes::from_static(b"stale"),
+            OnyxValue::Blob(Bytes::from_static(b"must disappear")),
+            None,
+        );
+
+        let staging = ShardedStore::new();
+        staging.engine.set(
+            Bytes::from_static(b"binary\0\xff"),
+            OnyxValue::Blob(Bytes::from_static(b"value\r\n\0\xff")),
+            Some(u64::MAX),
+        );
+        staging
+            .engine
+            .set(Bytes::from_static(b"counter"), OnyxValue::Int(9), None);
+        staging.engine.set(
+            Bytes::from_static(b"document"),
+            OnyxValue::Json(serde_json::json!({"visits": 2})),
+            None,
+        );
+
+        install_full_sync(&store, &persistence, 71, 40, staging)
+            .await
+            .unwrap();
+        assert!(store.engine.get(&Bytes::from_static(b"stale")).is_none());
+        let binary = store
+            .engine
+            .get(&Bytes::from_static(b"binary\0\xff"))
+            .unwrap();
+        assert_eq!(binary.expires_at, Some(u64::MAX));
+        assert!(matches!(
+            binary.value,
+            OnyxValue::Blob(value) if value == Bytes::from_static(b"value\r\n\0\xff")
+        ));
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 40);
+        assert!(persistence.replication_ready.load(Ordering::SeqCst));
+        assert_eq!(
+            load_durable_replica_state(&directory.paths, 40).unwrap(),
+            Some(DurableReplicaState::Ready(ReplicaIdentity {
+                replid: 71,
+                baseline_sequence: 40,
+            }))
+        );
+        assert_eq!(
+            load_replica_identity(&directory.paths, 40).unwrap(),
+            Some(ReplicaIdentity {
+                replid: 71,
+                baseline_sequence: 40,
+            })
+        );
+
+        let increment = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"counter"),
+            entry: PersistentEntry {
+                value: OnyxValue::Int(10),
+                expires_at: None,
+            },
+        }])
+        .unwrap();
+        persist_and_apply_replica_effect(&store, &persistence, 41, &increment)
+            .await
+            .unwrap();
+        let duplicate = persist_and_apply_replica_effect(&store, &persistence, 41, &increment)
+            .await
+            .unwrap_err();
+        assert!(duplicate.to_string().contains("expected 42, received 41"));
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 41);
+        assert!(matches!(
+            store
+                .engine
+                .get(&Bytes::from_static(b"counter"))
+                .unwrap()
+                .value,
+            OnyxValue::Int(10)
+        ));
+
+        request_log_flush(&persistence).await.unwrap();
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovery.snapshot_watermark, 40);
+        assert_eq!(recovery.last_sequence, 41);
+        assert!(
+            recovered
+                .engine
+                .get(&Bytes::from_static(b"stale"))
+                .is_none()
+        );
+        assert!(matches!(
+            recovered
+                .engine
+                .get(&Bytes::from_static(b"counter"))
+                .unwrap()
+                .value,
+            OnyxValue::Int(10)
+        ));
+        assert_eq!(
+            load_replica_identity(&directory.paths, recovery.snapshot_watermark).unwrap(),
+            Some(ReplicaIdentity {
+                replid: 71,
+                baseline_sequence: 40,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn replica_reads_wait_for_the_atomic_full_sync_installation_boundary() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let store = Arc::new(ShardedStore::new());
+        store.engine.set(
+            Bytes::from_static(b"first"),
+            OnyxValue::Blob(Bytes::from_static(b"old-first")),
+            None,
+        );
+        store.engine.set(
+            Bytes::from_static(b"second"),
+            OnyxValue::Blob(Bytes::from_static(b"old-second")),
+            None,
+        );
+
+        let installation_guard = persistence.write_gate.lock().await;
+        let read_store = Arc::clone(&store);
+        let read_persistence = Arc::clone(&persistence);
+        let (started_tx, started_rx) = oneshot::channel();
+        let mut read_task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            execute_ordered_command(
+                &read_store,
+                &read_persistence,
+                &[
+                    "MGET".to_string(),
+                    "first".to_string(),
+                    "second".to_string(),
+                ],
+                true,
+            )
+            .await
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut read_task)
+                .await
+                .is_err(),
+            "replica read crossed an in-progress baseline installation"
+        );
+
+        let replacement = ShardedStore::new();
+        replacement.engine.set(
+            Bytes::from_static(b"first"),
+            OnyxValue::Blob(Bytes::from_static(b"new-first")),
+            None,
+        );
+        replacement.engine.set(
+            Bytes::from_static(b"second"),
+            OnyxValue::Blob(Bytes::from_static(b"new-second")),
+            None,
+        );
+        store.engine.replace_all(replacement.engine.snapshot_all());
+        drop(installation_guard);
+
+        let (response, is_write) = read_task.await.unwrap();
+        assert!(!is_write);
+        let RESPValue::Array(values) = response else {
+            panic!("expected an MGET array response");
+        };
+        assert_eq!(values.len(), 2);
+        assert!(matches!(
+            &values[0],
+            RESPValue::BulkString(Some(value)) if value == "new-first"
+        ));
+        assert!(matches!(
+            &values[1],
+            RESPValue::BulkString(Some(value)) if value == "new-second"
+        ));
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn promotion_flushes_replica_state_and_clears_upstream_identity() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let store = Arc::new(ShardedStore::new());
+        let staging = ShardedStore::new();
+        staging
+            .engine
+            .set(Bytes::from_static(b"counter"), OnyxValue::Int(3), None);
+        install_full_sync(&store, &persistence, 81, 12, staging)
+            .await
+            .unwrap();
+        let effect = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"counter"),
+            entry: PersistentEntry {
+                value: OnyxValue::Int(4),
+                expires_at: None,
+            },
+        }])
+        .unwrap();
+        persist_and_apply_replica_effect(&store, &persistence, 13, &effect)
+            .await
+            .unwrap();
+
+        prepare_replica_promotion(&persistence).await.unwrap();
+        assert!(persistence.promote_to_master.load(Ordering::SeqCst));
+        assert!(!persistence.replication_ready.load(Ordering::SeqCst));
+        assert_eq!(
+            load_durable_replica_state(&directory.paths, 12).unwrap(),
+            Some(DurableReplicaState::Detached)
+        );
+        assert_eq!(load_replica_identity(&directory.paths, 12).unwrap(), None);
+
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovery.last_sequence, 13);
+        assert!(matches!(
+            recovered
+                .engine
+                .get(&Bytes::from_static(b"counter"))
+                .unwrap()
+                .value,
+            OnyxValue::Int(4)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepting_full_resync_invalidates_the_previous_promotable_identity() {
+        let directory = TestPersistenceDirectory::new();
+        write_replica_identity(
+            &directory.paths,
+            ReplicaIdentity {
+                replid: 81,
+                baseline_sequence: 12,
+            },
+        )
+        .unwrap();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 12).await;
+        persistence.upstream_replid.store(81, Ordering::SeqCst);
+        persistence.replication_ready.store(true, Ordering::SeqCst);
+
+        begin_full_sync_reception(&persistence).await.unwrap();
+
+        assert!(!persistence.replication_ready.load(Ordering::SeqCst));
+        assert_eq!(persistence.upstream_replid.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            load_durable_replica_state(&directory.paths, 12).unwrap(),
+            Some(DurableReplicaState::Installing)
+        );
+        assert!(prepare_replica_promotion(&persistence).await.is_err());
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replicated_effect_persistence_failure_is_not_applied_or_acknowledged() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(4);
+        let worker = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    LogMessage::Append { completion, .. } => {
+                        let _ = completion.send(Err("injected replica append failure".to_string()));
+                    }
+                    LogMessage::Flush { completion }
+                    | LogMessage::SyncData { completion }
+                    | LogMessage::Truncate { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 5);
+        persistence.upstream_replid.store(33, Ordering::SeqCst);
+        persistence.replication_ready.store(true, Ordering::SeqCst);
+        let store = Arc::new(ShardedStore::new());
+        store
+            .engine
+            .set(Bytes::from_static(b"counter"), OnyxValue::Int(5), None);
+        let effect = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"counter"),
+            entry: PersistentEntry {
+                value: OnyxValue::Int(6),
+                expires_at: None,
+            },
+        }])
+        .unwrap();
+
+        assert!(
+            persist_and_apply_replica_effect(&store, &persistence, 6, &effect)
+                .await
+                .is_err()
+        );
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 5);
+        assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
+        assert!(!persistence.replication_ready.load(Ordering::SeqCst));
+        assert!(matches!(
+            store
+                .engine
+                .get(&Bytes::from_static(b"counter"))
+                .unwrap()
+                .value,
+            OnyxValue::Int(5)
+        ));
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_full_sync_install_keeps_old_live_state_and_blocks_promotion() {
+        let directory = TestPersistenceDirectory::new();
+        let old_disk_state = ShardedStore::new();
+        old_disk_state.engine.set(
+            Bytes::from_static(b"old"),
+            OnyxValue::Blob(Bytes::from_static(b"durable")),
+            None,
+        );
+        write_snapshot_file(old_disk_state.engine.snapshot_all(), 3, &directory.paths).unwrap();
+        write_replica_identity(
+            &directory.paths,
+            ReplicaIdentity {
+                replid: 51,
+                baseline_sequence: 3,
+            },
+        )
+        .unwrap();
+        append_test_binlog_record(&directory.paths, 4, &["SET", "post", "boundary"]);
+
+        let mut failing_paths = directory.paths.clone();
+        failing_paths.snapshot_temp = directory.root.join("missing").join("snapshot.tmp");
+        let (persistence, worker) = start_test_persistence(failing_paths, 4).await;
+        persistence.upstream_replid.store(51, Ordering::SeqCst);
+        persistence.replication_ready.store(true, Ordering::SeqCst);
+        let store = Arc::new(ShardedStore::new());
+        store.engine.set(
+            Bytes::from_static(b"old"),
+            OnyxValue::Blob(Bytes::from_static(b"live")),
+            None,
+        );
+        let staging = ShardedStore::new();
+        staging.engine.set(
+            Bytes::from_static(b"new"),
+            OnyxValue::Blob(Bytes::from_static(b"uncommitted")),
+            None,
+        );
+
+        let error = install_full_sync(&store, &persistence, 91, 8, staging)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert_eq!(store.get("old"), Some("live".to_string()));
+        assert!(store.get("new").is_none());
+        assert!(!persistence.replication_ready.load(Ordering::SeqCst));
+        assert!(!persistence.promote_to_master.load(Ordering::SeqCst));
+        assert!(prepare_replica_promotion(&persistence).await.is_err());
+        assert_eq!(
+            load_durable_replica_state(&directory.paths, 3).unwrap(),
+            Some(DurableReplicaState::Installing)
+        );
+        assert_eq!(
+            load_replica_identity(&directory.paths, 3).unwrap(),
+            None,
+            "the old baseline must not remain promotable after destructive installation begins"
+        );
+
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovery.last_sequence, 3);
+        assert_eq!(recovered.get("old"), Some("durable".to_string()));
+        assert!(
+            load_replica_identity(&directory.paths, 3)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn master_startup_detaches_ready_history_and_rejects_incomplete_installation() {
+        let ready_directory = TestPersistenceDirectory::new();
+        write_replica_identity(
+            &ready_directory.paths,
+            ReplicaIdentity {
+                replid: 101,
+                baseline_sequence: 9,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepare_replication_startup(&ready_directory.paths, 9, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            load_durable_replica_state(&ready_directory.paths, 9).unwrap(),
+            Some(DurableReplicaState::Detached)
+        );
+
+        let installing_directory = TestPersistenceDirectory::new();
+        write_replica_installing(&installing_directory.paths).unwrap();
+        let error = prepare_replication_startup(&installing_directory.paths, 0, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("baseline installation is incomplete"));
+        assert_eq!(
+            prepare_replication_startup(&installing_directory.paths, 0, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            load_durable_replica_state(&installing_directory.paths, 0).unwrap(),
+            Some(DurableReplicaState::Installing)
+        );
+    }
+
+    #[test]
+    fn replication_v3_markers_are_strict_and_sequence_bound() {
+        assert_eq!(
+            parse_replica_sync_handshake(&[
+                "+FULLRESYNC3".to_string(),
+                "17".to_string(),
+                "23".to_string(),
+                "5".to_string(),
+            ])
+            .unwrap(),
+            ReplicaSyncHandshake::Full {
+                replid: 17,
+                sequence: 23,
+                entry_count: 5,
+            }
+        );
+        assert!(
+            parse_replica_sync_handshake(&[
+                "+FULLRESYNC3".to_string(),
+                "17".to_string(),
+                "23".to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_replica_sync_handshake(&[
+                "+CONTINUE3".to_string(),
+                "0".to_string(),
+                "23".to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_replica_sync_done(
+                &["+SYNCDONE3".to_string(), "18".to_string(), "23".to_string(),],
+                17,
+            )
+            .is_err()
+        );
+        assert!(decode_replication_effect("0", &[0]).is_err());
+        assert!(decode_replication_effect("not-a-sequence", &[0]).is_err());
+    }
+
     #[test]
     fn ambiguous_legacy_snapshot_and_binlog_are_rejected() {
         let directory = TestPersistenceDirectory::new();
@@ -6221,7 +7753,8 @@ mod tests {
         let store = Arc::new(ShardedStore::new());
 
         let command = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
-        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
+        let (response, is_write) =
+            execute_ordered_command(&store, &persistence, &command, false).await;
         assert!(!is_write);
         assert!(matches!(response, RESPValue::Error(message) if message.starts_with("MISCONF")));
         assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
@@ -6236,7 +7769,7 @@ mod tests {
             "rejected".to_string(),
         ];
         let (second_response, _) =
-            execute_ordered_command(&store, &persistence, &second_command).await;
+            execute_ordered_command(&store, &persistence, &second_command, false).await;
         assert!(matches!(second_response, RESPValue::Error(_)));
         assert_eq!(store.get("second"), None);
 
@@ -7107,7 +8640,8 @@ mod tests {
             "key".to_string(),
             "replacement".to_string(),
         ];
-        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
+        let (response, is_write) =
+            execute_ordered_command(&store, &persistence, &command, false).await;
         assert!(matches!(response, RESPValue::Integer(0)));
         assert!(!is_write);
         assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
@@ -7142,7 +8676,8 @@ mod tests {
         .await;
         let offset_before_overflow = persistence.repl_offset.load(Ordering::SeqCst);
         let overflow = vec!["INCR".to_string(), "maximum".to_string()];
-        let (response, is_write) = execute_ordered_command(&store, &persistence, &overflow).await;
+        let (response, is_write) =
+            execute_ordered_command(&store, &persistence, &overflow, false).await;
         assert!(matches!(response, RESPValue::Error(message) if message.contains("overflow")));
         assert!(!is_write);
         assert_eq!(
@@ -7182,8 +8717,8 @@ mod tests {
         let encoded = encode_committed_batch(&batch).unwrap();
         assert_eq!(decode_committed_batch(&encoded).unwrap(), batch);
         assert_eq!(
-            decode_replication_effect(&hex_encode(&encoded)).unwrap(),
-            batch
+            decode_replication_effect("7", &encoded).unwrap(),
+            (7, batch)
         );
 
         let mut trailing = encoded.clone();
@@ -7396,7 +8931,8 @@ mod tests {
 
         let store = Arc::new(ShardedStore::new());
         let command = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
-        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
+        let (response, is_write) =
+            execute_ordered_command(&store, &persistence, &command, false).await;
         assert!(!is_write);
         assert!(
             matches!(response, RESPValue::Error(message) if message.contains("injected sync failure"))

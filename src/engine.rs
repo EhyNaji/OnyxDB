@@ -383,6 +383,28 @@ impl OnyxEngine {
         shard.insert(key, entry)
     }
 
+    /// Replaces the complete dataset after locking every shard in index order.
+    /// Callers must serialize multi-shard observations across the replacement
+    /// boundary because those operations may otherwise release one shard
+    /// before acquiring the next.
+    pub fn replace_all(&self, entries: Vec<(Bytes, DataEntry)>) {
+        let mut shards: Vec<std::sync::MutexGuard<'_, Shard>> = self
+            .shards
+            .iter()
+            .map(|shard| shard.lock().unwrap())
+            .collect();
+        for shard in &mut shards {
+            shard.data.clear();
+            shard.mem_bytes = 0;
+            shard.op_count += 1;
+            shard.last_modified = now();
+        }
+        for (key, entry) in entries {
+            let shard_idx = shard_for_key(&key);
+            shards[shard_idx].insert(key, entry);
+        }
+    }
+
     /// SET — single shard
     #[inline]
     pub fn set(&self, key: Bytes, value: OnyxValue, expires: Option<u64>) -> Option<DataEntry> {
