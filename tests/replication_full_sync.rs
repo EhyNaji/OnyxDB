@@ -317,6 +317,72 @@ fn hex_encode(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn replica_authenticates_to_a_protected_master() {
+    let master_directory = TestDirectory::new("authenticated-master");
+    let replica_directory = TestDirectory::new("authenticated-replica");
+    let master_port = choose_port();
+    let replica_port = choose_port();
+    let password = "replication-test-password";
+
+    let master = start_server(
+        &master_directory.0,
+        master_port,
+        &["--requirepass".to_string(), password.to_string()],
+    );
+    let mut writer = TcpStream::connect(("127.0.0.1", master_port)).unwrap();
+    writer
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(writer.try_clone().unwrap());
+    assert_eq!(
+        send_command_on_connection(&mut writer, &mut reader, &[b"AUTH", password.as_bytes()]),
+        Resp::Simple("OK".to_string())
+    );
+    assert_eq!(
+        send_command_on_connection(
+            &mut writer,
+            &mut reader,
+            &[b"SET", b"protected-key", b"replicated-value"],
+        ),
+        Resp::Simple("OK".to_string())
+    );
+
+    let mut args = replica_args(master_port);
+    args.extend(["--masterauth".to_string(), password.to_string()]);
+    let replica = start_server(&replica_directory.0, replica_port, &args);
+    wait_for_response(
+        replica_port,
+        &[b"GET", b"protected-key"],
+        &resp_bulk("replicated-value"),
+    );
+
+    replica.stop();
+    master.stop();
+}
+
+#[test]
+fn master_emits_sequence_bound_heartbeats_when_negotiated() {
+    let master_directory = TestDirectory::new("heartbeat-master");
+    let master_port = choose_port();
+    let master = start_server(&master_directory.0, master_port, &[]);
+
+    let mut stream = TcpStream::connect(("127.0.0.1", master_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .write_all(&encode_command(&[b"SYNC3", b"0", b"0", b"HEARTBEAT"]))
+        .unwrap();
+    stream.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert!(read_line(&mut reader).starts_with("+FULLRESYNC3 "));
+    assert!(read_line(&mut reader).starts_with("+SYNCDONE3 "));
+    assert_eq!(read_line(&mut reader), "REPLCONF PING 0");
+
+    master.stop();
+}
+
+#[test]
 fn full_sync_replaces_stale_state_replicates_mutations_and_survives_restart() {
     let master_directory = TestDirectory::new("master");
     let replica_directory = TestDirectory::new("replica");

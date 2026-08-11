@@ -23,9 +23,9 @@ Data types — strings, lists, hashes, sets, and JSON documents with path-level 
 
 Two wire protocols — RESP (Redis-compatible, works with existing Redis clients and tooling) and OBP (OnyxDB Binary Protocol, a compact custom protocol for lower-overhead access), served on adjacent ports simultaneously.
 
-Replication — asynchronous master/replica replication with partial resync. Each master generates a replication ID on startup; a replica reconnecting after a network blip resumes from its last offset only if the master is provably the same process it was talking to before, otherwise it falls back to a full resync automatically. Optional --auto-failover lets a replica self-promote if its master stays unreachable past a configurable timeout (single-replica setups only — no split-brain coordination across multiple replicas yet).
+Replication — asynchronous master/replica replication with partial resync, optional upstream authentication, and sequence-bound heartbeats. Each master generates a replication ID on startup; a replica reconnecting after a network blip resumes from its last offset only if the master is provably the same process it was talking to before, otherwise it falls back to a full resync automatically. Optional --auto-failover lets a replica self-promote if its master stays unreachable past a configurable timeout (single-replica setups only — no split-brain coordination across multiple replicas yet).
 
-Persistence — a binary write-ahead log (binlog) for durability plus periodic gzip-compressed snapshot compaction, with configurable fsync policy (always / everysec / no). Startup recovery tolerates a truncated or corrupted binlog without crashing — damaged records are skipped and logged, not fatal.
+Persistence — a checksummed binary write-ahead log (binlog) for durability plus periodic gzip-compressed snapshot compaction, with configurable fsync policy (always / everysec / no). Startup recovery truncates only a recognizable incomplete final record and fails closed on complete corrupted records.
 
 Access control — multi-user authentication (--user name:password, repeatable) with AUTH user pass, plus legacy single-password mode via --requirepass for compatibility.
 
@@ -102,6 +102,8 @@ Configuration flags
 Flag	Description
 --port <n>	RESP listener port (default 6380); OBP binds to port+1, metrics to port+1000
 --replica-of <host:port>	Start as a replica of the given master
+--masterauth <password>	Authenticate replication to the upstream master
+--masteruser <name>	Upstream authentication user (default: default; requires --masterauth)
 --requirepass <password>	Enable single-password auth (legacy, maps to the default user)
 --user <name:password>	Add an authenticated user (repeatable)
 --appendfsync <always|everysec|no>	Binlog fsync policy (default everysec)
@@ -109,6 +111,8 @@ Flag	Description
 --maxmemory-policy <policy>	Eviction policy when over the limit (default noeviction)
 --auto-failover	Let a replica self-promote after losing its master (single-replica setups only)
 --failover-timeout <secs>	Unreachable-master threshold before self-promotion (default 30)
+
+Upstream credentials can also be supplied through `ONYXDB_MASTER_PASSWORD` and `ONYXDB_MASTER_USER`. Prefer the environment variables when command-line arguments may be visible to other local users.
 Architecture notes
 
 Storage is a custom sharded engine (OnyxEngine), not a wrapper around an existing embedded database — 64 shards, each behind its own mutex, keyed by an FNV-1a hash. Cross-shard operations (like RENAME) lock shards in a fixed ascending order to avoid deadlocks between concurrent operations touching the same two shards.

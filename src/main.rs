@@ -51,6 +51,10 @@ const MAX_KEYS: usize = 1_000_000;
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const CLIENT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLICATION_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLICATION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const REPLICATION_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLICATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const REPLICA_ACK_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TRANSACTION_COMMANDS: usize = 1024;
 const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 
@@ -115,13 +119,26 @@ impl Default for PersistencePaths {
 #[derive(Debug)]
 struct PersistenceError {
     message: String,
+    upstream_unavailable: bool,
 }
 
 impl PersistenceError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            upstream_unavailable: false,
         }
+    }
+
+    fn upstream_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_unavailable: true,
+        }
+    }
+
+    fn indicates_upstream_unavailable(&self) -> bool {
+        self.upstream_unavailable
     }
 }
 
@@ -1290,6 +1307,124 @@ struct ReplicaStatus {
     last_ack_time: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplicaLifecycleState {
+    Running,
+    Stopped,
+    Failed,
+}
+
+struct ReplicaLifecycle {
+    stop_tx: tokio::sync::watch::Sender<bool>,
+    state_tx: tokio::sync::watch::Sender<ReplicaLifecycleState>,
+}
+
+impl ReplicaLifecycle {
+    fn new(initially_stopped: bool) -> Self {
+        let (stop_tx, _) = tokio::sync::watch::channel(false);
+        let initial_state = if initially_stopped {
+            ReplicaLifecycleState::Stopped
+        } else {
+            ReplicaLifecycleState::Running
+        };
+        let (state_tx, _) = tokio::sync::watch::channel(initial_state);
+        Self { stop_tx, state_tx }
+    }
+
+    fn subscribe_stop(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stop_tx.subscribe()
+    }
+
+    fn stop_requested(&self) -> bool {
+        *self.stop_tx.borrow()
+    }
+
+    fn mark_running(&self) {
+        self.state_tx.send_replace(ReplicaLifecycleState::Running);
+    }
+
+    fn mark_stopped(&self) {
+        self.state_tx.send_replace(ReplicaLifecycleState::Stopped);
+    }
+
+    fn mark_failed(&self) {
+        self.state_tx.send_replace(ReplicaLifecycleState::Failed);
+    }
+
+    fn request_stop(&self) {
+        self.stop_tx.send_replace(true);
+    }
+
+    async fn wait_stopped(&self) -> Result<(), PersistenceError> {
+        let mut state_rx = self.state_tx.subscribe();
+        if *state_rx.borrow() == ReplicaLifecycleState::Running
+            && state_rx
+                .wait_for(|state| *state != ReplicaLifecycleState::Running)
+                .await
+                .is_err()
+        {
+            return Err(PersistenceError::new(
+                "Replica lifecycle state channel closed before shutdown completed",
+            ));
+        }
+        match *state_rx.borrow() {
+            ReplicaLifecycleState::Stopped => Ok(()),
+            ReplicaLifecycleState::Failed => Err(PersistenceError::new(
+                "Replica lifecycle failed before upstream cleanup completed",
+            )),
+            ReplicaLifecycleState::Running => Err(PersistenceError::new(
+                "Replica lifecycle did not reach a stopped state",
+            )),
+        }
+    }
+
+    async fn stop_and_wait(&self) -> Result<(), PersistenceError> {
+        self.request_stop();
+        self.wait_stopped().await
+    }
+}
+
+struct ReplicaRunGuard(Arc<ReplicaLifecycle>);
+
+impl Drop for ReplicaRunGuard {
+    fn drop(&mut self) {
+        // A panicked runner has not proven that every child task is quiescent.
+        // Mark it failed so promotion is rejected instead of hanging.
+        if std::thread::panicking() {
+            self.0.mark_failed();
+        } else {
+            self.0.mark_stopped();
+        }
+    }
+}
+
+struct AbortTaskOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortTaskOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn abort_and_wait(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl<T> Drop for AbortTaskOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
 struct Persistence {
     log_tx: mpsc::Sender<LogMessage>,
     write_count: AtomicUsize,
@@ -1334,6 +1469,7 @@ struct Persistence {
     failure: std::sync::Mutex<Option<String>>,
     upstream_replid: AtomicU64,
     replication_ready: AtomicBool,
+    replica_lifecycle: Arc<ReplicaLifecycle>,
 }
 
 fn mark_persistence_failed(persistence: &Persistence, message: impl Into<String>) {
@@ -3142,6 +3278,14 @@ async fn read_replication_command(
     reader: &mut TokioBufReader<tokio::net::tcp::OwnedReadHalf>,
     scratch: &mut Vec<u8>,
 ) -> std::io::Result<Option<Vec<String>>> {
+    read_replication_command_with_idle(reader, scratch, REPLICATION_TRANSFER_IDLE_TIMEOUT).await
+}
+
+async fn read_replication_command_with_idle(
+    reader: &mut TokioBufReader<tokio::net::tcp::OwnedReadHalf>,
+    scratch: &mut Vec<u8>,
+    idle_timeout: Duration,
+) -> std::io::Result<Option<Vec<String>>> {
     read_command_with_timeouts(
         reader,
         scratch,
@@ -3151,7 +3295,7 @@ async fn read_replication_command(
             max_inline_len: 1024,
             max_frame_len: MAX_REPLICATION_FRAME_BULK_SIZE as usize + 4096,
         },
-        None,
+        Some(idle_timeout),
         REPLICATION_FRAME_TIMEOUT,
     )
     .await
@@ -3174,15 +3318,15 @@ async fn read_chunked_replication_payload(
         let frame = match read_replication_command(reader, scratch).await {
             Ok(Some(frame)) => frame,
             Ok(None) => {
-                return Err(PersistenceError::new(
+                return Err(PersistenceError::upstream_unavailable(
                     "Master disconnected during a chunked replication record",
                 ));
             }
             Err(error) => {
-                return Err(PersistenceError::new(format!(
-                    "Unable to read a replication chunk: {}",
-                    error
-                )));
+                return Err(upstream_io_persistence_error(
+                    "Unable to read a replication chunk",
+                    error,
+                ));
             }
         };
         if frame.len() != 2 || frame[0] != chunk_command {
@@ -3217,15 +3361,15 @@ async fn read_full_sync_entry(
     let header = match read_replication_command(reader, scratch).await {
         Ok(Some(header)) => header,
         Ok(None) => {
-            return Err(PersistenceError::new(
+            return Err(PersistenceError::upstream_unavailable(
                 "Master disconnected during full synchronization",
             ));
         }
         Err(error) => {
-            return Err(PersistenceError::new(format!(
-                "Unable to read full synchronization entry: {}",
-                error
-            )));
+            return Err(upstream_io_persistence_error(
+                "Unable to read full synchronization entry",
+                error,
+            ));
         }
     };
     if header.len() != 2 || header[0] != "FULLSYNCENTRY" {
@@ -4317,9 +4461,9 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 let _ = buf_writer.flush().await;
                 return;
             }
-            let (requested_replid, requested_offset) = match args.as_slice() {
+            let (requested_replid, requested_offset, heartbeat_enabled) = match args.as_slice() {
                 [_, replid, offset] => match (replid.parse::<u64>(), offset.parse::<u64>()) {
-                    (Ok(replid), Ok(offset)) => (replid, offset),
+                    (Ok(replid), Ok(offset)) => (replid, offset, false),
                     _ => {
                         resp_buf.clear();
                         RESPValue::Error(
@@ -4331,9 +4475,25 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                         return;
                     }
                 },
+                [_, replid, offset, capability] if capability.eq_ignore_ascii_case("HEARTBEAT") => {
+                    match (replid.parse::<u64>(), offset.parse::<u64>()) {
+                        (Ok(replid), Ok(offset)) => (replid, offset, true),
+                        _ => {
+                            resp_buf.clear();
+                            RESPValue::Error(
+                                "ERR SYNC3 requires numeric replication ID and sequence"
+                                    .to_string(),
+                            )
+                            .encode_into(&mut resp_buf);
+                            let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
+                            let _ = buf_writer.flush().await;
+                            return;
+                        }
+                    }
+                }
                 _ => {
                     resp_buf.clear();
-                    RESPValue::Error("ERR usage: SYNC3 replid sequence".to_string())
+                    RESPValue::Error("ERR usage: SYNC3 replid sequence [HEARTBEAT]".to_string())
                         .encode_into(&mut resp_buf);
                     let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
                     let _ = buf_writer.flush().await;
@@ -4403,7 +4563,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                             max_inline_len: 128,
                             max_frame_len: 512,
                         },
-                        None,
+                        Some(REPLICA_ACK_IDLE_TIMEOUT),
                         REPLICATION_FRAME_TIMEOUT,
                     )
                     .await
@@ -4556,6 +4716,12 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 peer_addr, last_sent_offset
             );
 
+            let mut heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + REPLICATION_HEARTBEAT_INTERVAL,
+                REPLICATION_HEARTBEAT_INTERVAL,
+            );
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             loop {
                 tokio::select! {
                     _ = &mut reader_task => {
@@ -4564,6 +4730,14 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                             peer_addr
                         );
                         break;
+                    }
+                    _ = heartbeat.tick(), if heartbeat_enabled => {
+                        let frame = format!("REPLCONF PING {}\r\n", last_sent_offset);
+                        if buf_writer.write_all(frame.as_bytes()).await.is_err()
+                            || buf_writer.flush().await.is_err()
+                        {
+                            break;
+                        }
                     }
                     replication = replica_rx.recv() => {
                         match replication {
@@ -5434,7 +5608,9 @@ async fn persist_and_apply_replica_effect(
 
 async fn begin_full_sync_reception(persistence: &Arc<Persistence>) -> Result<(), PersistenceError> {
     let _write_guard = persistence.write_gate.lock().await;
-    if persistence.promote_to_master.load(Ordering::SeqCst) {
+    if persistence.promote_to_master.load(Ordering::SeqCst)
+        || persistence.replica_lifecycle.stop_requested()
+    {
         return Err(PersistenceError::new(
             "Replica promotion started before full synchronization could begin",
         ));
@@ -5473,7 +5649,9 @@ async fn install_full_sync(
     }
     let _write_guard = persistence.write_gate.lock().await;
     let _visibility_guard = persistence.visibility_gate.write().await;
-    if persistence.promote_to_master.load(Ordering::SeqCst) {
+    if persistence.promote_to_master.load(Ordering::SeqCst)
+        || persistence.replica_lifecycle.stop_requested()
+    {
         return Err(PersistenceError::new(
             "Replica promotion started before full synchronization could be installed",
         ));
@@ -5517,6 +5695,20 @@ async fn install_full_sync(
 }
 
 async fn prepare_replica_promotion(persistence: &Arc<Persistence>) -> Result<(), PersistenceError> {
+    {
+        let _write_guard = persistence.write_gate.lock().await;
+        if !persistence.replication_ready.load(Ordering::SeqCst) {
+            return Err(PersistenceError::new(
+                "Replica is not durably synchronized and cannot be promoted",
+            ));
+        }
+        persistence.replica_lifecycle.request_stop();
+    }
+    persistence.replica_lifecycle.stop_and_wait().await?;
+    commit_replica_promotion(persistence).await
+}
+
+async fn commit_replica_promotion(persistence: &Arc<Persistence>) -> Result<(), PersistenceError> {
     let _write_guard = persistence.write_gate.lock().await;
     if !persistence.replication_ready.load(Ordering::SeqCst) {
         return Err(PersistenceError::new(
@@ -6028,6 +6220,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("This instance's replication ID: {}", repl_id_val);
     let args: Vec<String> = env::args().collect();
     let mut master_addr: Option<String> = None;
+    let mut master_user: Option<String> = None;
+    let mut master_password: Option<String> = None;
     let mut password: Option<String> = None;
     let mut appendfsync: Option<String> = None;
     let mut maxmemory_arg: Option<String> = None;
@@ -6038,6 +6232,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..args.len() {
         if args[i] == "--replica-of" && i + 1 < args.len() {
             master_addr = Some(args[i + 1].clone());
+        }
+        if args[i] == "--masteruser" && i + 1 < args.len() {
+            master_user = Some(args[i + 1].clone());
+        }
+        if args[i] == "--masterauth" && i + 1 < args.len() {
+            master_password = Some(args[i + 1].clone());
         }
         if args[i] == "--requirepass" && i + 1 < args.len() {
             password = Some(args[i + 1].clone());
@@ -6073,6 +6273,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if password.is_none() {
         password = env::var("ONYXDB_PASSWORD").ok();
     }
+    if master_user.is_none() {
+        master_user = env::var("ONYXDB_MASTER_USER").ok();
+    }
+    if master_password.is_none() {
+        master_password = env::var("ONYXDB_MASTER_PASSWORD").ok();
+    }
+    if master_user.is_some() && master_password.is_none() {
+        return Err(
+            "upstream replication username requires --masterauth or ONYXDB_MASTER_PASSWORD".into(),
+        );
+    }
+    if master_addr.is_none() && (master_user.is_some() || master_password.is_some()) {
+        return Err("upstream replication credentials require --replica-of".into());
+    }
+    let upstream_credentials = master_password.map(|password| UpstreamCredentials {
+        username: master_user.unwrap_or_else(|| "default".to_string()),
+        password,
+    });
     // Compatibilità con la vecchia modalità a password unica: diventa
     // l'utente "default", utilizzabile anche con `AUTH password` (senza
     // nome utente esplicito).
@@ -6150,6 +6368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (replica_tx, _) = tokio::sync::broadcast::channel::<(u64, CommittedBatch)>(4096);
     let (pubsub_tx, _) = tokio::sync::broadcast::channel::<(String, String)>(4096);
     let promote_flag = Arc::new(AtomicBool::new(false));
+    let replica_lifecycle = Arc::new(ReplicaLifecycle::new(master_addr.is_none()));
     let persistence = Arc::new(Persistence {
         log_tx: tx,
         write_count: AtomicUsize::new(0),
@@ -6170,6 +6389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(0),
         ),
         replication_ready: AtomicBool::new(recovered_replica_identity.is_some()),
+        replica_lifecycle,
         accepting_writes: AtomicBool::new(true),
         visibility_gate: tokio::sync::RwLock::new(()),
         write_gate: tokio::sync::Mutex::new(()),
@@ -6211,7 +6431,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         let store_replica = Arc::clone(&store);
-        let promote_flag_replica = Arc::clone(&promote_flag);
         let persistence_replica = Arc::clone(&persistence);
         let initial_offset = recovered_replica_identity
             .map(|_| recovery.last_sequence)
@@ -6223,11 +6442,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_replica(
                 store_replica,
                 persistence_replica,
-                promote_flag_replica,
                 ReplicaRuntimeConfig {
                     master_addr: addr,
+                    credentials: upstream_credentials,
                     auto_failover,
-                    failover_timeout_secs,
+                    failover_timeout: Duration::from_secs(failover_timeout_secs),
+                    liveness_timeout: REPLICATION_IDLE_TIMEOUT,
                     initial_replid,
                     initial_offset,
                 },
@@ -6314,10 +6534,17 @@ enum ReplicaSyncHandshake {
 
 struct ReplicaRuntimeConfig {
     master_addr: String,
+    credentials: Option<UpstreamCredentials>,
     auto_failover: bool,
-    failover_timeout_secs: u64,
+    failover_timeout: Duration,
+    liveness_timeout: Duration,
     initial_replid: u64,
     initial_offset: u64,
+}
+
+struct UpstreamCredentials {
+    username: String,
+    password: String,
 }
 
 fn parse_replica_sync_handshake(
@@ -6396,21 +6623,21 @@ async fn maybe_auto_promote_replica(
     persistence: &Arc<Persistence>,
     unreachable_since: &Option<std::time::Instant>,
     auto_failover: bool,
-    failover_timeout_secs: u64,
+    failover_timeout: Duration,
 ) -> bool {
     if !auto_failover
         || !matches!(
             unreachable_since,
-            Some(since) if since.elapsed().as_secs() >= failover_timeout_secs
+            Some(since) if since.elapsed() >= failover_timeout
         )
     {
         return false;
     }
-    match prepare_replica_promotion(persistence).await {
+    match commit_replica_promotion(persistence).await {
         Ok(()) => {
             warn!(
                 "Master unreachable for over {}s: self-promoting the durably synchronized replica",
-                failover_timeout_secs
+                failover_timeout.as_secs()
             );
             true
         }
@@ -6424,16 +6651,85 @@ async fn maybe_auto_promote_replica(
     }
 }
 
+async fn await_or_stop<T>(
+    stop_rx: &mut tokio::sync::watch::Receiver<bool>,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if *stop_rx.borrow() {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        _ = stop_rx.wait_for(|stop| *stop) => None,
+        output = future => Some(output),
+    }
+}
+
+fn encode_upstream_auth(credentials: &UpstreamCredentials) -> String {
+    let mut encoded = String::new();
+    RESPValue::Array(vec![
+        RESPValue::BulkString(Some("AUTH".to_string())),
+        RESPValue::BulkString(Some(credentials.username.clone())),
+        RESPValue::BulkString(Some(credentials.password.clone())),
+    ])
+    .encode_into(&mut encoded);
+    encoded
+}
+
+fn upstream_failure_counts_as_unreachable(error: &std::io::Error) -> bool {
+    error.kind() != std::io::ErrorKind::InvalidData
+}
+
+fn upstream_io_persistence_error(context: &str, error: std::io::Error) -> PersistenceError {
+    let message = format!("{}: {}", context, error);
+    if upstream_failure_counts_as_unreachable(&error) {
+        PersistenceError::upstream_unavailable(message)
+    } else {
+        PersistenceError::new(message)
+    }
+}
+
+fn is_authentication_rejection(frame: &[String]) -> bool {
+    frame.first().is_some_and(|value| {
+        value.eq_ignore_ascii_case("-NOAUTH") || value.eq_ignore_ascii_case("-WRONGPASS")
+    })
+}
+
+fn parse_upstream_heartbeat(
+    frame: &[String],
+    installed_sequence: u64,
+) -> Result<bool, PersistenceError> {
+    if frame.first().map(String::as_str) != Some("REPLCONF") {
+        return Ok(false);
+    }
+    if frame.len() != 3 || frame[1] != "PING" {
+        return Err(PersistenceError::new(
+            "Master sent a malformed replication heartbeat",
+        ));
+    }
+    let heartbeat_sequence = frame[2]
+        .parse::<u64>()
+        .map_err(|_| PersistenceError::new("Master sent an invalid heartbeat sequence"))?;
+    if heartbeat_sequence != installed_sequence {
+        return Err(PersistenceError::new(format!(
+            "Replication heartbeat sequence mismatch: installed {}, received {}",
+            installed_sequence, heartbeat_sequence
+        )));
+    }
+    Ok(true)
+}
+
 async fn run_replica(
     store: Arc<ShardedStore>,
     persistence: Arc<Persistence>,
-    promote_flag: Arc<AtomicBool>,
     config: ReplicaRuntimeConfig,
 ) {
     let ReplicaRuntimeConfig {
         master_addr,
+        credentials,
         auto_failover,
-        failover_timeout_secs,
+        failover_timeout,
+        liveness_timeout,
         initial_replid,
         initial_offset,
     } = config;
@@ -6443,55 +6739,213 @@ async fn run_replica(
     let local_offset = Arc::new(AtomicU64::new(initial_offset));
     let local_replid = Arc::new(AtomicU64::new(initial_replid));
     let mut unreachable_since: Option<std::time::Instant> = None;
+    let lifecycle = Arc::clone(&persistence.replica_lifecycle);
+    lifecycle.mark_running();
+    let _run_guard = ReplicaRunGuard(Arc::clone(&lifecycle));
+    let mut stop_rx = lifecycle.subscribe_stop();
 
     loop {
-        if promote_flag.load(Ordering::SeqCst) {
-            info!("Promotion to master complete, disconnecting from the previous master");
+        if lifecycle.stop_requested() {
+            info!("Replica lifecycle stopped before reconnecting to the former upstream");
             return;
         }
         info!("Connecting to master {}...", master_addr);
 
-        match TcpStream::connect(&master_addr).await {
+        let Some(connection) = await_or_stop(&mut stop_rx, TcpStream::connect(&master_addr)).await
+        else {
+            return;
+        };
+        match connection {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
                 let (reader, mut writer) = stream.into_split();
                 let mut buf_reader = TokioBufReader::with_capacity(65536, reader);
                 let mut scratch = Vec::new();
 
+                if let Some(credentials) = credentials.as_ref() {
+                    let auth_command = encode_upstream_auth(credentials);
+                    let Some(auth_write) =
+                        await_or_stop(&mut stop_rx, writer.write_all(auth_command.as_bytes()))
+                            .await
+                    else {
+                        return;
+                    };
+                    if auth_write.is_err() {
+                        warn!(
+                            "Unable to send upstream authentication, retrying in {}s",
+                            backoff_secs
+                        );
+                        unreachable_since.get_or_insert_with(std::time::Instant::now);
+                        drop(buf_reader);
+                        drop(writer);
+                        if maybe_auto_promote_replica(
+                            &persistence,
+                            &unreachable_since,
+                            auto_failover,
+                            failover_timeout,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        if await_or_stop(
+                            &mut stop_rx,
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)),
+                        )
+                        .await
+                        .is_none()
+                        {
+                            return;
+                        }
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                        continue;
+                    }
+
+                    let Some(auth_reply) = await_or_stop(
+                        &mut stop_rx,
+                        read_replication_command_with_idle(
+                            &mut buf_reader,
+                            &mut scratch,
+                            liveness_timeout,
+                        ),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    let authenticated = match auth_reply {
+                        Ok(Some(reply))
+                            if reply.len() == 1 && reply[0].eq_ignore_ascii_case("+OK") =>
+                        {
+                            true
+                        }
+                        Ok(Some(_)) => {
+                            warn!(
+                                "Upstream authentication was rejected; automatic failover remains disabled for this reachable master"
+                            );
+                            unreachable_since = None;
+                            false
+                        }
+                        Ok(None) => {
+                            warn!(
+                                "Master disconnected during upstream authentication, retrying in {}s",
+                                backoff_secs
+                            );
+                            unreachable_since.get_or_insert_with(std::time::Instant::now);
+                            false
+                        }
+                        Err(error) => {
+                            warn!(
+                                "Unable to read the upstream authentication response, retrying in {}s",
+                                backoff_secs
+                            );
+                            if upstream_failure_counts_as_unreachable(&error) {
+                                unreachable_since.get_or_insert_with(std::time::Instant::now);
+                            } else {
+                                unreachable_since = None;
+                            }
+                            false
+                        }
+                    };
+                    if authenticated {
+                        backoff_secs = MIN_BACKOFF_SECS;
+                    } else {
+                        drop(buf_reader);
+                        drop(writer);
+                        if maybe_auto_promote_replica(
+                            &persistence,
+                            &unreachable_since,
+                            auto_failover,
+                            failover_timeout,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        if await_or_stop(
+                            &mut stop_rx,
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)),
+                        )
+                        .await
+                        .is_none()
+                        {
+                            return;
+                        }
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                        continue;
+                    }
+                }
+
                 let starting_offset = local_offset.load(Ordering::SeqCst);
                 let known_replid = local_replid.load(Ordering::SeqCst);
-                let sync_cmd = format!("SYNC3 {} {}\r\n", known_replid, starting_offset);
-                if writer.write_all(sync_cmd.as_bytes()).await.is_err() {
+                let sync_cmd = format!("SYNC3 {} {} HEARTBEAT\r\n", known_replid, starting_offset);
+                let Some(sync_write) =
+                    await_or_stop(&mut stop_rx, writer.write_all(sync_cmd.as_bytes())).await
+                else {
+                    return;
+                };
+                if sync_write.is_err() {
                     warn!(
                         "Failed to send SYNC3 to master, retrying in {}s",
                         backoff_secs
                     );
                     unreachable_since.get_or_insert_with(std::time::Instant::now);
+                    drop(buf_reader);
+                    drop(writer);
                     if maybe_auto_promote_replica(
                         &persistence,
                         &unreachable_since,
                         auto_failover,
-                        failover_timeout_secs,
+                        failover_timeout,
                     )
                     .await
                     {
                         return;
                     }
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    if await_or_stop(
+                        &mut stop_rx,
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)),
+                    )
+                    .await
+                    .is_none()
+                    {
+                        return;
+                    }
                     backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                     continue;
                 }
 
-                let handshake = match read_replication_command(&mut buf_reader, &mut scratch).await
-                {
+                let Some(handshake_read) = await_or_stop(
+                    &mut stop_rx,
+                    read_replication_command_with_idle(
+                        &mut buf_reader,
+                        &mut scratch,
+                        liveness_timeout,
+                    ),
+                )
+                .await
+                else {
+                    return;
+                };
+                let mut handshake_was_unavailable = false;
+                let handshake_reached_eof = matches!(&handshake_read, Ok(None));
+                let handshake = match handshake_read {
+                    Ok(Some(marker)) if is_authentication_rejection(&marker) => {
+                        Err(PersistenceError::new(
+                            "Master requires valid upstream replication credentials",
+                        ))
+                    }
                     Ok(Some(marker)) => parse_replica_sync_handshake(&marker),
                     Ok(None) => Err(PersistenceError::new(
                         "Master disconnected before the replication handshake",
                     )),
-                    Err(error) => Err(PersistenceError::new(format!(
-                        "Unable to read the replication handshake: {}",
-                        error
-                    ))),
+                    Err(error) => {
+                        handshake_was_unavailable = upstream_failure_counts_as_unreachable(&error);
+                        Err(PersistenceError::new(format!(
+                            "Unable to read the replication handshake: {}",
+                            error
+                        )))
+                    }
                 };
                 let handshake = match handshake {
                     Ok(handshake) => handshake,
@@ -6500,18 +6954,32 @@ async fn run_replica(
                             "Replication handshake failed: {}; retrying in {}s",
                             error, backoff_secs
                         );
-                        unreachable_since.get_or_insert_with(std::time::Instant::now);
+                        if handshake_was_unavailable || handshake_reached_eof {
+                            unreachable_since.get_or_insert_with(std::time::Instant::now);
+                        } else {
+                            unreachable_since = None;
+                        }
+                        drop(buf_reader);
+                        drop(writer);
                         if maybe_auto_promote_replica(
                             &persistence,
                             &unreachable_since,
                             auto_failover,
-                            failover_timeout_secs,
+                            failover_timeout,
                         )
                         .await
                         {
                             return;
                         }
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        if await_or_stop(
+                            &mut stop_rx,
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)),
+                        )
+                        .await
+                        .is_none()
+                        {
+                            return;
+                        }
                         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                         continue;
                     }
@@ -6526,8 +6994,18 @@ async fn run_replica(
                     warn!(
                         "Master returned a partial synchronization boundary that does not match the request"
                     );
-                    unreachable_since.get_or_insert_with(std::time::Instant::now);
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    unreachable_since = None;
+                    drop(buf_reader);
+                    drop(writer);
+                    if await_or_stop(
+                        &mut stop_rx,
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)),
+                    )
+                    .await
+                    .is_none()
+                    {
+                        return;
+                    }
                     backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                     continue;
                 }
@@ -6538,8 +7016,18 @@ async fn run_replica(
                             "Unable to begin full synchronization safely: {}; retrying in {}s",
                             error, backoff_secs
                         );
-                        unreachable_since.get_or_insert_with(std::time::Instant::now);
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        unreachable_since = None;
+                        drop(buf_reader);
+                        drop(writer);
+                        if await_or_stop(
+                            &mut stop_rx,
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)),
+                        )
+                        .await
+                        .is_none()
+                        {
+                            return;
+                        }
                         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                         continue;
                     }
@@ -6557,17 +7045,33 @@ async fn run_replica(
                 // During a full transfer this remains the previous durable
                 // boundary until the replacement snapshot is committed.
                 let ack_offset = Arc::clone(&local_offset);
-                let ack_task = tokio::spawn(async move {
+                let mut ack_stop_rx = lifecycle.subscribe_stop();
+                let ack_task = AbortTaskOnDrop::new(tokio::spawn(async move {
                     loop {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        if await_or_stop(
+                            &mut ack_stop_rx,
+                            tokio::time::sleep(Duration::from_secs(1)),
+                        )
+                        .await
+                        .is_none()
+                        {
+                            break;
+                        }
                         let off = ack_offset.load(Ordering::SeqCst);
                         let ack_cmd = format!("REPLCONF ACK {}\r\n", off);
-                        if writer.write_all(ack_cmd.as_bytes()).await.is_err() {
+                        let Some(write_result) =
+                            await_or_stop(&mut ack_stop_rx, writer.write_all(ack_cmd.as_bytes()))
+                                .await
+                        else {
+                            break;
+                        };
+                        if write_result.is_err() {
                             break;
                         }
                     }
-                });
+                }));
 
+                let mut initial_failure_unavailable = false;
                 let initial_sync_result: Result<(u64, u64), PersistenceError> = async {
                     match handshake {
                     ReplicaSyncHandshake::Full {
@@ -6579,14 +7083,22 @@ async fn run_replica(
                         let mut seen_keys = std::collections::HashSet::new();
                         let mut receive_result = Ok(());
                         for _ in 0..entry_count {
-                            let (key, entry) = match read_full_sync_entry(
-                                &mut buf_reader,
-                                &mut scratch,
+                            let Some(entry_result) = await_or_stop(
+                                &mut stop_rx,
+                                read_full_sync_entry(&mut buf_reader, &mut scratch),
                             )
                             .await
-                            {
+                            else {
+                                receive_result = Err(PersistenceError::new(
+                                    "Replica lifecycle stopped during full synchronization",
+                                ));
+                                break;
+                            };
+                            let (key, entry) = match entry_result {
                                 Ok(entry) => entry,
                                 Err(error) => {
+                                    initial_failure_unavailable =
+                                        error.indicates_upstream_unavailable();
                                     receive_result = Err(PersistenceError::new(format!(
                                         "Master sent an invalid full synchronization entry: {}",
                                         error
@@ -6605,15 +7117,36 @@ async fn run_replica(
                         if let Err(error) = receive_result {
                             Err(error)
                         } else {
-                            let done = match read_replication_command(&mut buf_reader, &mut scratch).await {
+                            let done_read = await_or_stop(
+                                &mut stop_rx,
+                                read_replication_command_with_idle(
+                                    &mut buf_reader,
+                                    &mut scratch,
+                                    liveness_timeout,
+                                ),
+                            )
+                            .await
+                            .ok_or_else(|| {
+                                PersistenceError::new(
+                                    "Replica lifecycle stopped before full synchronization completed",
+                                )
+                            })?;
+                            let done = match done_read {
                                 Ok(Some(marker)) => parse_replica_sync_done(&marker, replid),
-                                Ok(None) => Err(PersistenceError::new(
-                                    "Master disconnected before completing full synchronization",
-                                )),
-                                Err(error) => Err(PersistenceError::new(format!(
-                                    "Unable to read full synchronization completion: {}",
-                                    error
-                                ))),
+                                Ok(None) => {
+                                    initial_failure_unavailable = true;
+                                    Err(PersistenceError::new(
+                                        "Master disconnected before completing full synchronization",
+                                    ))
+                                }
+                                Err(error) => {
+                                    initial_failure_unavailable =
+                                        upstream_failure_counts_as_unreachable(&error);
+                                    Err(PersistenceError::new(format!(
+                                        "Unable to read full synchronization completion: {}",
+                                        error
+                                    )))
+                                }
                             }?;
                             if done != sequence {
                                 Err(PersistenceError::new(
@@ -6642,14 +7175,31 @@ async fn run_replica(
                         replid,
                         requested_sequence: _,
                     } => loop {
-                        let frame = match read_replication_command(&mut buf_reader, &mut scratch).await {
+                        let Some(frame_result) = await_or_stop(
+                            &mut stop_rx,
+                            read_replication_command_with_idle(
+                                &mut buf_reader,
+                                &mut scratch,
+                                liveness_timeout,
+                            ),
+                        )
+                        .await
+                        else {
+                            break Err(PersistenceError::new(
+                                "Replica lifecycle stopped during partial synchronization",
+                            ));
+                        };
+                        let frame = match frame_result {
                             Ok(Some(frame)) => frame,
                             Ok(None) => {
+                                initial_failure_unavailable = true;
                                 break Err(PersistenceError::new(
                                     "Master disconnected during partial synchronization",
                                 ));
                             }
                             Err(error) => {
+                                initial_failure_unavailable =
+                                    upstream_failure_counts_as_unreachable(&error);
                                 break Err(PersistenceError::new(format!(
                                     "Unable to read partial synchronization data: {}",
                                     error
@@ -6667,8 +7217,24 @@ async fn run_replica(
                             info!("Completed partial synchronization at sequence {}", done);
                             break Ok((replid, done));
                         }
-                        let (effect_sequence, batch) =
-                            read_replication_effect(&frame, &mut buf_reader, &mut scratch).await?;
+                        let Some(effect_result) = await_or_stop(
+                            &mut stop_rx,
+                            read_replication_effect(&frame, &mut buf_reader, &mut scratch),
+                        )
+                        .await
+                        else {
+                            break Err(PersistenceError::new(
+                                "Replica lifecycle stopped while receiving a partial effect",
+                            ));
+                        };
+                        let (effect_sequence, batch) = match effect_result {
+                            Ok(effect) => effect,
+                            Err(error) => {
+                                initial_failure_unavailable =
+                                    error.indicates_upstream_unavailable();
+                                break Err(error);
+                            }
+                        };
                         persist_and_apply_replica_effect(
                             &store,
                             &persistence,
@@ -6686,19 +7252,35 @@ async fn run_replica(
                     Ok(boundary) => boundary,
                     Err(error) => {
                         warn!("Initial replication synchronization failed: {}", error);
-                        ack_task.abort();
-                        unreachable_since.get_or_insert_with(std::time::Instant::now);
+                        ack_task.abort_and_wait().await;
+                        drop(buf_reader);
+                        if lifecycle.stop_requested() {
+                            return;
+                        }
+                        if initial_failure_unavailable {
+                            unreachable_since.get_or_insert_with(std::time::Instant::now);
+                        } else {
+                            unreachable_since = None;
+                        }
                         if maybe_auto_promote_replica(
                             &persistence,
                             &unreachable_since,
                             auto_failover,
-                            failover_timeout_secs,
+                            failover_timeout,
                         )
                         .await
                         {
                             return;
                         }
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        if await_or_stop(
+                            &mut stop_rx,
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)),
+                        )
+                        .await
+                        .is_none()
+                        {
+                            return;
+                        }
                         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                         continue;
                     }
@@ -6707,28 +7289,50 @@ async fn run_replica(
                 local_offset.store(stream_offset, Ordering::SeqCst);
 
                 loop {
-                    if promote_flag.load(Ordering::SeqCst) {
-                        info!("Master promotion completed, disconnecting from the previous master");
-                        ack_task.abort();
-                        return;
-                    }
-                    match read_replication_command(&mut buf_reader, &mut scratch).await {
+                    let Some(frame_result) = await_or_stop(
+                        &mut stop_rx,
+                        read_replication_command_with_idle(
+                            &mut buf_reader,
+                            &mut scratch,
+                            liveness_timeout,
+                        ),
+                    )
+                    .await
+                    else {
+                        break;
+                    };
+                    match frame_result {
                         Ok(Some(frame)) if !frame.is_empty() => {
-                            if promote_flag.load(Ordering::SeqCst) {
-                                ack_task.abort();
-                                return;
-                            }
-                            let (effect_sequence, batch) = match read_replication_effect(
+                            match parse_upstream_heartbeat(
                                 &frame,
-                                &mut buf_reader,
-                                &mut scratch,
+                                local_offset.load(Ordering::SeqCst),
+                            ) {
+                                Ok(true) => continue,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    warn!("Master sent an invalid heartbeat: {}", error);
+                                    unreachable_since = None;
+                                    break;
+                                }
+                            }
+                            let Some(effect_result) = await_or_stop(
+                                &mut stop_rx,
+                                read_replication_effect(&frame, &mut buf_reader, &mut scratch),
                             )
                             .await
-                            {
+                            else {
+                                break;
+                            };
+                            let (effect_sequence, batch) = match effect_result {
                                 Ok(effect) => effect,
                                 Err(error) => {
                                     warn!("Master sent an invalid replication effect: {}", error);
-                                    unreachable_since.get_or_insert_with(std::time::Instant::now);
+                                    if error.indicates_upstream_unavailable() {
+                                        unreachable_since
+                                            .get_or_insert_with(std::time::Instant::now);
+                                    } else {
+                                        unreachable_since = None;
+                                    }
                                     break;
                                 }
                             };
@@ -6741,6 +7345,7 @@ async fn run_replica(
                             .await
                             {
                                 warn!("Unable to install replicated effect: {}", error);
+                                unreachable_since = None;
                                 break;
                             }
                             local_offset.store(effect_sequence, Ordering::SeqCst);
@@ -6756,17 +7361,26 @@ async fn run_replica(
                                 "Error reading from master: {}; retrying in {}s",
                                 error, backoff_secs
                             );
-                            unreachable_since.get_or_insert_with(std::time::Instant::now);
+                            if upstream_failure_counts_as_unreachable(&error) {
+                                unreachable_since.get_or_insert_with(std::time::Instant::now);
+                            } else {
+                                unreachable_since = None;
+                            }
                             break;
                         }
                     }
                 }
-                ack_task.abort();
+                ack_task.abort_and_wait().await;
+                drop(buf_reader);
+                if lifecycle.stop_requested() {
+                    info!("Former upstream connection closed before promotion");
+                    return;
+                }
                 if maybe_auto_promote_replica(
                     &persistence,
                     &unreachable_since,
                     auto_failover,
-                    failover_timeout_secs,
+                    failover_timeout,
                 )
                 .await
                 {
@@ -6783,7 +7397,7 @@ async fn run_replica(
                     &persistence,
                     &unreachable_since,
                     auto_failover,
-                    failover_timeout_secs,
+                    failover_timeout,
                 )
                 .await
                 {
@@ -6792,7 +7406,15 @@ async fn run_replica(
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        if await_or_stop(
+            &mut stop_rx,
+            tokio::time::sleep(Duration::from_secs(backoff_secs)),
+        )
+        .await
+        .is_none()
+        {
+            return;
+        }
         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
     }
 }
@@ -6857,6 +7479,7 @@ mod tests {
             failure: std::sync::Mutex::new(None),
             upstream_replid: AtomicU64::new(0),
             replication_ready: AtomicBool::new(false),
+            replica_lifecycle: Arc::new(ReplicaLifecycle::new(true)),
             accepting_writes: AtomicBool::new(true),
             visibility_gate: tokio::sync::RwLock::new(()),
             write_gate: tokio::sync::Mutex::new(()),
@@ -8203,6 +8826,323 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_promotion_cancels_a_blocked_upstream_read() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 7).await;
+        persistence.upstream_replid.store(123, Ordering::SeqCst);
+        persistence.replication_ready.store(true, Ordering::SeqCst);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let master_addr = listener.local_addr().unwrap().to_string();
+        let (streaming_tx, streaming_rx) = oneshot::channel();
+        let master = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut scratch = Vec::new();
+            let request = read_replication_command(&mut reader, &mut scratch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request, vec!["SYNC3", "123", "7", "HEARTBEAT"]);
+            writer
+                .write_all(b"+CONTINUE3 123 7\r\n+SYNCDONE3 123 7\r\n")
+                .await
+                .unwrap();
+            streaming_tx.send(()).unwrap();
+            let mut byte = [0u8; 1];
+            while reader.read(&mut byte).await.unwrap_or(0) != 0 {}
+        });
+
+        let replica_store = Arc::new(ShardedStore::new());
+        let mut replica = tokio::spawn(run_replica(
+            replica_store,
+            Arc::clone(&persistence),
+            ReplicaRuntimeConfig {
+                master_addr,
+                credentials: None,
+                auto_failover: false,
+                failover_timeout: Duration::from_secs(30),
+                liveness_timeout: Duration::from_secs(30),
+                initial_replid: 123,
+                initial_offset: 7,
+            },
+        ));
+        streaming_rx.await.unwrap();
+        prepare_replica_promotion(&persistence).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut replica)
+                .await
+                .is_ok(),
+            "promotion left the replica task blocked on the former upstream"
+        );
+        tokio::time::timeout(Duration::from_millis(200), master)
+            .await
+            .expect("the former upstream connection remained open")
+            .unwrap();
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_authentication_preserves_boundaries_and_precedes_sync() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 7).await;
+        persistence.upstream_replid.store(123, Ordering::SeqCst);
+        persistence.replication_ready.store(true, Ordering::SeqCst);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let master_addr = listener.local_addr().unwrap().to_string();
+        let (synchronized_tx, synchronized_rx) = oneshot::channel();
+        let master = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut scratch = Vec::new();
+            let auth = read_replication_command(&mut reader, &mut scratch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                auth,
+                vec!["AUTH", "replica user", "secret\r\nSYNC3 0 0 HEARTBEAT"]
+            );
+            writer.write_all(b"+OK\r\n").await.unwrap();
+            let sync = read_replication_command(&mut reader, &mut scratch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sync, vec!["SYNC3", "123", "7", "HEARTBEAT"]);
+            writer
+                .write_all(b"+CONTINUE3 123 7\r\n+SYNCDONE3 123 7\r\n")
+                .await
+                .unwrap();
+            synchronized_tx.send(()).unwrap();
+            let mut byte = [0u8; 1];
+            while reader.read(&mut byte).await.unwrap_or(0) != 0 {}
+        });
+
+        let replica = tokio::spawn(run_replica(
+            Arc::new(ShardedStore::new()),
+            Arc::clone(&persistence),
+            ReplicaRuntimeConfig {
+                master_addr,
+                credentials: Some(UpstreamCredentials {
+                    username: "replica user".to_string(),
+                    password: "secret\r\nSYNC3 0 0 HEARTBEAT".to_string(),
+                }),
+                auto_failover: false,
+                failover_timeout: Duration::from_secs(30),
+                liveness_timeout: Duration::from_secs(30),
+                initial_replid: 123,
+                initial_offset: 7,
+            },
+        ));
+        synchronized_rx.await.unwrap();
+        persistence.replica_lifecycle.stop_and_wait().await.unwrap();
+        replica.await.unwrap();
+        master.await.unwrap();
+        assert!(!persistence.promote_to_master.load(Ordering::SeqCst));
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_rejection_never_triggers_auto_failover() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 7).await;
+        persistence.upstream_replid.store(123, Ordering::SeqCst);
+        persistence.replication_ready.store(true, Ordering::SeqCst);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let master_addr = listener.local_addr().unwrap().to_string();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let master = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut scratch = Vec::new();
+            let auth = read_replication_command(&mut reader, &mut scratch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(auth.first().map(String::as_str), Some("AUTH"));
+            writer
+                .write_all(b"-WRONGPASS invalid username or password\r\n")
+                .await
+                .unwrap();
+            let mut byte = [0u8; 1];
+            while reader.read(&mut byte).await.unwrap_or(0) != 0 {}
+            closed_tx.send(()).unwrap();
+        });
+
+        let replica = tokio::spawn(run_replica(
+            Arc::new(ShardedStore::new()),
+            Arc::clone(&persistence),
+            ReplicaRuntimeConfig {
+                master_addr,
+                credentials: Some(UpstreamCredentials {
+                    username: "replica".to_string(),
+                    password: "wrong".to_string(),
+                }),
+                auto_failover: true,
+                failover_timeout: Duration::ZERO,
+                liveness_timeout: Duration::from_secs(1),
+                initial_replid: 123,
+                initial_offset: 7,
+            },
+        ));
+        closed_rx.await.unwrap();
+        assert!(!persistence.promote_to_master.load(Ordering::SeqCst));
+        persistence.replica_lifecycle.stop_and_wait().await.unwrap();
+        replica.await.unwrap();
+        master.await.unwrap();
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn silent_connected_master_is_failed_over_after_the_liveness_deadline() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 7).await;
+        persistence.upstream_replid.store(123, Ordering::SeqCst);
+        persistence.replication_ready.store(true, Ordering::SeqCst);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let master_addr = listener.local_addr().unwrap().to_string();
+        let (streaming_tx, streaming_rx) = oneshot::channel();
+        let master = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut scratch = Vec::new();
+            let sync = read_replication_command(&mut reader, &mut scratch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sync, vec!["SYNC3", "123", "7", "HEARTBEAT"]);
+            writer
+                .write_all(b"+CONTINUE3 123 7\r\n+SYNCDONE3 123 7\r\n")
+                .await
+                .unwrap();
+            streaming_tx.send(()).unwrap();
+            let mut byte = [0u8; 1];
+            while reader.read(&mut byte).await.unwrap_or(0) != 0 {}
+        });
+
+        let replica = tokio::spawn(run_replica(
+            Arc::new(ShardedStore::new()),
+            Arc::clone(&persistence),
+            ReplicaRuntimeConfig {
+                master_addr,
+                credentials: None,
+                auto_failover: true,
+                failover_timeout: Duration::ZERO,
+                liveness_timeout: Duration::from_millis(50),
+                initial_replid: 123,
+                initial_offset: 7,
+            },
+        ));
+        streaming_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), replica)
+            .await
+            .expect("silent upstream did not trigger deterministic failover")
+            .unwrap();
+        master.await.unwrap();
+        assert!(persistence.promote_to_master.load(Ordering::SeqCst));
+        assert!(!persistence.replication_ready.load(Ordering::SeqCst));
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn valid_heartbeats_keep_an_idle_replication_stream_live() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 7).await;
+        persistence.upstream_replid.store(123, Ordering::SeqCst);
+        persistence.replication_ready.store(true, Ordering::SeqCst);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let master_addr = listener.local_addr().unwrap().to_string();
+        let (heartbeats_tx, heartbeats_rx) = oneshot::channel();
+        let master = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut scratch = Vec::new();
+            let sync = read_replication_command(&mut reader, &mut scratch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sync, vec!["SYNC3", "123", "7", "HEARTBEAT"]);
+            writer
+                .write_all(b"+CONTINUE3 123 7\r\n+SYNCDONE3 123 7\r\n")
+                .await
+                .unwrap();
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                writer.write_all(b"REPLCONF PING 7\r\n").await.unwrap();
+            }
+            heartbeats_tx.send(()).unwrap();
+            let mut byte = [0u8; 1];
+            while reader.read(&mut byte).await.unwrap_or(0) != 0 {}
+        });
+
+        let replica = tokio::spawn(run_replica(
+            Arc::new(ShardedStore::new()),
+            Arc::clone(&persistence),
+            ReplicaRuntimeConfig {
+                master_addr,
+                credentials: None,
+                auto_failover: true,
+                failover_timeout: Duration::ZERO,
+                liveness_timeout: Duration::from_millis(100),
+                initial_replid: 123,
+                initial_offset: 7,
+            },
+        ));
+        heartbeats_rx.await.unwrap();
+        assert!(!persistence.promote_to_master.load(Ordering::SeqCst));
+        persistence.replica_lifecycle.stop_and_wait().await.unwrap();
+        replica.await.unwrap();
+        master.await.unwrap();
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[test]
+    fn replication_heartbeat_is_sequence_bound() {
+        assert!(
+            parse_upstream_heartbeat(
+                &["REPLCONF".to_string(), "PING".to_string(), "9".to_string()],
+                9,
+            )
+            .unwrap()
+        );
+        assert!(
+            parse_upstream_heartbeat(
+                &["REPLCONF".to_string(), "PING".to_string(), "8".to_string()],
+                9,
+            )
+            .is_err()
+        );
+        assert!(!parse_upstream_heartbeat(&["EFFECT3".to_string()], 9).unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_replica_lifecycle_cannot_claim_quiescence() {
+        let lifecycle = ReplicaLifecycle::new(false);
+        lifecycle.mark_failed();
+        assert!(lifecycle.stop_and_wait().await.is_err());
+    }
+
+    #[tokio::test]
     async fn accepting_full_resync_invalidates_the_previous_promotable_identity() {
         let directory = TestPersistenceDirectory::new();
         write_replica_identity(
@@ -8226,6 +9166,37 @@ mod tests {
             Some(DurableReplicaState::Installing)
         );
         assert!(prepare_replica_promotion(&persistence).await.is_err());
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn promotion_intent_prevents_a_new_full_sync_from_invalidating_ready_state() {
+        let directory = TestPersistenceDirectory::new();
+        write_replica_identity(
+            &directory.paths,
+            ReplicaIdentity {
+                replid: 81,
+                baseline_sequence: 12,
+            },
+        )
+        .unwrap();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 12).await;
+        persistence.upstream_replid.store(81, Ordering::SeqCst);
+        persistence.replication_ready.store(true, Ordering::SeqCst);
+        persistence.replica_lifecycle.request_stop();
+
+        assert!(begin_full_sync_reception(&persistence).await.is_err());
+        assert!(persistence.replication_ready.load(Ordering::SeqCst));
+        assert_eq!(persistence.upstream_replid.load(Ordering::SeqCst), 81);
+        assert_eq!(
+            load_durable_replica_state(&directory.paths, 12).unwrap(),
+            Some(DurableReplicaState::Ready(ReplicaIdentity {
+                replid: 81,
+                baseline_sequence: 12,
+            }))
+        );
 
         drop(persistence);
         worker.await.unwrap();
