@@ -11,8 +11,8 @@ use protocol::OBPFrame;
 use resp::{RESPValue, read_command};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader as StdBufReader, BufWriter, Write};
-use std::path::Path;
+use std::io::{BufRead, BufReader as StdBufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,7 +20,7 @@ use tokio::io::{
     AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter as TokioBufWriter,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 // 1. ALLOCATORE DI MEMORIA AD ALTE PRESTAZIONI
@@ -28,9 +28,63 @@ use tracing::{error, info, warn};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const SNAPSHOT_PATH: &str = "onyx.snapshot";
-const LOG_PATH: &str = "onyx.log";
+const BINLOG_PATH: &str = "onyx.binlog";
+const SNAPSHOT_MAGIC: &str = "ONYXSNAP";
+const SNAPSHOT_VERSION: u8 = 2;
+const BINLOG_RECORD_MAGIC: &[u8; 4] = b"ONX3";
+const PREVIOUS_BINLOG_RECORD_MAGIC: &[u8; 4] = b"ONX2";
+const MAX_BINLOG_RECORD_SIZE: usize = 512 * 1024 * 1024 + 1024;
+const MAX_SNAPSHOT_METADATA_SIZE: usize = 4096;
+const MAX_SNAPSHOT_LINE_SIZE: usize = 512 * 1024 * 1024 + 1024;
+const MAX_SNAPSHOT_RECORD_SIZE: usize = 512 * 1024 * 1024 + 1024;
 const COMPACTION_THRESHOLD: usize = 100000;
 const MAX_KEYS: usize = 1_000_000;
+
+#[derive(Clone, Debug)]
+struct PersistencePaths {
+    snapshot: PathBuf,
+    snapshot_temp: PathBuf,
+    snapshot_backup: PathBuf,
+    binlog: PathBuf,
+}
+
+impl Default for PersistencePaths {
+    fn default() -> Self {
+        Self {
+            snapshot: PathBuf::from(SNAPSHOT_PATH),
+            snapshot_temp: PathBuf::from(format!("{}.tmp", SNAPSHOT_PATH)),
+            snapshot_backup: PathBuf::from(format!("{}.previous", SNAPSHOT_PATH)),
+            binlog: PathBuf::from(BINLOG_PATH),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PersistenceError {
+    message: String,
+}
+
+impl PersistenceError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PersistenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PersistenceError {}
+
+impl From<std::io::Error> for PersistenceError {
+    fn from(error: std::io::Error) -> Self {
+        Self::new(error.to_string())
+    }
+}
 /// Utenti autorizzati (nome -> password). Nessuna granularità per comando
 /// (quello sarebbe un'altra feature a parte) — qui
 /// è "chi ha una password valida può fare tutto", ma con utenti multipli
@@ -84,17 +138,24 @@ fn fsync_policy() -> FsyncPolicy {
     *FSYNC_POLICY.get().unwrap_or(&FsyncPolicy::EverySec)
 }
 
-/// Apre (o crea) il binlog in append mode, ritentando ogni 3s in caso di
-/// errore I/O invece di far crashare il processo (disco pieno, permessi,
-/// file bloccato da un antivirus, ecc.). Bloccante di proposito: viene
-/// chiamata solo all'avvio e nei rari momenti di compattazione, mai sul
-/// percorso caldo di un comando.
-fn open_binlog_file(path: &str) -> File {
+/// Opens or creates the binlog and retries transient I/O failures every three
+/// seconds. This is intentionally blocking because it runs only at startup.
+fn open_binlog_file(path: &Path) -> File {
     loop {
-        match OpenOptions::new().create(true).append(true).open(path) {
+        match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+        {
             Ok(f) => return f,
             Err(e) => {
-                error!("Unable to open {} ({}). Retrying in 3s...", path, e);
+                error!(
+                    "Unable to open {} ({}). Retrying in 3s...",
+                    path.display(),
+                    e
+                );
                 std::thread::sleep(Duration::from_secs(3));
             }
         }
@@ -173,6 +234,9 @@ pub struct ShardedStore {
     engine: OnyxEngine,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvictionDenied;
+
 impl Default for ShardedStore {
     fn default() -> Self {
         Self::new()
@@ -247,27 +311,30 @@ impl ShardedStore {
             .unwrap_or(-2)
     }
 
-    pub fn incr(&self, key: &str) -> i64 {
+    pub fn incr(&self, key: &str) -> Result<i64, &'static str> {
         self.incrby(key, 1)
     }
 
-    pub fn incrby(&self, key: &str, delta: i64) -> i64 {
-        // Un solo lock per leggi-e-scrivi: prima era get()+set() separati,
-        // quindi due INCR concorrenti sulla stessa chiave potevano leggere lo
-        // stesso valore di partenza e uno dei due incrementi andava perso.
+    pub fn incrby(&self, key: &str, delta: i64) -> Result<i64, &'static str> {
+        // Read, overflow validation, and mutation occur under one engine lock,
+        // so concurrent increments cannot overwrite each other.
         self.engine.update_or_insert(
             Bytes::from(key.to_string()),
             || OnyxValue::Int(0),
             move |v| {
-                let new_val = match v {
-                    OnyxValue::Int(n) => *n + delta,
-                    OnyxValue::Blob(b) => {
-                        String::from_utf8_lossy(b).parse::<i64>().unwrap_or(0) + delta
-                    }
-                    _ => delta,
+                let current = match v {
+                    OnyxValue::Int(n) => *n,
+                    OnyxValue::Blob(b) => std::str::from_utf8(b)
+                        .ok()
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .ok_or("ERR value is not an integer")?,
+                    _ => return Err("ERR value is not an integer"),
                 };
+                let new_val = current
+                    .checked_add(delta)
+                    .ok_or("ERR increment or decrement would overflow")?;
                 *v = OnyxValue::Int(new_val);
-                new_val
+                Ok(new_val)
             },
         )
     }
@@ -837,25 +904,22 @@ impl ShardedStore {
         self.engine.total_memory_bytes()
     }
 
-    /// Se è configurato un `--maxmemory`, prova a liberare spazio secondo la
-    /// policy scelta prima di accettare una scrittura che creerebbe una
-    /// nuova chiave. Ritorna false solo quando la policy è `noeviction` e
-    /// siamo sopra il limite (il comando va rifiutato); true in ogni altro
-    /// caso, incluso "nessun limite configurato".
-    pub fn make_room_for_write(&self) -> bool {
+    /// Applies the configured max-memory policy before a write that may create
+    /// a key. Successful eviction returns the exact removed entries so the
+    /// write coordinator can persist them or restore them after a failure.
+    pub fn make_room_for_write(&self) -> Result<Vec<(Bytes, DataEntry)>, EvictionDenied> {
         let limit = maxmemory_bytes();
         if limit == 0 {
-            return true;
+            return Ok(Vec::new());
         }
         if self.engine.total_memory_bytes() <= limit {
-            return true;
+            return Ok(Vec::new());
         }
         let policy = maxmemory_policy();
         if policy == EvictionPolicy::NoEviction {
-            return false;
+            return Err(EvictionDenied);
         }
-        self.engine.evict_to_fit(limit, policy);
-        true
+        Ok(self.engine.evict_to_fit(limit, policy))
     }
 
     pub fn expire_conditional(&self, key: &str, seconds: u64, condition: &str) -> bool {
@@ -1163,8 +1227,20 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 const BACKLOG_CAPACITY: usize = 10_000;
 
 enum LogMessage {
-    Append(Vec<u8>), // modificato il 07/26 in Vec<u8> (binario)
-    Compact,
+    Append {
+        sequence: u64,
+        record: Vec<u8>,
+        completion: oneshot::Sender<Result<(), String>>,
+    },
+    Flush {
+        completion: oneshot::Sender<Result<(), String>>,
+    },
+    SyncData {
+        completion: oneshot::Sender<Result<(), String>>,
+    },
+    Truncate {
+        completion: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Stato di una Replica connessa, per il monitoraggio del lag.
@@ -1178,10 +1254,13 @@ struct Persistence {
     log_tx: mpsc::Sender<LogMessage>,
     write_count: AtomicUsize,
     compaction_pending: AtomicBool,
+    accepting_writes: AtomicBool,
+    write_gate: tokio::sync::Mutex<()>,
+    paths: PersistencePaths,
     // Canale broadcast: ogni comando di scrittura viene trasmesso a tutte le
     // Replica connesse in tempo reale (in aggiunta al log su disco), taggato
     // con l'offset di replicazione a cui corrisponde.
-    replica_tx: tokio::sync::broadcast::Sender<(u64, String)>,
+    replica_tx: tokio::sync::broadcast::Sender<(u64, CommittedBatch)>,
     // Se true, questa istanza smette di comportarsi da Replica e diventa
     // un Master indipendente (promozione manuale via REPLICAOF NO ONE).
     promote_to_master: Arc<AtomicBool>,
@@ -1193,7 +1272,7 @@ struct Persistence {
     // offset. Usato per il resync parziale: una Replica che si riconnette
     // con un offset ancora presente qui riceve solo i comandi mancanti,
     // invece di un dump completo.
-    backlog: std::sync::Mutex<std::collections::VecDeque<(u64, String)>>,
+    backlog: std::sync::Mutex<std::collections::VecDeque<(u64, CommittedBatch)>>,
     next_replica_id: AtomicU64,
     replica_status: std::sync::Mutex<std::collections::HashMap<u64, ReplicaStatus>>,
     // Pub/Sub: un unico canale broadcast per tutti i canali applicativi
@@ -1207,32 +1286,127 @@ struct Persistence {
     // a PUBLISH il numero di destinatari (Redis fa lo stesso).
     subscriptions:
         std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<u64>>>,
+    failure: std::sync::Mutex<Option<String>>,
+}
+
+fn mark_persistence_failed(persistence: &Persistence, message: impl Into<String>) {
+    let message = message.into();
+    if let Ok(mut failure) = persistence.failure.lock()
+        && failure.is_none()
+    {
+        *failure = Some(message.clone());
+    }
+    persistence.accepting_writes.store(false, Ordering::SeqCst);
+    error!("Persistence entered a failed state: {}", message);
+}
+
+fn persistence_unavailable_message(persistence: &Persistence) -> String {
+    let reason = persistence
+        .failure
+        .lock()
+        .ok()
+        .and_then(|failure| failure.clone());
+    match reason {
+        Some(reason) => format!("MISCONF persistence is unavailable: {}", reason),
+        None => "MISCONF persistence is unavailable".to_string(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PersistentEntry {
+    value: OnyxValue,
+    expires_at: Option<u64>,
+}
+
+impl From<DataEntry> for PersistentEntry {
+    fn from(entry: DataEntry) -> Self {
+        Self {
+            value: entry.value,
+            expires_at: entry.expires_at,
+        }
+    }
+}
+
+impl PersistentEntry {
+    fn into_data_entry(self) -> DataEntry {
+        let timestamp = now();
+        DataEntry {
+            value: self.value,
+            expires_at: self.expires_at,
+            created_at: timestamp,
+            last_accessed: timestamp,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CommittedEffect {
+    Put { key: Bytes, entry: PersistentEntry },
+    Delete { key: Bytes },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CommittedBatch {
+    effects: Vec<CommittedEffect>,
+}
+
+impl CommittedBatch {
+    fn new(effects: Vec<CommittedEffect>) -> Result<Self, PersistenceError> {
+        if effects.is_empty() {
+            return Err(PersistenceError::new(
+                "A committed mutation batch cannot be empty",
+            ));
+        }
+        Ok(Self { effects })
+    }
 }
 
 // ============================================================
 // LOG BINARIO - Formato compatto per operazioni di scrittura
 // ============================================================
+#[cfg(test)]
 const OP_SET: u8 = 1;
+#[cfg(test)]
 const OP_DEL: u8 = 2;
+#[cfg(test)]
 const OP_EXPIRE: u8 = 3;
+#[cfg(test)]
 const OP_L_PUSH: u8 = 4;
+#[cfg(test)]
 const OP_HSET: u8 = 5;
+#[cfg(test)]
 const OP_SADD: u8 = 6;
+#[cfg(test)]
 const OP_RENAME: u8 = 7;
+#[cfg(test)]
 const OP_INCR: u8 = 8;
+#[cfg(test)]
 const OP_DECR: u8 = 9;
+#[cfg(test)]
 const OP_APPEND: u8 = 10;
+#[cfg(test)]
 const OP_HDEL: u8 = 11;
+#[cfg(test)]
 const OP_SREM: u8 = 12;
+#[cfg(test)]
 const OP_COPY: u8 = 13;
+#[cfg(test)]
 const OP_MSET: u8 = 14;
+#[cfg(test)]
 const OP_R_PUSH: u8 = 15;
+#[cfg(test)]
 const OP_LPOP: u8 = 16;
+#[cfg(test)]
 const OP_RPOP: u8 = 17;
+#[cfg(test)]
 const OP_JSON_SET: u8 = 18;
+#[cfg(test)]
 const OP_JSON_DEL: u8 = 19;
+#[cfg(test)]
 const OP_JSON_NUMINCRBY: u8 = 20;
+#[cfg(test)]
 const OP_JSON_ARRAPPEND: u8 = 21;
+#[cfg(test)]
 fn write_u16_be(buf: &mut Vec<u8>, val: u16) {
     buf.push((val >> 8) as u8);
     buf.push(val as u8);
@@ -1262,6 +1436,7 @@ fn write_u64_be(buf: &mut Vec<u8>, val: u64) {
 // recovery all'avvio, dove un binlog danneggiato non deve MAI far
 // crashare il processo — nel peggiore dei casi si perde quel singolo
 // record, non l'intero avvio.
+#[cfg(test)]
 fn read_u16_be(bytes: &[u8], offset: &mut usize) -> Option<u16> {
     if offset.checked_add(2)? > bytes.len() {
         return None;
@@ -1306,7 +1481,70 @@ fn safe_slice(bytes: &[u8], offset: usize, len: usize) -> Option<&[u8]> {
     bytes.get(offset..end)
 }
 
+fn encode_versioned_binlog_record(
+    sequence: u64,
+    effect_record: &[u8],
+) -> Result<Vec<u8>, PersistenceError> {
+    if sequence == 0 {
+        return Err(PersistenceError::new(
+            "Versioned binlog records require a non-zero sequence",
+        ));
+    }
+    let record_length = BINLOG_RECORD_MAGIC
+        .len()
+        .checked_add(8)
+        .and_then(|length| length.checked_add(effect_record.len()))
+        .ok_or_else(|| PersistenceError::new("Binlog record length overflow"))?;
+    if record_length > MAX_BINLOG_RECORD_SIZE {
+        return Err(PersistenceError::new(
+            "Binlog record exceeds the format limit",
+        ));
+    }
+    let mut record = Vec::with_capacity(record_length);
+    record.extend_from_slice(BINLOG_RECORD_MAGIC);
+    write_u64_be(&mut record, sequence);
+    record.extend_from_slice(effect_record);
+    Ok(record)
+}
+
+enum DecodedBinlogRecord<'a> {
+    Versioned { sequence: u64, effects: &'a [u8] },
+}
+
+fn decode_binlog_record(record: &[u8]) -> Result<DecodedBinlogRecord<'_>, PersistenceError> {
+    if !record.starts_with(BINLOG_RECORD_MAGIC) {
+        let format = if record.starts_with(PREVIOUS_BINLOG_RECORD_MAGIC) {
+            "ONX2 command records"
+        } else {
+            "legacy command records"
+        };
+        return Err(PersistenceError::new(format!(
+            "Unsupported unsafe binlog format: {}",
+            format
+        )));
+    }
+
+    let mut offset = BINLOG_RECORD_MAGIC.len();
+    let sequence = read_u64_be(record, &mut offset)
+        .ok_or_else(|| PersistenceError::new("Truncated versioned binlog record header"))?;
+    if sequence == 0 {
+        return Err(PersistenceError::new(
+            "Versioned binlog records must have a non-zero sequence",
+        ));
+    }
+    let effects = record
+        .get(offset..)
+        .ok_or_else(|| PersistenceError::new("Missing committed-effect payload"))?;
+    if effects.is_empty() {
+        return Err(PersistenceError::new(
+            "Versioned binlog record contains an empty committed-effect payload",
+        ));
+    }
+    Ok(DecodedBinlogRecord::Versioned { sequence, effects })
+}
+
 /// Converte un comando + entry in record binario per il log
+#[cfg(test)]
 fn command_to_binary_record(
     cmd: &str,
     args: &[String],
@@ -1597,6 +1835,7 @@ fn command_to_binary_record(
 }
 
 /// Legge un record binario e lo converte in args per execute_command
+#[cfg(test)]
 fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
     if record.is_empty() {
         return None;
@@ -1868,6 +2107,7 @@ fn line_to_entry(line: &str) -> Option<(String, DataEntry)> {
     ))
 }
 
+#[cfg(test)]
 fn value_to_line(key: &str, entry: &DataEntry) -> String {
     let (val_type, val_str): (&str, String) = match &entry.value {
         OnyxValue::Blob(b) => ("STR", String::from_utf8_lossy(b).to_string()),
@@ -1942,6 +2182,112 @@ fn is_write_command(cmd: &str) -> bool {
             | "JSON.ARRAPPEND"
     )
 }
+
+fn persistent_keys_for_command(args: &[String]) -> Vec<Bytes> {
+    let command = args.first().map(String::as_str).unwrap_or("");
+    let mut keys = Vec::new();
+    match command {
+        "MSET" => {
+            let mut index = 1;
+            while index + 1 < args.len() {
+                keys.push(Bytes::copy_from_slice(args[index].as_bytes()));
+                index += 2;
+            }
+        }
+        "RENAME" | "COPY" => {
+            if let Some(key) = args.get(1) {
+                keys.push(Bytes::copy_from_slice(key.as_bytes()));
+            }
+            if let Some(key) = args.get(2) {
+                keys.push(Bytes::copy_from_slice(key.as_bytes()));
+            }
+        }
+        _ if is_write_command(command) => {
+            if let Some(key) = args.get(1) {
+                keys.push(Bytes::copy_from_slice(key.as_bytes()));
+            }
+        }
+        _ => {}
+    }
+
+    let mut unique = std::collections::HashSet::new();
+    keys.retain(|key| unique.insert(key.clone()));
+    keys
+}
+
+fn capture_persistent_entries(
+    store: &ShardedStore,
+    keys: &[Bytes],
+) -> std::collections::HashMap<Bytes, Option<PersistentEntry>> {
+    keys.iter()
+        .map(|key| {
+            (
+                key.clone(),
+                store.engine.peek(key).map(PersistentEntry::from),
+            )
+        })
+        .collect()
+}
+
+fn derive_committed_batch(
+    store: &ShardedStore,
+    keys: &[Bytes],
+    before: &std::collections::HashMap<Bytes, Option<PersistentEntry>>,
+    evicted_entries: &[(Bytes, DataEntry)],
+) -> Option<CommittedBatch> {
+    let mut effects = Vec::new();
+    let mut deleted = std::collections::HashSet::new();
+    for (key, _) in evicted_entries {
+        if deleted.insert(key.clone()) {
+            effects.push(CommittedEffect::Delete { key: key.clone() });
+        }
+    }
+
+    for key in keys {
+        let previous = before.get(key).cloned().flatten();
+        let current = store.engine.peek(key).map(PersistentEntry::from);
+        let was_evicted = deleted.contains(key);
+        if previous == current && !was_evicted {
+            continue;
+        }
+        match current {
+            Some(entry) => effects.push(CommittedEffect::Put {
+                key: key.clone(),
+                entry,
+            }),
+            None if deleted.insert(key.clone()) => {
+                effects.push(CommittedEffect::Delete { key: key.clone() });
+            }
+            None => {}
+        }
+    }
+
+    (!effects.is_empty()).then_some(CommittedBatch { effects })
+}
+
+fn rollback_attempted_mutation(
+    store: &ShardedStore,
+    before: &std::collections::HashMap<Bytes, Option<PersistentEntry>>,
+    evicted_entries: &[(Bytes, DataEntry)],
+) {
+    for (key, previous) in before {
+        match previous {
+            Some(entry) => {
+                store
+                    .engine
+                    .apply_entry(key.clone(), entry.clone().into_data_entry());
+            }
+            None => {
+                store.engine.delete(key);
+            }
+        }
+    }
+    for (key, entry) in evicted_entries {
+        if !before.contains_key(key) {
+            store.engine.apply_entry(key.clone(), entry.clone());
+        }
+    }
+}
 /// Un resync parziale è ammissibile solo se il replication ID richiesto
 /// dalla Replica coincide con quello attuale del Master: garantisce che
 /// stiamo parlando con lo stesso identico processo Master di prima, non
@@ -1959,20 +2305,32 @@ fn partial_resync_possible(
     backlog_oldest: Option<u64>,
     current_repl_offset: u64,
 ) -> bool {
+    if requested_offset > current_repl_offset {
+        return false;
+    }
+    if requested_offset == current_repl_offset {
+        return true;
+    }
     match backlog_oldest {
-        Some(oldest) => oldest <= requested_offset + 1,
-        None => requested_offset == current_repl_offset,
+        Some(oldest) => requested_offset
+            .checked_add(1)
+            .is_some_and(|next_offset| oldest <= next_offset),
+        None => false,
     }
 }
-fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
+
+fn execute_command_with_evictions(
+    store: &ShardedStore,
+    args: &[String],
+) -> (RESPValue, bool, Vec<(Bytes, DataEntry)>) {
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("");
     let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
-    let arg = args.get(2).map(|s| s.as_str()).unwrap_or("");
 
     const CREATE_COMMANDS: &[&str] = &[
         "SET", "LPUSH", "RPUSH", "HSET", "SADD", "MSET", "APPEND", "GETSET", "INCRBY", "DECRBY",
         "INCR", "JSON.SET",
     ];
+    let mut evicted = Vec::new();
     if CREATE_COMMANDS.contains(&cmd) && !key.is_empty() && !store.exists(key) {
         if store.is_full() {
             return (
@@ -1980,17 +2338,36 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
                     "ERR database pieno: limite massimo di chiavi raggiunto".to_string(),
                 ),
                 false,
+                evicted,
             );
         }
-        if !store.make_room_for_write() {
-            return (
-                RESPValue::Error(
-                    "OOM command not allowed when used memory > 'maxmemory'".to_string(),
-                ),
-                false,
-            );
+        match store.make_room_for_write() {
+            Ok(keys) => evicted = keys,
+            Err(EvictionDenied) => {
+                return (
+                    RESPValue::Error(
+                        "OOM command not allowed when used memory > 'maxmemory'".to_string(),
+                    ),
+                    false,
+                    evicted,
+                );
+            }
         }
     }
+
+    let (response, is_write) = execute_command_dispatch(store, args);
+    (response, is_write, evicted)
+}
+
+fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
+    let (response, is_write, _) = execute_command_with_evictions(store, args);
+    (response, is_write)
+}
+
+fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
+    let cmd = args.first().map(|s| s.as_str()).unwrap_or("");
+    let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    let arg = args.get(2).map(|s| s.as_str()).unwrap_or("");
 
     match cmd {
         "SET" if !key.is_empty() && !arg.is_empty() => {
@@ -2078,7 +2455,10 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
             RESPValue::Integer(if store.delete(key) { 1 } else { 0 }),
             true,
         ),
-        "INCR" if !key.is_empty() => (RESPValue::Integer(store.incr(key)), true),
+        "INCR" if !key.is_empty() => match store.incr(key) {
+            Ok(value) => (RESPValue::Integer(value), true),
+            Err(message) => (RESPValue::Error(message.to_string()), false),
+        },
         "LPUSH" if !key.is_empty() && !arg.is_empty() => (
             RESPValue::Integer(store.lpush(key, arg.to_string()) as i64),
             true,
@@ -2345,14 +2725,26 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
             (RESPValue::SimpleString("OK".to_string()), false)
         }
         "INCRBY" if !key.is_empty() && !arg.is_empty() => match arg.parse::<i64>() {
-            Ok(delta) => (RESPValue::Integer(store.incrby(key, delta)), true),
+            Ok(delta) => match store.incrby(key, delta) {
+                Ok(value) => (RESPValue::Integer(value), true),
+                Err(message) => (RESPValue::Error(message.to_string()), false),
+            },
             Err(_) => (
                 RESPValue::Error("ERR value is not an integer".to_string()),
                 false,
             ),
         },
         "DECRBY" if !key.is_empty() && !arg.is_empty() => match arg.parse::<i64>() {
-            Ok(delta) => (RESPValue::Integer(store.incrby(key, -delta)), true),
+            Ok(delta) => match delta.checked_neg() {
+                Some(negated) => match store.incrby(key, negated) {
+                    Ok(value) => (RESPValue::Integer(value), true),
+                    Err(message) => (RESPValue::Error(message.to_string()), false),
+                },
+                None => (
+                    RESPValue::Error("ERR increment or decrement would overflow".to_string()),
+                    false,
+                ),
+            },
             Err(_) => (
                 RESPValue::Error("ERR value is not an integer".to_string()),
                 false,
@@ -2459,14 +2851,15 @@ fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
     }
 }
 
-fn normalize_for_log(store: &ShardedStore, args: &[String]) -> String {
+#[cfg(test)]
+fn normalize_for_log(store: &ShardedStore, args: &[String]) -> Vec<String> {
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("");
     let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     if cmd == "EXPIRE"
         && let Some(exp) = store.get_expiry(key)
     {
-        return format!("EXPIREAT {} {}", key, exp);
+        return vec!["EXPIREAT".to_string(), key.to_string(), exp.to_string()];
     }
     if cmd == "SET" && args.len() > 3 {
         // SET con opzioni (EX/PX/NX/XX): NX/XX sono a posto così come sono
@@ -2478,103 +2871,674 @@ fn normalize_for_log(store: &ShardedStore, args: &[String]) -> String {
         // replay riproduce esattamente la stessa scadenza, non una nuova.
         if let Some(exp) = store.get_expiry(key) {
             let value = args.get(2).map(|s| s.as_str()).unwrap_or("");
-            return format!("SET {} {} EXAT {}", key, value, exp);
+            return vec![
+                "SET".to_string(),
+                key.to_string(),
+                value.to_string(),
+                "EXAT".to_string(),
+                exp.to_string(),
+            ];
         }
     }
-    args.join(" ")
+    args.to_vec()
 }
 
-fn load_data(store: &ShardedStore) {
+fn encode_replication_command(args: &[String]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+    for arg in args {
+        encoded.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        encoded.extend_from_slice(arg.as_bytes());
+        encoded.extend_from_slice(b"\r\n");
+    }
+    encoded
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(encoded: &str) -> Result<Vec<u8>, PersistenceError> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err(PersistenceError::new(
+            "Hex-encoded committed effect has an odd length",
+        ));
+    }
+    let nibble = |value: u8| match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    };
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = nibble(pair[0])
+            .ok_or_else(|| PersistenceError::new("Invalid hexadecimal committed effect"))?;
+        let low = nibble(pair[1])
+            .ok_or_else(|| PersistenceError::new("Invalid hexadecimal committed effect"))?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn encode_replication_effect(batch: &CommittedBatch) -> Result<Vec<u8>, PersistenceError> {
+    let payload = hex_encode(&encode_committed_batch(batch)?);
+    Ok(encode_replication_command(&[
+        "APPLYEFFECT".to_string(),
+        payload,
+    ]))
+}
+
+fn decode_replication_effect(encoded: &str) -> Result<CommittedBatch, PersistenceError> {
+    decode_committed_batch(&hex_decode(encoded)?)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotFormat {
+    Missing,
+    Legacy,
+    Versioned { watermark: u64 },
+}
+
+#[derive(Debug, Default)]
+struct BinlogInspection {
+    min_sequence: Option<u64>,
+    max_sequence: u64,
+    valid_len: u64,
+    truncated_tail: bool,
+}
+
+#[derive(Debug, Default)]
+struct RecoveryState {
+    last_sequence: u64,
+    snapshot_watermark: u64,
+}
+
+fn read_bounded_utf8_line(
+    reader: &mut impl BufRead,
+    maximum_size: usize,
+) -> Result<Option<String>, PersistenceError> {
+    let mut bytes = Vec::new();
+    let mut limited = reader.take((maximum_size + 1) as u64);
+    if limited.read_until(b'\n', &mut bytes)? == 0 {
+        return Ok(None);
+    }
+    if bytes.len() > maximum_size {
+        return Err(PersistenceError::new(format!(
+            "Snapshot line exceeds the {} byte limit",
+            maximum_size
+        )));
+    }
+    let mut line = String::from_utf8(bytes)
+        .map_err(|_| PersistenceError::new("Snapshot contains invalid UTF-8"))?;
+    while line.ends_with(['\r', '\n']) {
+        line.pop();
+    }
+    Ok(Some(line))
+}
+
+fn inspect_snapshot(path: &Path) -> Result<SnapshotFormat, PersistenceError> {
+    if !path.exists() {
+        return Ok(SnapshotFormat::Missing);
+    }
+    let file = File::open(path)?;
+    let decoder = GzDecoder::new(file);
+    let mut reader = StdBufReader::new(decoder);
+    let first_line = read_bounded_utf8_line(&mut reader, MAX_SNAPSHOT_METADATA_SIZE)?
+        .ok_or_else(|| PersistenceError::new("Snapshot is empty"))?;
+    if !first_line.starts_with(SNAPSHOT_MAGIC) {
+        return Ok(SnapshotFormat::Legacy);
+    }
+
+    let fields: Vec<&str> = first_line.split('\t').collect();
+    if fields.len() != 3 || fields[0] != SNAPSHOT_MAGIC {
+        return Err(PersistenceError::new("Malformed snapshot metadata header"));
+    }
+    let version = fields[1]
+        .parse::<u8>()
+        .map_err(|_| PersistenceError::new("Invalid snapshot format version"))?;
+    if version != SNAPSHOT_VERSION {
+        return Err(PersistenceError::new(format!(
+            "Unsupported snapshot format version: {}",
+            version
+        )));
+    }
+    let watermark = fields[2]
+        .parse::<u64>()
+        .map_err(|_| PersistenceError::new("Invalid snapshot sequence watermark"))?;
+    Ok(SnapshotFormat::Versioned { watermark })
+}
+
+fn for_each_binlog_record(
+    path: &Path,
+    mut visitor: impl FnMut(&[u8]) -> Result<(), PersistenceError>,
+) -> Result<(u64, bool), PersistenceError> {
+    if !path.exists() {
+        return Ok((0, false));
+    }
+
+    let file = File::open(path)?;
+    let mut reader = StdBufReader::new(file);
+    let mut valid_len = 0u64;
+    loop {
+        let record_start = valid_len;
+        let mut length_bytes = [0u8; 4];
+        match reader.read_exact(&mut length_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                let file_len = fs::metadata(path)?.len();
+                return Ok((record_start, file_len != record_start));
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let record_len = u32::from_be_bytes(length_bytes) as usize;
+        if record_len == 0 || record_len > MAX_BINLOG_RECORD_SIZE {
+            return Err(PersistenceError::new(format!(
+                "Invalid binlog record length: {}",
+                record_len
+            )));
+        }
+        let mut record = vec![0u8; record_len];
+        match reader.read_exact(&mut record) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok((record_start, true));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        visitor(&record)?;
+        valid_len = record_start + 4 + record_len as u64;
+    }
+}
+
+fn inspect_binlog(path: &Path) -> Result<BinlogInspection, PersistenceError> {
+    let mut inspection = BinlogInspection::default();
+    let mut last_sequence: Option<u64> = None;
+    let (valid_len, truncated_tail) = for_each_binlog_record(path, |record| {
+        let DecodedBinlogRecord::Versioned { sequence, effects } = decode_binlog_record(record)?;
+        if let Some(previous) = last_sequence
+            && previous.checked_add(1) != Some(sequence)
+        {
+            return Err(PersistenceError::new(format!(
+                "Non-contiguous binlog sequence: {} after {}",
+                sequence, previous
+            )));
+        }
+        decode_committed_batch(effects).map_err(|error| {
+            PersistenceError::new(format!(
+                "Invalid committed-effect payload at binlog sequence {}: {}",
+                sequence, error
+            ))
+        })?;
+        inspection.min_sequence.get_or_insert(sequence);
+        inspection.max_sequence = sequence;
+        last_sequence = Some(sequence);
+        Ok(())
+    })?;
+    inspection.valid_len = valid_len;
+    inspection.truncated_tail = truncated_tail;
+    Ok(inspection)
+}
+
+fn checked_u32_length(length: usize, description: &str) -> Result<u32, PersistenceError> {
+    u32::try_from(length)
+        .map_err(|_| PersistenceError::new(format!("{} exceeds the format limit", description)))
+}
+
+fn append_snapshot_bytes(record: &mut Vec<u8>, bytes: &[u8]) -> Result<(), PersistenceError> {
+    let length = checked_u32_length(bytes.len(), "Snapshot value")?;
+    write_u32_be(record, length);
+    record.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn encode_snapshot_entry(key: &[u8], entry: &DataEntry) -> Result<Vec<u8>, PersistenceError> {
+    let mut record = Vec::new();
+    append_snapshot_bytes(&mut record, key)?;
+    write_u64_be(&mut record, entry.expires_at.unwrap_or(0));
+    match &entry.value {
+        OnyxValue::Blob(value) => {
+            record.push(1);
+            append_snapshot_bytes(&mut record, value)?;
+        }
+        OnyxValue::Int(value) => {
+            record.push(2);
+            record.extend_from_slice(&value.to_be_bytes());
+        }
+        OnyxValue::Float(value) => {
+            record.push(3);
+            write_u64_be(&mut record, value.to_bits());
+        }
+        OnyxValue::List(values) => {
+            record.push(4);
+            write_u32_be(
+                &mut record,
+                u32::try_from(values.len())
+                    .map_err(|_| PersistenceError::new("Snapshot list is too large"))?,
+            );
+            for value in values {
+                append_snapshot_bytes(&mut record, value)?;
+            }
+        }
+        OnyxValue::Hash(values) => {
+            record.push(5);
+            write_u32_be(
+                &mut record,
+                u32::try_from(values.len())
+                    .map_err(|_| PersistenceError::new("Snapshot hash is too large"))?,
+            );
+            for (field, value) in values {
+                append_snapshot_bytes(&mut record, field)?;
+                append_snapshot_bytes(&mut record, value)?;
+            }
+        }
+        OnyxValue::Set(values) => {
+            record.push(6);
+            write_u32_be(
+                &mut record,
+                u32::try_from(values.len())
+                    .map_err(|_| PersistenceError::new("Snapshot set is too large"))?,
+            );
+            for value in values {
+                append_snapshot_bytes(&mut record, value)?;
+            }
+        }
+        OnyxValue::Json(value) => {
+            record.push(7);
+            let encoded = serde_json::to_vec(value)
+                .map_err(|error| PersistenceError::new(error.to_string()))?;
+            append_snapshot_bytes(&mut record, &encoded)?;
+        }
+        OnyxValue::Vector(values) => {
+            record.push(8);
+            write_u32_be(
+                &mut record,
+                u32::try_from(values.len())
+                    .map_err(|_| PersistenceError::new("Snapshot vector is too large"))?,
+            );
+            for value in values {
+                record.extend_from_slice(&value.to_bits().to_be_bytes());
+            }
+        }
+    }
+    if record.len() > MAX_SNAPSHOT_RECORD_SIZE {
+        return Err(PersistenceError::new(
+            "Snapshot entry exceeds the format limit",
+        ));
+    }
+    Ok(record)
+}
+
+fn read_snapshot_bytes<'a>(record: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
+    let length = read_u32_be(record, offset)? as usize;
+    let bytes = safe_slice(record, *offset, length)?;
+    *offset = offset.checked_add(length)?;
+    Some(bytes)
+}
+
+fn decode_snapshot_entry(record: &[u8]) -> Result<(Bytes, DataEntry), PersistenceError> {
+    let mut offset = 0usize;
+    let key = Bytes::copy_from_slice(
+        read_snapshot_bytes(record, &mut offset)
+            .ok_or_else(|| PersistenceError::new("Invalid snapshot key"))?,
+    );
+    let expiry = read_u64_be(record, &mut offset)
+        .ok_or_else(|| PersistenceError::new("Invalid snapshot expiry"))?;
+    let value_type = *record
+        .get(offset)
+        .ok_or_else(|| PersistenceError::new("Missing snapshot value type"))?;
+    offset += 1;
+
+    let read_values = |record: &[u8], offset: &mut usize| {
+        let count = read_u32_be(record, offset)
+            .ok_or_else(|| PersistenceError::new("Invalid snapshot collection count"))?;
+        if count as usize > record.len().saturating_sub(*offset) / 4 {
+            return Err(PersistenceError::new(
+                "Snapshot collection count exceeds the record bounds",
+            ));
+        }
+        let mut values = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let value = read_snapshot_bytes(record, offset)
+                .ok_or_else(|| PersistenceError::new("Invalid snapshot collection value"))?;
+            values.push(Bytes::copy_from_slice(value));
+        }
+        Ok::<Vec<Bytes>, PersistenceError>(values)
+    };
+
+    let value = match value_type {
+        1 => OnyxValue::Blob(Bytes::copy_from_slice(
+            read_snapshot_bytes(record, &mut offset)
+                .ok_or_else(|| PersistenceError::new("Invalid snapshot blob"))?,
+        )),
+        2 => {
+            let bytes: [u8; 8] = safe_slice(record, offset, 8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| PersistenceError::new("Invalid snapshot integer"))?;
+            offset += 8;
+            OnyxValue::Int(i64::from_be_bytes(bytes))
+        }
+        3 => {
+            let bits = read_u64_be(record, &mut offset)
+                .ok_or_else(|| PersistenceError::new("Invalid snapshot float"))?;
+            OnyxValue::Float(f64::from_bits(bits))
+        }
+        4 => OnyxValue::List(read_values(record, &mut offset)?),
+        5 => {
+            let count = read_u32_be(record, &mut offset)
+                .ok_or_else(|| PersistenceError::new("Invalid snapshot hash count"))?;
+            if count as usize > record.len().saturating_sub(offset) / 8 {
+                return Err(PersistenceError::new(
+                    "Snapshot hash count exceeds the record bounds",
+                ));
+            }
+            let mut values = std::collections::HashMap::with_capacity(count as usize);
+            for _ in 0..count {
+                let field = Bytes::copy_from_slice(
+                    read_snapshot_bytes(record, &mut offset)
+                        .ok_or_else(|| PersistenceError::new("Invalid snapshot hash field"))?,
+                );
+                let value = Bytes::copy_from_slice(
+                    read_snapshot_bytes(record, &mut offset)
+                        .ok_or_else(|| PersistenceError::new("Invalid snapshot hash value"))?,
+                );
+                values.insert(field, value);
+            }
+            OnyxValue::Hash(values)
+        }
+        6 => OnyxValue::Set(read_values(record, &mut offset)?.into_iter().collect()),
+        7 => {
+            let bytes = read_snapshot_bytes(record, &mut offset)
+                .ok_or_else(|| PersistenceError::new("Invalid snapshot JSON value"))?;
+            OnyxValue::Json(
+                serde_json::from_slice(bytes)
+                    .map_err(|error| PersistenceError::new(error.to_string()))?,
+            )
+        }
+        8 => {
+            let count = read_u32_be(record, &mut offset)
+                .ok_or_else(|| PersistenceError::new("Invalid snapshot vector count"))?
+                as usize;
+            let byte_length = count
+                .checked_mul(4)
+                .ok_or_else(|| PersistenceError::new("Snapshot vector length overflow"))?;
+            let bytes = safe_slice(record, offset, byte_length)
+                .ok_or_else(|| PersistenceError::new("Invalid snapshot vector"))?;
+            let values = bytes
+                .chunks_exact(4)
+                .map(|chunk| {
+                    f32::from_bits(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                })
+                .collect();
+            offset += byte_length;
+            OnyxValue::Vector(values)
+        }
+        _ => return Err(PersistenceError::new("Unknown snapshot value type")),
+    };
+    if offset != record.len() {
+        return Err(PersistenceError::new("Trailing bytes in snapshot entry"));
+    }
+
+    let timestamp = now();
+    Ok((
+        key,
+        DataEntry {
+            value,
+            expires_at: (expiry != 0).then_some(expiry),
+            created_at: timestamp,
+            last_accessed: timestamp,
+        },
+    ))
+}
+
+const EFFECT_PUT: u8 = 1;
+const EFFECT_DELETE: u8 = 2;
+
+fn encode_committed_batch(batch: &CommittedBatch) -> Result<Vec<u8>, PersistenceError> {
+    if batch.effects.is_empty() {
+        return Err(PersistenceError::new(
+            "Committed-effect batch cannot be empty",
+        ));
+    }
+    let count = u32::try_from(batch.effects.len())
+        .map_err(|_| PersistenceError::new("Committed-effect batch is too large"))?;
+    let mut encoded = Vec::new();
+    write_u32_be(&mut encoded, count);
+    for effect in &batch.effects {
+        match effect {
+            CommittedEffect::Put { key, entry } => {
+                encoded.push(EFFECT_PUT);
+                let data_entry = DataEntry {
+                    value: entry.value.clone(),
+                    expires_at: entry.expires_at,
+                    created_at: 0,
+                    last_accessed: 0,
+                };
+                let record = encode_snapshot_entry(key, &data_entry)?;
+                append_snapshot_bytes(&mut encoded, &record)?;
+            }
+            CommittedEffect::Delete { key } => {
+                encoded.push(EFFECT_DELETE);
+                append_snapshot_bytes(&mut encoded, key)?;
+            }
+        }
+    }
+    if encoded.len() > MAX_BINLOG_RECORD_SIZE {
+        return Err(PersistenceError::new(
+            "Committed-effect batch exceeds the binlog record limit",
+        ));
+    }
+    Ok(encoded)
+}
+
+fn decode_committed_batch(encoded: &[u8]) -> Result<CommittedBatch, PersistenceError> {
+    let mut offset = 0usize;
+    let count = read_u32_be(encoded, &mut offset)
+        .ok_or_else(|| PersistenceError::new("Missing committed-effect count"))?;
+    if count == 0 {
+        return Err(PersistenceError::new(
+            "Committed-effect batch cannot be empty",
+        ));
+    }
+    if count as usize > encoded.len().saturating_sub(offset) / 5 {
+        return Err(PersistenceError::new(
+            "Committed-effect count exceeds the record bounds",
+        ));
+    }
+
+    let mut effects = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let opcode = *encoded
+            .get(offset)
+            .ok_or_else(|| PersistenceError::new("Missing committed-effect opcode"))?;
+        offset += 1;
+        let payload = read_snapshot_bytes(encoded, &mut offset)
+            .ok_or_else(|| PersistenceError::new("Invalid committed-effect payload"))?;
+        match opcode {
+            EFFECT_PUT => {
+                let (key, entry) = decode_snapshot_entry(payload)?;
+                effects.push(CommittedEffect::Put {
+                    key,
+                    entry: entry.into(),
+                });
+            }
+            EFFECT_DELETE => effects.push(CommittedEffect::Delete {
+                key: Bytes::copy_from_slice(payload),
+            }),
+            _ => {
+                return Err(PersistenceError::new(format!(
+                    "Unknown committed-effect opcode: {}",
+                    opcode
+                )));
+            }
+        }
+    }
+    if offset != encoded.len() {
+        return Err(PersistenceError::new(
+            "Trailing bytes in committed-effect batch",
+        ));
+    }
+    CommittedBatch::new(effects)
+}
+
+fn apply_committed_batch(store: &ShardedStore, batch: &CommittedBatch) {
+    for effect in &batch.effects {
+        match effect {
+            CommittedEffect::Put { key, entry } => {
+                store
+                    .engine
+                    .apply_entry(key.clone(), entry.clone().into_data_entry());
+            }
+            CommittedEffect::Delete { key } => {
+                store.engine.delete(key);
+            }
+        }
+    }
+}
+
+fn load_snapshot_entries(
+    store: &ShardedStore,
+    path: &Path,
+    format: SnapshotFormat,
+) -> Result<usize, PersistenceError> {
+    if format == SnapshotFormat::Missing {
+        return Ok(0);
+    }
+    let file = File::open(path)?;
+    let decoder = GzDecoder::new(file);
+    let mut reader = StdBufReader::new(decoder);
+    if matches!(format, SnapshotFormat::Versioned { .. }) {
+        read_bounded_utf8_line(&mut reader, MAX_SNAPSHOT_METADATA_SIZE)?
+            .ok_or_else(|| PersistenceError::new("Snapshot metadata header is missing"))?;
+
+        let mut count = 0;
+        loop {
+            let mut length_bytes = [0u8; 4];
+            if reader.read(&mut length_bytes[..1])? == 0 {
+                break;
+            }
+            reader.read_exact(&mut length_bytes[1..])?;
+            let record_length = u32::from_be_bytes(length_bytes) as usize;
+            if record_length == 0 || record_length > MAX_SNAPSHOT_RECORD_SIZE {
+                return Err(PersistenceError::new(format!(
+                    "Invalid snapshot record length: {}",
+                    record_length
+                )));
+            }
+            let mut record = vec![0u8; record_length];
+            reader.read_exact(&mut record)?;
+            let (key, entry) = decode_snapshot_entry(&record)?;
+            if !is_expired(&entry) {
+                store.engine.set(key, entry.value, entry.expires_at);
+                count += 1;
+            }
+        }
+        return Ok(count);
+    }
+
+    let mut count = 0;
+    let mut skipped = 0;
+    while let Some(line) = read_bounded_utf8_line(&mut reader, MAX_SNAPSHOT_LINE_SIZE)? {
+        match line_to_entry(&line) {
+            Some((key, entry)) if !is_expired(&entry) => {
+                store.set_raw(key, entry);
+                count += 1;
+            }
+            Some(_) => {}
+            None => skipped += 1,
+        }
+    }
+    if skipped > 0 {
+        warn!(
+            "Legacy snapshot: {} malformed entries were skipped",
+            skipped
+        );
+    }
+    Ok(count)
+}
+
+fn load_data_from_paths(
+    store: &ShardedStore,
+    paths: &PersistencePaths,
+) -> Result<RecoveryState, PersistenceError> {
     CURRENT_TIME.store(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .map_err(|error| PersistenceError::new(error.to_string()))?
             .as_secs(),
         Ordering::SeqCst,
     );
 
-    if Path::new(SNAPSHOT_PATH).exists()
-        && let Ok(file) = File::open(SNAPSHOT_PATH)
+    let snapshot_path = if paths.snapshot.exists() {
+        &paths.snapshot
+    } else if paths.snapshot_backup.exists() {
+        warn!(
+            "Primary snapshot is missing; recovering from {}",
+            paths.snapshot_backup.display()
+        );
+        &paths.snapshot_backup
+    } else {
+        &paths.snapshot
+    };
+    let snapshot_format = inspect_snapshot(snapshot_path)?;
+    if snapshot_format == SnapshotFormat::Legacy {
+        return Err(PersistenceError::new(
+            "Unsupported unsafe legacy snapshot format; create a verified versioned snapshot before upgrading",
+        ));
+    }
+    let binlog = inspect_binlog(&paths.binlog)?;
+    let snapshot_watermark = match snapshot_format {
+        SnapshotFormat::Versioned { watermark } => watermark,
+        SnapshotFormat::Missing => 0,
+        SnapshotFormat::Legacy => unreachable!(),
+    };
+    if let Some(first_sequence) = binlog.min_sequence
+        && first_sequence > snapshot_watermark.saturating_add(1)
     {
-        let decoder = GzDecoder::new(file);
-        let mut count = 0;
-        let mut skipped = 0;
-        for line_result in StdBufReader::new(decoder).lines() {
-            let line = match line_result {
-                Ok(l) => l,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                } // riga non UTF-8 valida
-            };
-            match line_to_entry(&line) {
-                Some((key, entry)) => {
-                    if !is_expired(&entry) {
-                        store.set_raw(key, entry);
-                        count += 1;
-                    }
-                }
-                None => skipped += 1, // riga malformata nello snapshot
-            }
-        }
-        if skipped > 0 {
-            warn!(
-                "Snapshot: {} righe scartate perché malformate o illeggibili",
-                skipped
-            );
-        }
-        info!("Snapshot loaded: {} active entries", count);
+        return Err(PersistenceError::new(
+            "Binlog begins after the snapshot recovery boundary",
+        ));
     }
 
-    const BINLOG_PATH: &str = "onyx.binlog";
-    if Path::new(BINLOG_PATH).exists()
-        && let Ok(data) = fs::read(BINLOG_PATH)
-    {
-        let mut offset = 0;
-        let mut count = 0;
-        let mut corrupt_records = 0;
-        while offset < data.len() {
-            if offset + 4 > data.len() {
-                warn!(
-                    "Binlog truncated: {} trailing bytes don't form a complete record, discarded",
-                    data.len() - offset
-                );
-                break;
-            }
-            let record_len = ((data[offset] as u32) << 24)
-                | ((data[offset + 1] as u32) << 16)
-                | ((data[offset + 2] as u32) << 8)
-                | (data[offset + 3] as u32);
-            offset += 4;
+    let snapshot_count = load_snapshot_entries(store, snapshot_path, snapshot_format)?;
+    info!("Snapshot loaded: {} active entries", snapshot_count);
 
-            if offset + record_len as usize > data.len() {
-                warn!(
-                    "Binlog truncated: a record declares {} bytes but only {} remain, discarded",
-                    record_len,
-                    data.len() - offset
-                );
-                break;
-            }
-            let record = &data[offset..offset + record_len as usize];
-            offset += record_len as usize;
+    let mut replayed = 0usize;
+    for_each_binlog_record(&paths.binlog, |record| {
+        let DecodedBinlogRecord::Versioned { sequence, effects } = decode_binlog_record(record)?;
+        if sequence <= snapshot_watermark {
+            return Ok(());
+        }
+        let batch = decode_committed_batch(effects)?;
+        apply_committed_batch(store, &batch);
+        replayed += 1;
+        Ok(())
+    })?;
 
-            match binary_record_to_args(record) {
-                Some(args) => {
-                    execute_command(store, &args);
-                    count += 1;
-                }
-                None => corrupt_records += 1, // lunghezza ok ma contenuto non decodificabile
-            }
-        }
-        if corrupt_records > 0 {
-            warn!(
-                "Binlog: {} records discarded because they are corrupt or not recognized",
-                corrupt_records
-            );
-        }
-        info!("Binlog replayed: {} commands", count);
+    if binlog.truncated_tail {
+        warn!(
+            "Truncating incomplete binlog tail at byte {}",
+            binlog.valid_len
+        );
+        let file = OpenOptions::new().write(true).open(&paths.binlog)?;
+        file.set_len(binlog.valid_len)?;
+        file.sync_all()?;
     }
+    info!("Binlog replayed: {} commands", replayed);
+
+    Ok(RecoveryState {
+        last_sequence: snapshot_watermark.max(binlog.max_sequence),
+        snapshot_watermark,
+    })
 }
+
 async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence: Arc<Persistence>) {
     let _ = stream.set_nodelay(true);
     let peer_addr = stream
@@ -2696,10 +3660,8 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                         ));
                         continue;
                     }
-                    let (resp, is_write) = execute_command(&store, &queued_args);
-                    if is_write {
-                        persist_and_replicate(&store, &persistence, &queued_args).await;
-                    }
+                    let (resp, _) =
+                        execute_ordered_command(&store, &persistence, &queued_args).await;
                     results.push(resp);
                 }
                 RESPValue::Array(results)
@@ -2919,8 +3881,9 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             // Un resync parziale è possibile SOLO se il replication ID
             // combacia (stesso processo Master) E il backlog copre ancora
             // tutto da requested_offset+1 in poi (nessun buco).
-            let backlog_snapshot: Option<Vec<(u64, String)>> =
+            let backlog_snapshot: Option<Vec<(u64, CommittedBatch)>> =
                 if replid_matches && requested_offset > 0 {
+                    let _write_guard = persistence.write_gate.lock().await;
                     let backlog = persistence.backlog.lock().unwrap();
                     let backlog_oldest = backlog.front().map(|(off, _)| *off);
                     let current_offset = persistence.repl_offset.load(Ordering::SeqCst);
@@ -2999,9 +3962,21 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                         .remove(&replica_id);
                     return;
                 }
-                for (off, cmd_line) in missing {
-                    let line = format!("{}\r\n", cmd_line);
-                    if buf_writer.write_all(line.as_bytes()).await.is_err() {
+                for (off, batch) in missing {
+                    let encoded = match encode_replication_effect(&batch) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            error!("Unable to encode replication effect: {}", error);
+                            reader_task.abort();
+                            persistence
+                                .replica_status
+                                .lock()
+                                .unwrap()
+                                .remove(&replica_id);
+                            return;
+                        }
+                    };
+                    if buf_writer.write_all(&encoded).await.is_err() {
                         reader_task.abort();
                         persistence
                             .replica_status
@@ -3018,7 +3993,13 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 );
             } else {
                 // FULL RESYNC (comportamento di prima: dump completo di tutte le chiavi)
-                let full_sync_offset = persistence.repl_offset.load(Ordering::SeqCst);
+                let (full_sync_offset, full_sync_entries) = {
+                    let _write_guard = persistence.write_gate.lock().await;
+                    (
+                        persistence.repl_offset.load(Ordering::SeqCst),
+                        store.snapshot_entries(),
+                    )
+                };
                 let marker = format!("+FULLRESYNC {} {}\r\n", repl_id(), full_sync_offset);
                 if buf_writer.write_all(marker.as_bytes()).await.is_err() {
                     reader_task.abort();
@@ -3030,7 +4011,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     return;
                 }
 
-                for (k, entry) in store.snapshot_entries() {
+                for (k, entry) in full_sync_entries {
                     let restore_cmd = match &entry.value {
                         OnyxValue::Blob(b) => {
                             format!("SET {} {}\r\n", k, String::from_utf8_lossy(b))
@@ -3116,18 +4097,20 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
 
             loop {
                 match replica_rx.recv().await {
-                    Ok((offset, cmd_line)) => {
+                    Ok((offset, batch)) => {
                         if offset <= last_sent_offset {
                             // Già coperto dal backlog/dump iniziale: evita doppioni
                             // nella stretta finestra tra subscribe() e l'inizio dell'invio.
                             continue;
                         }
-                        let line_with_newline = format!("{}\r\n", cmd_line);
-                        if buf_writer
-                            .write_all(line_with_newline.as_bytes())
-                            .await
-                            .is_err()
-                        {
+                        let encoded = match encode_replication_effect(&batch) {
+                            Ok(encoded) => encoded,
+                            Err(error) => {
+                                error!("Unable to encode live replication effect: {}", error);
+                                break;
+                            }
+                        };
+                        if buf_writer.write_all(&encoded).await.is_err() {
                             break;
                         }
                         let _ = buf_writer.flush().await;
@@ -3161,10 +4144,10 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
 
         // Comando normale
         let response = if cmd == "SAVE" {
-            persistence.compaction_pending.store(true, Ordering::SeqCst);
-            let _ = persistence.log_tx.send(LogMessage::Compact).await;
-            persistence.write_count.store(0, Ordering::SeqCst);
-            RESPValue::SimpleString("OK".to_string())
+            match compact_store(&store, &persistence).await {
+                Ok(_) => RESPValue::SimpleString("OK".to_string()),
+                Err(error) => RESPValue::Error(format!("ERR snapshot failed: {}", error)),
+            }
         } else if IS_REPLICA.load(Ordering::Relaxed) && is_write_command(cmd) {
             // Una Replica non deve accettare scritture dirette dai client: i
             // suoi dati arrivano SOLO dal Master via replica_tx. Scritture
@@ -3189,7 +4172,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             }
 
             TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
-            let (mut resp, is_write) = execute_command(&store, &args);
+            let (mut resp, _is_write) = execute_ordered_command(&store, &persistence, &args).await;
             if cmd.eq_ignore_ascii_case("INFO")
                 && let RESPValue::BulkString(Some(ref mut text)) = resp
             {
@@ -3215,7 +4198,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                 }
                 drop(statuses);
             }
-            if !is_write {
+            if !is_write_command(cmd) {
                 match &resp {
                     RESPValue::BulkString(None) => {
                         CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
@@ -3225,9 +4208,6 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     }
                     _ => {}
                 }
-            }
-            if is_write {
-                persist_and_replicate(&store, &persistence, &args).await;
             }
             resp
         };
@@ -3263,55 +4243,260 @@ async fn time_updater_task() {
     }
 }
 
-async fn do_compact(store: &Arc<ShardedStore>) {
-    let store_c = Arc::clone(store);
-    tokio::task::spawn_blocking(move || {
-        let tmp_path = format!("{}.tmp", SNAPSHOT_PATH);
-        match File::create(&tmp_path) {
-            Ok(file) => {
-                let mut writer = GzEncoder::new(BufWriter::new(file), Compression::default());
-                for (key, entry) in store_c.snapshot_entries() {
-                    let _ = writeln!(writer, "{}", value_to_line(&key, &entry));
-                }
-                if let Err(e) = writer.finish() {
-                    error!("Error finalizing compressed snapshot: {}", e);
-                }
-                if let Err(e) = fs::rename(&tmp_path, SNAPSHOT_PATH) {
-                    error!(
-                        "Unable to replace onyx.snapshot ({}). Will retry at the next compaction.",
-                        e
-                    );
-                }
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    // Windows metadata durability is provided by durable_rename using
+    // MOVEFILE_WRITE_THROUGH. FlushFileBuffers on a directory handle is not
+    // consistently supported and returns access denied on common systems.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Directory synchronization is unsupported on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn durable_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+
+    let existing: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replacement: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            replacement.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn durable_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
+fn write_snapshot_file(
+    entries: Vec<(Bytes, DataEntry)>,
+    watermark: u64,
+    paths: &PersistencePaths,
+) -> Result<(), PersistenceError> {
+    let file = File::create(&paths.snapshot_temp)?;
+    let mut encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
+    writeln!(
+        encoder,
+        "{}\t{}\t{}",
+        SNAPSHOT_MAGIC, SNAPSHOT_VERSION, watermark
+    )?;
+    for (key, entry) in entries {
+        let record = encode_snapshot_entry(&key, &entry)?;
+        let record_length = u32::try_from(record.len())
+            .map_err(|_| PersistenceError::new("Snapshot entry exceeds the format limit"))?;
+        encoder.write_all(&record_length.to_be_bytes())?;
+        encoder.write_all(&record)?;
+    }
+    let mut writer = encoder.finish()?;
+    writer.flush()?;
+    let snapshot_file = writer
+        .into_inner()
+        .map_err(|error| PersistenceError::new(error.into_error().to_string()))?;
+    snapshot_file.sync_all()?;
+    drop(snapshot_file);
+
+    if paths.snapshot.exists() {
+        durable_rename(&paths.snapshot, &paths.snapshot_backup)?;
+        sync_parent_directory(&paths.snapshot)?;
+    }
+
+    if let Err(error) = durable_rename(&paths.snapshot_temp, &paths.snapshot) {
+        if !paths.snapshot.exists() && paths.snapshot_backup.exists() {
+            let _ = durable_rename(&paths.snapshot_backup, &paths.snapshot);
+            let _ = sync_parent_directory(&paths.snapshot);
+        }
+        return Err(error.into());
+    }
+    sync_parent_directory(&paths.snapshot)?;
+    Ok(())
+}
+
+async fn request_log_flush(persistence: &Persistence) -> Result<(), PersistenceError> {
+    let (completion_tx, completion_rx) = oneshot::channel();
+    persistence
+        .log_tx
+        .send(LogMessage::Flush {
+            completion: completion_tx,
+        })
+        .await
+        .map_err(|_| PersistenceError::new("Binlog worker is unavailable"))?;
+    completion_rx
+        .await
+        .map_err(|_| PersistenceError::new("Binlog flush completion was dropped"))?
+        .map_err(PersistenceError::new)
+}
+
+async fn request_log_sync_data(persistence: &Persistence) -> Result<(), PersistenceError> {
+    let (completion_tx, completion_rx) = oneshot::channel();
+    persistence
+        .log_tx
+        .send(LogMessage::SyncData {
+            completion: completion_tx,
+        })
+        .await
+        .map_err(|_| PersistenceError::new("Binlog worker is unavailable"))?;
+    completion_rx
+        .await
+        .map_err(|_| PersistenceError::new("Binlog sync completion was dropped"))?
+        .map_err(PersistenceError::new)
+}
+
+async fn run_periodic_sync_once(persistence: &Persistence) -> Result<(), PersistenceError> {
+    match request_log_sync_data(persistence).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            mark_persistence_failed(
+                persistence,
+                format!("Periodic binlog sync failed: {}", error),
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn request_log_truncate(persistence: &Persistence) -> Result<(), PersistenceError> {
+    let (completion_tx, completion_rx) = oneshot::channel();
+    persistence
+        .log_tx
+        .send(LogMessage::Truncate {
+            completion: completion_tx,
+        })
+        .await
+        .map_err(|_| PersistenceError::new("Binlog worker is unavailable"))?;
+    completion_rx
+        .await
+        .map_err(|_| PersistenceError::new("Binlog truncate completion was dropped"))?
+        .map_err(PersistenceError::new)
+}
+
+async fn run_binlog_worker(
+    mut receiver: mpsc::Receiver<LogMessage>,
+    binlog: Arc<std::sync::Mutex<File>>,
+) {
+    while let Some(message) = receiver.recv().await {
+        match message {
+            LogMessage::Append {
+                sequence,
+                record,
+                completion,
+            } => {
+                let result = (|| -> Result<(), PersistenceError> {
+                    let encoded = encode_versioned_binlog_record(sequence, &record)?;
+                    let length = u32::try_from(encoded.len()).map_err(|_| {
+                        PersistenceError::new("Binlog record exceeds the format limit")
+                    })?;
+                    let mut file = binlog
+                        .lock()
+                        .map_err(|_| PersistenceError::new("Binlog file lock is poisoned"))?;
+                    file.seek(SeekFrom::End(0))?;
+                    file.write_all(&length.to_be_bytes())?;
+                    file.write_all(&encoded)?;
+                    file.flush()?;
+                    if fsync_policy() == FsyncPolicy::Always {
+                        file.sync_data()?;
+                    }
+                    Ok(())
+                })();
+                let _ = completion.send(result.map_err(|error| error.to_string()));
             }
-            Err(e) => {
-                error!(
-                    "Unable to create temporary snapshot ({}). Skipping this compaction.",
-                    e
-                );
+            LogMessage::Flush { completion } => {
+                let result = (|| -> Result<(), PersistenceError> {
+                    let mut file = binlog
+                        .lock()
+                        .map_err(|_| PersistenceError::new("Binlog file lock is poisoned"))?;
+                    file.flush()?;
+                    file.sync_all()?;
+                    Ok(())
+                })();
+                let _ = completion.send(result.map_err(|error| error.to_string()));
+            }
+            LogMessage::SyncData { completion } => {
+                let result = (|| -> Result<(), PersistenceError> {
+                    let file = binlog
+                        .lock()
+                        .map_err(|_| PersistenceError::new("Binlog file lock is poisoned"))?;
+                    file.sync_data()?;
+                    Ok(())
+                })();
+                let _ = completion.send(result.map_err(|error| error.to_string()));
+            }
+            LogMessage::Truncate { completion } => {
+                let result = (|| -> Result<(), PersistenceError> {
+                    let mut file = binlog
+                        .lock()
+                        .map_err(|_| PersistenceError::new("Binlog file lock is poisoned"))?;
+                    file.flush()?;
+                    file.set_len(0)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    file.sync_all()?;
+                    Ok(())
+                })();
+                let _ = completion.send(result.map_err(|error| error.to_string()));
             }
         }
+    }
+}
 
-        let _log_file = loop {
-            match OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(LOG_PATH)
-            {
-                Ok(f) => break f,
-                Err(e) => {
-                    eprintln!(
-                        "Unable to reopen onyx.log after compaction ({}). Retrying in 3s...",
-                        e
-                    );
-                    std::thread::sleep(Duration::from_secs(3));
-                }
-            }
-        };
-        info!("Compaction complete: snapshot updated, log cleared");
-    })
-    .await
-    .unwrap()
+async fn compact_store(
+    store: &Arc<ShardedStore>,
+    persistence: &Arc<Persistence>,
+) -> Result<u64, PersistenceError> {
+    let _write_guard = persistence.write_gate.lock().await;
+    request_log_flush(persistence)
+        .await
+        .map_err(|error| PersistenceError::new(format!("Binlog flush failed: {}", error)))?;
+
+    let watermark = persistence.repl_offset.load(Ordering::SeqCst);
+    let entries = store.engine.snapshot_all();
+    let paths = persistence.paths.clone();
+    tokio::task::spawn_blocking(move || write_snapshot_file(entries, watermark, &paths))
+        .await
+        .map_err(|error| PersistenceError::new(format!("Snapshot task failed: {}", error)))?
+        .map_err(|error| {
+            PersistenceError::new(format!("Snapshot installation failed: {}", error))
+        })?;
+
+    request_log_truncate(persistence)
+        .await
+        .map_err(|error| PersistenceError::new(format!("Binlog rotation failed: {}", error)))?;
+    persistence.write_count.store(0, Ordering::SeqCst);
+    info!(
+        "Compaction complete at sequence {}: snapshot installed and binlog truncated",
+        watermark
+    );
+    Ok(watermark)
 }
 fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) -> String {
     let uptime = now().saturating_sub(START_TIME.load(Ordering::Relaxed));
@@ -3460,61 +4645,138 @@ async fn handle_obp_client(
     let _ = buf_writer.flush().await;
 }
 
-/// Punto unico per ogni scrittura che deve arrivare al binlog E alle
-/// Replica: usato sia dal percorso RESP (comando singolo ed EXEC, dentro
-/// handle_client) sia dal percorso OBP. Assegna l'offset di replicazione,
-/// lo mette nel backlog, lo trasmette in tempo reale, lo scrive sul binlog
-/// e innesca la compattazione se serve.
-async fn persist_and_replicate(
-    store: &ShardedStore,
+/// Persists and publishes one already-applied mutation at its assigned
+/// sequence. The caller must hold the authoritative write gate.
+async fn persist_ordered_mutation(
     persistence: &Persistence,
-    cmd_args: &[String],
-) {
-    let text_for_replica = normalize_for_log(store, cmd_args);
-    // Usiamo la STESSA versione normalizzata sia per il binlog sia per lo
-    // stream di replica: prima venivano ricalcolate separatamente (binlog
-    // dai cmd_args originali, replica dal testo normalizzato), il che per
-    // "SET ... EX ..." avrebbe fatto sì che il binlog perdesse la scadenza
-    // mentre la Replica no (o viceversa) — due percorsi che potevano
-    // silenziosamente divergere sullo stesso identico comando.
-    let normalized_args: Vec<String> = text_for_replica
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect();
+    sequence: u64,
+    batch: &CommittedBatch,
+) -> Result<bool, PersistenceError> {
+    let effect_record = encode_committed_batch(batch)?;
 
-    let new_offset = persistence.repl_offset.fetch_add(1, Ordering::SeqCst) + 1;
+    let (completion_tx, completion_rx) = oneshot::channel();
+    persistence
+        .log_tx
+        .send(LogMessage::Append {
+            sequence,
+            record: effect_record,
+            completion: completion_tx,
+        })
+        .await
+        .map_err(|_| PersistenceError::new("Binlog worker is unavailable"))?;
+    completion_rx
+        .await
+        .map_err(|_| PersistenceError::new("Binlog append completion was dropped"))?
+        .map_err(PersistenceError::new)?;
+    // The exact same committed batch is published to the backlog and live
+    // replication only after its binlog append has been acknowledged.
     {
         let mut backlog = persistence.backlog.lock().unwrap();
-        backlog.push_back((new_offset, text_for_replica.clone()));
+        backlog.push_back((sequence, batch.clone()));
         while backlog.len() > BACKLOG_CAPACITY {
             backlog.pop_front();
         }
     }
-    let _ = persistence.replica_tx.send((new_offset, text_for_replica));
+    let _ = persistence.replica_tx.send((sequence, batch.clone()));
 
-    let cmd_name = normalized_args.first().map(|s| s.as_str()).unwrap_or("");
-    if let Some(binary_record) = command_to_binary_record(cmd_name, &normalized_args, None) {
-        let _ = persistence
-            .log_tx
-            .send(LogMessage::Append(binary_record))
-            .await;
-    }
-
-    if persistence.write_count.fetch_add(1, Ordering::SeqCst) + 1 >= COMPACTION_THRESHOLD {
-        if persistence
+    let should_compact = persistence.write_count.fetch_add(1, Ordering::SeqCst) + 1
+        >= COMPACTION_THRESHOLD
+        && persistence
             .compaction_pending
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            let _ = persistence.log_tx.send(LogMessage::Compact).await;
-        }
-        persistence.write_count.store(0, Ordering::SeqCst);
+            .is_ok();
+    Ok(should_compact)
+}
+
+fn schedule_compaction(
+    store: &Arc<ShardedStore>,
+    persistence: &Arc<Persistence>,
+    should_compact: bool,
+) {
+    if !should_compact {
+        return;
     }
+
+    let store = Arc::clone(store);
+    let persistence = Arc::clone(persistence);
+    tokio::spawn(async move {
+        if let Err(error) = compact_store(&store, &persistence).await {
+            error!("Automatic compaction failed: {}", error);
+            persistence
+                .write_count
+                .store(COMPACTION_THRESHOLD, Ordering::SeqCst);
+        }
+        persistence
+            .compaction_pending
+            .store(false, Ordering::SeqCst);
+    });
+}
+
+async fn execute_ordered_command(
+    store: &Arc<ShardedStore>,
+    persistence: &Arc<Persistence>,
+    args: &[String],
+) -> (RESPValue, bool) {
+    let command = args.first().map(|value| value.as_str()).unwrap_or("");
+    if !is_write_command(command) {
+        return execute_command(store, args);
+    }
+
+    let write_guard = persistence.write_gate.lock().await;
+    if !persistence.accepting_writes.load(Ordering::SeqCst) {
+        return (
+            RESPValue::Error(persistence_unavailable_message(persistence)),
+            false,
+        );
+    }
+    let current_sequence = persistence.repl_offset.load(Ordering::SeqCst);
+    if current_sequence == u64::MAX {
+        mark_persistence_failed(persistence, "Persistence sequence is exhausted");
+        return (
+            RESPValue::Error("MISCONF persistence sequence is exhausted".to_string()),
+            false,
+        );
+    }
+
+    let affected_keys = persistent_keys_for_command(args);
+    let before = capture_persistent_entries(store, &affected_keys);
+    let (response, _, evicted_entries) = execute_command_with_evictions(store, args);
+    let committed_batch = derive_committed_batch(store, &affected_keys, &before, &evicted_entries);
+    let is_write = committed_batch.is_some();
+    let mut should_compact = false;
+    if let Some(batch) = committed_batch {
+        let sequence = current_sequence + 1;
+        persistence.repl_offset.store(sequence, Ordering::SeqCst);
+        match persist_ordered_mutation(persistence, sequence, &batch).await {
+            Ok(value) => should_compact = value,
+            Err(error) => {
+                rollback_attempted_mutation(store, &before, &evicted_entries);
+                persistence
+                    .repl_offset
+                    .store(current_sequence, Ordering::SeqCst);
+                mark_persistence_failed(
+                    persistence,
+                    format!(
+                        "Mutation persistence failed at sequence {}: {}",
+                        sequence, error
+                    ),
+                );
+                drop(write_guard);
+                return (
+                    RESPValue::Error(format!("MISCONF mutation persistence failed: {}", error)),
+                    false,
+                );
+            }
+        }
+    }
+    drop(write_guard);
+    schedule_compaction(store, persistence, should_compact);
+    (response, is_write)
 }
 
 async fn execute_obp_command(
-    store: &ShardedStore,
-    persistence: &Persistence,
+    store: &Arc<ShardedStore>,
+    persistence: &Arc<Persistence>,
     frame: OBPFrame,
     authenticated: &mut bool,
 ) -> OBPFrame {
@@ -3577,14 +4839,75 @@ async fn execute_obp_command(
         }
         0x02 => {
             if args.len() >= 2 {
+                let write_guard = persistence.write_gate.lock().await;
+                if !persistence.accepting_writes.load(Ordering::SeqCst) {
+                    return OBPFrame {
+                        cmd: 0x00,
+                        flags: 0,
+                        correlation_id: frame.correlation_id,
+                        args: Vec::new(),
+                        payload: Some(Bytes::from("MISCONF persistence is unavailable")),
+                    };
+                }
+                let current_sequence = persistence.repl_offset.load(Ordering::SeqCst);
+                if current_sequence == u64::MAX {
+                    mark_persistence_failed(persistence, "Persistence sequence is exhausted");
+                    return OBPFrame {
+                        cmd: 0x00,
+                        flags: 0,
+                        correlation_id: frame.correlation_id,
+                        args: Vec::new(),
+                        payload: Some(Bytes::from("MISCONF persistence sequence is exhausted")),
+                    };
+                }
                 let key = args[0].clone();
+                let before = std::collections::HashMap::from([(
+                    key.clone(),
+                    store.engine.peek(&key).map(PersistentEntry::from),
+                )]);
                 let value = OnyxValue::Blob(args[1].clone());
                 store.engine.set(key.clone(), value, None);
-
-                let key_str = String::from_utf8_lossy(&key).to_string();
-                let val_str = String::from_utf8_lossy(&args[1]).to_string();
-                let cmd_args = vec!["SET".to_string(), key_str, val_str];
-                persist_and_replicate(store, persistence, &cmd_args).await;
+                let entry = store
+                    .engine
+                    .peek(&key)
+                    .map(PersistentEntry::from)
+                    .expect("OBP SET must leave the committed key present");
+                let batch = CommittedBatch {
+                    effects: vec![CommittedEffect::Put { key, entry }],
+                };
+                let sequence = current_sequence + 1;
+                persistence.repl_offset.store(sequence, Ordering::SeqCst);
+                let persistence_result =
+                    persist_ordered_mutation(persistence, sequence, &batch).await;
+                drop(write_guard);
+                match persistence_result {
+                    Ok(should_compact) => {
+                        schedule_compaction(store, persistence, should_compact);
+                    }
+                    Err(error) => {
+                        rollback_attempted_mutation(store, &before, &[]);
+                        persistence
+                            .repl_offset
+                            .store(current_sequence, Ordering::SeqCst);
+                        mark_persistence_failed(
+                            persistence,
+                            format!(
+                                "OBP mutation persistence failed at sequence {}: {}",
+                                sequence, error
+                            ),
+                        );
+                        return OBPFrame {
+                            cmd: 0x00,
+                            flags: 0,
+                            correlation_id: frame.correlation_id,
+                            args: Vec::new(),
+                            payload: Some(Bytes::from(format!(
+                                "MISCONF mutation persistence failed: {}",
+                                error
+                            ))),
+                        };
+                    }
+                }
 
                 (OnyxValue::Blob(Bytes::from("OK")), true)
             } else {
@@ -3593,11 +4916,71 @@ async fn execute_obp_command(
         }
         0x03 => {
             if let Some(key) = args.first() {
+                let write_guard = persistence.write_gate.lock().await;
+                if !persistence.accepting_writes.load(Ordering::SeqCst) {
+                    return OBPFrame {
+                        cmd: 0x00,
+                        flags: 0,
+                        correlation_id: frame.correlation_id,
+                        args: Vec::new(),
+                        payload: Some(Bytes::from("MISCONF persistence is unavailable")),
+                    };
+                }
+                let current_sequence = persistence.repl_offset.load(Ordering::SeqCst);
+                if current_sequence == u64::MAX {
+                    mark_persistence_failed(persistence, "Persistence sequence is exhausted");
+                    return OBPFrame {
+                        cmd: 0x00,
+                        flags: 0,
+                        correlation_id: frame.correlation_id,
+                        args: Vec::new(),
+                        payload: Some(Bytes::from("MISCONF persistence sequence is exhausted")),
+                    };
+                }
+                let before = std::collections::HashMap::from([(
+                    key.clone(),
+                    store.engine.peek(key).map(PersistentEntry::from),
+                )]);
                 let deleted = store.engine.delete(key);
                 if deleted {
-                    let key_str = String::from_utf8_lossy(key).to_string();
-                    let cmd_args = vec!["DEL".to_string(), key_str];
-                    persist_and_replicate(store, persistence, &cmd_args).await;
+                    let batch = CommittedBatch {
+                        effects: vec![CommittedEffect::Delete { key: key.clone() }],
+                    };
+                    let sequence = current_sequence + 1;
+                    persistence.repl_offset.store(sequence, Ordering::SeqCst);
+                    let persistence_result =
+                        persist_ordered_mutation(persistence, sequence, &batch).await;
+                    drop(write_guard);
+                    match persistence_result {
+                        Ok(should_compact) => {
+                            schedule_compaction(store, persistence, should_compact);
+                        }
+                        Err(error) => {
+                            rollback_attempted_mutation(store, &before, &[]);
+                            persistence
+                                .repl_offset
+                                .store(current_sequence, Ordering::SeqCst);
+                            mark_persistence_failed(
+                                persistence,
+                                format!(
+                                    "OBP mutation persistence failed at sequence {}: {}",
+                                    sequence, error
+                                ),
+                            );
+                            return OBPFrame {
+                                cmd: 0x00,
+                                flags: 0,
+                                correlation_id: frame.correlation_id,
+                                args: Vec::new(),
+                                payload: Some(Bytes::from(format!(
+                                    "MISCONF mutation persistence failed: {}",
+                                    error
+                                ))),
+                            };
+                        }
+                    }
+                } else {
+                    drop(write_guard);
                 }
                 (OnyxValue::Int(if deleted { 1 } else { 0 }), true)
             } else {
@@ -3748,17 +5131,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let store = Arc::new(ShardedStore::new());
-    if master_addr.is_none() {
-        load_data(&store);
-    }
+    let paths = PersistencePaths::default();
+    let recovery = if master_addr.is_none() {
+        load_data_from_paths(&store, &paths)?
+    } else {
+        RecoveryState::default()
+    };
+    info!(
+        "Persistence recovery complete at sequence {} (snapshot watermark {})",
+        recovery.last_sequence, recovery.snapshot_watermark
+    );
 
     let store_gc = Arc::clone(&store);
     tokio::spawn(async move {
         active_expiration_task(store_gc).await;
     });
 
-    let (tx, mut rx) = mpsc::channel::<LogMessage>(100_000);
-    let (replica_tx, _) = tokio::sync::broadcast::channel::<(u64, String)>(4096);
+    let (tx, rx) = mpsc::channel::<LogMessage>(100_000);
+    let (replica_tx, _) = tokio::sync::broadcast::channel::<(u64, CommittedBatch)>(4096);
     let (pubsub_tx, _) = tokio::sync::broadcast::channel::<(String, String)>(4096);
     let promote_flag = Arc::new(AtomicBool::new(false));
     let persistence = Arc::new(Persistence {
@@ -3767,99 +5157,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         compaction_pending: AtomicBool::new(false),
         replica_tx,
         promote_to_master: Arc::clone(&promote_flag),
-        repl_offset: AtomicU64::new(0),
+        repl_offset: AtomicU64::new(recovery.last_sequence),
         backlog: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(BACKLOG_CAPACITY)),
         next_replica_id: AtomicU64::new(0),
         replica_status: std::sync::Mutex::new(std::collections::HashMap::new()),
         pubsub_tx,
         next_subscriber_id: AtomicU64::new(0),
         subscriptions: std::sync::Mutex::new(std::collections::HashMap::new()),
+        failure: std::sync::Mutex::new(None),
+        accepting_writes: AtomicBool::new(true),
+        write_gate: tokio::sync::Mutex::new(()),
+        paths: paths.clone(),
     });
 
-    let store_worker = Arc::clone(&store);
-    let persistence_worker = Arc::clone(&persistence);
-
-    const BINLOG_PATH: &str = "onyx.binlog";
     let binlog_shared: Arc<std::sync::Mutex<File>> =
-        Arc::new(std::sync::Mutex::new(open_binlog_file(BINLOG_PATH)));
+        Arc::new(std::sync::Mutex::new(open_binlog_file(&paths.binlog)));
 
     // Task periodico di fsync: solo se la policy e' "everysec" (il default,
     // come in Redis). Ogni secondo forza la scrittura fisica su disco del
     // binlog corrente, indipendentemente da quanto e' stato scritto nel
     // frattempo — se non c'e' nulla di nuovo l'fsync e' comunque economico.
     if fsync_policy() == FsyncPolicy::EverySec {
-        let binlog_fsync = Arc::clone(&binlog_shared);
+        let persistence_fsync = Arc::clone(&persistence);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                if let Ok(f) = binlog_fsync.lock() {
-                    let _ = f.sync_data();
+                if run_periodic_sync_once(&persistence_fsync).await.is_err() {
+                    break;
                 }
             }
         });
     }
 
     let binlog_writer = Arc::clone(&binlog_shared);
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                LogMessage::Append(first_record) => {
-                    let mut batch = vec![first_record];
-                    let mut compact_after = false;
-
-                    while let Ok(next) = rx.try_recv() {
-                        match next {
-                            LogMessage::Append(r) => batch.push(r),
-                            LogMessage::Compact => {
-                                compact_after = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    {
-                        let mut f = binlog_writer.lock().unwrap();
-                        for record in &batch {
-                            let len = record.len() as u32;
-                            let _ = f.write_all(&[
-                                (len >> 24) as u8,
-                                (len >> 16) as u8,
-                                (len >> 8) as u8,
-                                len as u8,
-                            ]);
-                            let _ = f.write_all(record);
-                        }
-                        let _ = f.flush();
-                        // Con "always" ogni batch va fisicamente su disco prima
-                        // di continuare: massima durabilita', al costo di più
-                        // latenza per scrittura rispetto a "everysec"/"no".
-                        if fsync_policy() == FsyncPolicy::Always {
-                            let _ = f.sync_data();
-                        }
-                    }
-
-                    if compact_after {
-                        do_compact(&store_worker).await;
-                        let _ = fs::remove_file(BINLOG_PATH);
-                        let new_file = open_binlog_file(BINLOG_PATH);
-                        *binlog_writer.lock().unwrap() = new_file;
-                        persistence_worker
-                            .compaction_pending
-                            .store(false, Ordering::SeqCst);
-                    }
-                }
-                LogMessage::Compact => {
-                    do_compact(&store_worker).await;
-                    let _ = fs::remove_file(BINLOG_PATH);
-                    let new_file = open_binlog_file(BINLOG_PATH);
-                    *binlog_writer.lock().unwrap() = new_file;
-                    persistence_worker
-                        .compaction_pending
-                        .store(false, Ordering::SeqCst);
-                }
-            }
-        }
-    });
+    tokio::spawn(run_binlog_worker(rx, binlog_writer));
 
     if let Some(addr) = master_addr {
         IS_REPLICA.store(true, Ordering::Relaxed);
@@ -3941,8 +5272,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Shutdown signal received, saving final state...");
-            do_compact(&store_shutdown).await;
-            persistence_shutdown.write_count.store(0, Ordering::SeqCst);
+            persistence_shutdown.accepting_writes.store(false, Ordering::SeqCst);
+            compact_store(&store_shutdown, &persistence_shutdown).await?;
             info!("Save complete, goodbye!");
         }
     }
@@ -4103,9 +5434,33 @@ async fn run_replica(
                                 receiving_initial_sync = false;
                                 continue;
                             }
-                            execute_command(&store, &args);
-                            if !receiving_initial_sync {
-                                local_offset.fetch_add(1, Ordering::SeqCst);
+                            if args[0] == "APPLYEFFECT" {
+                                let Some(payload) = args.get(1) else {
+                                    warn!("Master sent a replication effect without a payload");
+                                    break;
+                                };
+                                match decode_replication_effect(payload) {
+                                    Ok(batch) => apply_committed_batch(&store, &batch),
+                                    Err(error) => {
+                                        warn!(
+                                            "Master sent an invalid replication effect: {}",
+                                            error
+                                        );
+                                        break;
+                                    }
+                                }
+                            } else {
+                                execute_command(&store, &args);
+                            }
+                            if !receiving_initial_sync
+                                && local_offset
+                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |offset| {
+                                        offset.checked_add(1)
+                                    })
+                                    .is_err()
+                            {
+                                warn!("Replication offset overflow");
+                                break;
                             }
                         }
                         Ok(Some(_)) => continue,
@@ -4143,6 +5498,129 @@ async fn run_replica(
 mod tests {
     use super::*;
 
+    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestPersistenceDirectory {
+        root: PathBuf,
+        paths: PersistencePaths,
+    }
+
+    impl TestPersistenceDirectory {
+        fn new() -> Self {
+            let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+            let root = env::temp_dir().join(format!(
+                "onyxdb-persistence-test-{}-{}",
+                std::process::id(),
+                sequence
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let paths = PersistencePaths {
+                snapshot: root.join("onyx.snapshot"),
+                snapshot_temp: root.join("onyx.snapshot.tmp"),
+                snapshot_backup: root.join("onyx.snapshot.previous"),
+                binlog: root.join("onyx.binlog"),
+            };
+            Self { root, paths }
+        }
+    }
+
+    impl Drop for TestPersistenceDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_persistence(
+        paths: PersistencePaths,
+        log_tx: mpsc::Sender<LogMessage>,
+        initial_sequence: u64,
+    ) -> Arc<Persistence> {
+        let (replica_tx, _) = tokio::sync::broadcast::channel(4096);
+        let (pubsub_tx, _) = tokio::sync::broadcast::channel(16);
+        Arc::new(Persistence {
+            log_tx,
+            write_count: AtomicUsize::new(0),
+            compaction_pending: AtomicBool::new(false),
+            replica_tx,
+            promote_to_master: Arc::new(AtomicBool::new(false)),
+            repl_offset: AtomicU64::new(initial_sequence),
+            backlog: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            next_replica_id: AtomicU64::new(0),
+            replica_status: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pubsub_tx,
+            next_subscriber_id: AtomicU64::new(0),
+            subscriptions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            failure: std::sync::Mutex::new(None),
+            accepting_writes: AtomicBool::new(true),
+            write_gate: tokio::sync::Mutex::new(()),
+            paths,
+        })
+    }
+
+    fn append_test_binlog_record(paths: &PersistencePaths, sequence: u64, args: &[&str]) {
+        let command_args: Vec<String> = args.iter().map(|value| (*value).to_string()).collect();
+        let store = ShardedStore::new();
+        let recovery =
+            load_data_from_paths(&store, paths).expect("existing persistence state must load");
+        let keys = persistent_keys_for_command(&command_args);
+        let before = capture_persistent_entries(&store, &keys);
+        let (_, _, evicted) = execute_command_with_evictions(&store, &command_args);
+        let batch = derive_committed_batch(&store, &keys, &before, &evicted).unwrap_or_else(|| {
+            assert!(sequence <= recovery.snapshot_watermark);
+            CommittedBatch {
+                effects: vec![CommittedEffect::Delete {
+                    key: Bytes::from_static(b"skipped-before-snapshot"),
+                }],
+            }
+        });
+        let effect_record = encode_committed_batch(&batch).expect("encodable committed effect");
+        let record = encode_versioned_binlog_record(sequence, &effect_record)
+            .expect("encodable versioned binlog record");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&paths.binlog)
+            .unwrap();
+        file.write_all(&(record.len() as u32).to_be_bytes())
+            .unwrap();
+        file.write_all(&record).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    async fn start_test_persistence(
+        paths: PersistencePaths,
+        initial_sequence: u64,
+    ) -> (Arc<Persistence>, tokio::task::JoinHandle<()>) {
+        let (log_tx, receiver) = mpsc::channel(1024);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.binlog)
+            .unwrap();
+        let persistence = test_persistence(paths, log_tx, initial_sequence);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::new(std::sync::Mutex::new(file)),
+        ));
+        (persistence, worker)
+    }
+
+    async fn apply_test_command(
+        store: &Arc<ShardedStore>,
+        persistence: &Arc<Persistence>,
+        args: &[&str],
+    ) {
+        let command: Vec<String> = args.iter().map(|value| (*value).to_string()).collect();
+        let (response, is_write) = execute_ordered_command(store, persistence, &command).await;
+        assert!(is_write, "command was not treated as a mutation: {args:?}");
+        assert!(
+            !matches!(response, RESPValue::Error(_)),
+            "mutation failed: {response:?}"
+        );
+    }
+
     #[test]
     fn test_set_and_get() {
         let store = ShardedStore::new();
@@ -4159,15 +5637,15 @@ mod tests {
     #[test]
     fn test_incr_from_zero() {
         let store = ShardedStore::new();
-        assert_eq!(store.incr("counter"), 1);
-        assert_eq!(store.incr("counter"), 2);
+        assert_eq!(store.incr("counter"), Ok(1));
+        assert_eq!(store.incr("counter"), Ok(2));
     }
 
     #[test]
     fn test_incrby() {
         let store = ShardedStore::new();
-        assert_eq!(store.incrby("counter", 5), 5);
-        assert_eq!(store.incrby("counter", -2), 3);
+        assert_eq!(store.incrby("counter", 5), Ok(5));
+        assert_eq!(store.incrby("counter", -2), Ok(3));
     }
 
     #[test]
@@ -4258,6 +5736,564 @@ mod tests {
         let record = command_to_binary_record("SET", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
         assert_eq!(decoded, vec!["SET", "k", "v"]);
+    }
+
+    #[test]
+    fn persistence_pipeline_preserves_argument_boundaries() {
+        let store = ShardedStore::new();
+        let cases = vec![
+            vec![
+                "SET".to_string(),
+                "key with spaces".to_string(),
+                "hello world\r\nnext line".to_string(),
+            ],
+            vec![
+                "JSON.SET".to_string(),
+                "document".to_string(),
+                "$".to_string(),
+                r#"{"name": "Marco Rossi"}"#.to_string(),
+            ],
+        ];
+
+        for args in cases {
+            let normalized_args = normalize_for_log(&store, &args);
+            let command = normalized_args[0].as_str();
+            let record = command_to_binary_record(command, &normalized_args, None).unwrap();
+            let decoded = binary_record_to_args(&record).unwrap();
+
+            assert_eq!(decoded, args);
+        }
+    }
+
+    #[test]
+    fn expiring_set_normalization_preserves_argument_boundaries() {
+        let store = ShardedStore::new();
+        store.engine.set(
+            Bytes::from("key with spaces"),
+            OnyxValue::Blob(Bytes::from("hello world")),
+            Some(u64::MAX),
+        );
+        let args = vec![
+            "SET".to_string(),
+            "key with spaces".to_string(),
+            "hello world".to_string(),
+            "EX".to_string(),
+            "10".to_string(),
+        ];
+
+        let normalized_args = normalize_for_log(&store, &args);
+        let record = command_to_binary_record("SET", &normalized_args, None).unwrap();
+        let decoded = binary_record_to_args(&record).unwrap();
+
+        assert_eq!(
+            decoded,
+            vec![
+                "SET",
+                "key with spaces",
+                "hello world",
+                "EXAT",
+                "18446744073709551615"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn replication_wire_preserves_argument_boundaries() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let args = vec![
+            "JSON.SET".to_string(),
+            "document with spaces".to_string(),
+            "$".to_string(),
+            r#"{"message": "hello world"}"#.to_string(),
+        ];
+        let encoded = encode_replication_command(&args);
+
+        let sender = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(&encoded).await.unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, _) = stream.into_split();
+        let mut reader = TokioBufReader::new(reader);
+        let mut scratch = String::new();
+        let decoded = read_command(&mut reader, &mut scratch)
+            .await
+            .unwrap()
+            .unwrap();
+        sender.await.unwrap();
+
+        assert_eq!(decoded, args);
+    }
+
+    #[tokio::test]
+    async fn clean_shutdown_recovery_does_not_duplicate_non_idempotent_mutations() {
+        let directory = TestPersistenceDirectory::new();
+        let store = Arc::new(ShardedStore::new());
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+
+        apply_test_command(&store, &persistence, &["SET", "plain", "value"]).await;
+        apply_test_command(&store, &persistence, &["INCR", "counter"]).await;
+        apply_test_command(&store, &persistence, &["INCRBY", "counter", "4"]).await;
+        apply_test_command(&store, &persistence, &["APPEND", "text", "alpha"]).await;
+        apply_test_command(&store, &persistence, &["APPEND", "text", "-beta"]).await;
+        apply_test_command(&store, &persistence, &["LPUSH", "items", "one"]).await;
+        apply_test_command(&store, &persistence, &["LPUSH", "items", "two"]).await;
+        apply_test_command(
+            &store,
+            &persistence,
+            &["JSON.SET", "document", "$", r#"{"visits":0}"#],
+        )
+        .await;
+        apply_test_command(
+            &store,
+            &persistence,
+            &["JSON.NUMINCRBY", "document", "$.visits", "3"],
+        )
+        .await;
+
+        let watermark = compact_store(&store, &persistence).await.unwrap();
+        assert_eq!(watermark, 9);
+        assert_eq!(fs::metadata(&directory.paths.binlog).unwrap().len(), 0);
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(state.last_sequence, 9);
+        assert_eq!(recovered.get("plain"), Some("value".to_string()));
+        assert_eq!(recovered.get("counter"), Some("5".to_string()));
+        assert_eq!(recovered.get("text"), Some("alpha-beta".to_string()));
+        assert_eq!(
+            recovered.lrange("items", 0, -1),
+            Some(vec!["two".to_string(), "one".to_string()])
+        );
+        let visits = recovered
+            .json_get("document", "$.visits")
+            .unwrap()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert_eq!(visits, 3.0);
+    }
+
+    #[test]
+    fn recovery_skips_snapshot_sequences_and_preserves_post_boundary_writes() {
+        let directory = TestPersistenceDirectory::new();
+        let snapshot_store = ShardedStore::new();
+        let snapshot_commands = [
+            vec!["SET", "plain", "value"],
+            vec!["INCR", "counter"],
+            vec!["APPEND", "text", "alpha"],
+            vec!["LPUSH", "items", "one"],
+            vec!["JSON.SET", "document", "$", r#"{"visits":0}"#],
+            vec!["JSON.NUMINCRBY", "document", "$.visits", "2"],
+        ];
+        for command in &snapshot_commands {
+            let args: Vec<String> = command.iter().map(|value| (*value).to_string()).collect();
+            let (response, _) = execute_command(&snapshot_store, &args);
+            assert!(!matches!(response, RESPValue::Error(_)));
+        }
+        write_snapshot_file(snapshot_store.engine.snapshot_all(), 6, &directory.paths).unwrap();
+
+        for (index, command) in snapshot_commands.iter().enumerate() {
+            append_test_binlog_record(&directory.paths, index as u64 + 1, command);
+        }
+        append_test_binlog_record(&directory.paths, 7, &["INCRBY", "counter", "4"]);
+        append_test_binlog_record(&directory.paths, 8, &["APPEND", "text", "-beta"]);
+        append_test_binlog_record(&directory.paths, 9, &["LPUSH", "items", "two"]);
+        append_test_binlog_record(
+            &directory.paths,
+            10,
+            &["JSON.NUMINCRBY", "document", "$.visits", "3"],
+        );
+
+        let recovered = ShardedStore::new();
+        let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(state.last_sequence, 10);
+        assert_eq!(recovered.get("counter"), Some("5".to_string()));
+        assert_eq!(recovered.get("text"), Some("alpha-beta".to_string()));
+        assert_eq!(
+            recovered.lrange("items", 0, -1),
+            Some(vec!["two".to_string(), "one".to_string()])
+        );
+        let visits = recovered
+            .json_get("document", "$.visits")
+            .unwrap()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert_eq!(visits, 5.0);
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_creation_does_not_request_binlog_truncation() {
+        let directory = TestPersistenceDirectory::new();
+        let previous_store = ShardedStore::new();
+        previous_store.set("safe".to_string(), "old".to_string());
+        write_snapshot_file(previous_store.engine.snapshot_all(), 1, &directory.paths).unwrap();
+        append_test_binlog_record(&directory.paths, 2, &["APPEND", "safe", "-log"]);
+        let previous_snapshot = fs::read(&directory.paths.snapshot).unwrap();
+
+        let mut failing_paths = directory.paths.clone();
+        failing_paths.snapshot_temp = directory.root.join("missing").join("snapshot.tmp");
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let truncate_requested = Arc::new(AtomicBool::new(false));
+        let truncate_observer = Arc::clone(&truncate_requested);
+        let worker = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    LogMessage::Flush { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Truncate { completion } => {
+                        truncate_observer.store(true, Ordering::SeqCst);
+                        let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Append { completion, .. } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::SyncData { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let persistence = test_persistence(failing_paths, log_tx, 2);
+        let store = Arc::new(ShardedStore::new());
+        store.set("safe".to_string(), "new".to_string());
+
+        assert!(compact_store(&store, &persistence).await.is_err());
+        assert!(!truncate_requested.load(Ordering::SeqCst));
+        assert_eq!(
+            fs::read(&directory.paths.snapshot).unwrap(),
+            previous_snapshot
+        );
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(state.last_sequence, 2);
+        assert_eq!(recovered.get("safe"), Some("old-log".to_string()));
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_installed_before_a_failed_binlog_rotation() {
+        let directory = TestPersistenceDirectory::new();
+        append_test_binlog_record(&directory.paths, 1, &["SET", "safe", "old"]);
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    LogMessage::Flush { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Truncate { completion } => {
+                        let _ = completion.send(Err("injected rotation failure".to_string()));
+                    }
+                    LogMessage::Append { completion, .. } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::SyncData { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 7);
+        let store = Arc::new(ShardedStore::new());
+        store.set("safe".to_string(), "new".to_string());
+
+        assert!(compact_store(&store, &persistence).await.is_err());
+        assert!(directory.paths.snapshot.exists());
+        assert!(fs::metadata(&directory.paths.binlog).unwrap().len() > 0);
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(state.snapshot_watermark, 7);
+        assert_eq!(recovered.get("safe"), Some("new".to_string()));
+    }
+
+    #[tokio::test]
+    async fn repeated_compaction_replaces_snapshot_and_recovers_latest_state() {
+        let directory = TestPersistenceDirectory::new();
+        let store = Arc::new(ShardedStore::new());
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+
+        apply_test_command(&store, &persistence, &["SET", "key", "first"]).await;
+        compact_store(&store, &persistence).await.unwrap();
+        apply_test_command(&store, &persistence, &["SET", "key", "second"]).await;
+        compact_store(&store, &persistence).await.unwrap();
+
+        assert!(directory.paths.snapshot.exists());
+        assert!(directory.paths.snapshot_backup.exists());
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(state.snapshot_watermark, 2);
+        assert_eq!(recovered.get("key"), Some("second".to_string()));
+    }
+
+    #[test]
+    fn recovery_uses_previous_snapshot_during_interrupted_installation() {
+        let directory = TestPersistenceDirectory::new();
+        let store = ShardedStore::new();
+        store.set("safe".to_string(), "value".to_string());
+        write_snapshot_file(store.engine.snapshot_all(), 3, &directory.paths).unwrap();
+        append_test_binlog_record(&directory.paths, 1, &["SET", "safe", "old"]);
+        fs::rename(&directory.paths.snapshot, &directory.paths.snapshot_backup).unwrap();
+
+        let recovered = ShardedStore::new();
+        let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(state.snapshot_watermark, 3);
+        assert_eq!(recovered.get("safe"), Some("value".to_string()));
+    }
+
+    #[test]
+    fn oversized_snapshot_metadata_is_rejected() {
+        let directory = TestPersistenceDirectory::new();
+        let file = File::create(&directory.paths.snapshot).unwrap();
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder
+            .write_all(&vec![b'x'; MAX_SNAPSHOT_METADATA_SIZE + 1])
+            .unwrap();
+        encoder.finish().unwrap().sync_all().unwrap();
+
+        let error = inspect_snapshot(&directory.paths.snapshot).unwrap_err();
+        assert!(error.to_string().contains("Snapshot line exceeds"));
+    }
+
+    #[test]
+    fn snapshot_collection_count_is_bounded_by_record_size() {
+        let mut record = Vec::new();
+        write_u32_be(&mut record, 1);
+        record.push(b'k');
+        write_u64_be(&mut record, 0);
+        record.push(4);
+        write_u32_be(&mut record, u32::MAX);
+
+        let error = decode_snapshot_entry(&record).unwrap_err();
+        assert!(error.to_string().contains("exceeds the record bounds"));
+    }
+
+    #[test]
+    fn versioned_snapshot_preserves_binary_and_native_value_types() {
+        let directory = TestPersistenceDirectory::new();
+        let store = ShardedStore::new();
+        let binary_key = Bytes::from_static(b"key\t\xff\n");
+        let binary_value = Bytes::from_static(b"value\0|=\xff\n");
+        store.engine.set(
+            binary_key.clone(),
+            OnyxValue::Blob(binary_value.clone()),
+            Some(u64::MAX),
+        );
+        store.engine.set(
+            Bytes::from_static(b"list"),
+            OnyxValue::List(vec![
+                Bytes::from_static(b"left|right"),
+                Bytes::from_static(b"line\n\xff"),
+            ]),
+            None,
+        );
+        store
+            .engine
+            .set(Bytes::from_static(b"float"), OnyxValue::Float(-0.0), None);
+        store.engine.set(
+            Bytes::from_static(b"vector"),
+            OnyxValue::Vector(vec![1.25, -3.5, f32::INFINITY]),
+            None,
+        );
+        let mut hash = std::collections::HashMap::new();
+        hash.insert(
+            Bytes::from_static(b"field=|"),
+            Bytes::from_static(b"value\n\xff"),
+        );
+        store.engine.set(
+            Bytes::from_static(b"hash"),
+            OnyxValue::Hash(hash.clone()),
+            None,
+        );
+        let set = [
+            Bytes::from_static(b"member|one"),
+            Bytes::from_static(b"\xff"),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        store.engine.set(
+            Bytes::from_static(b"set"),
+            OnyxValue::Set(set.clone()),
+            None,
+        );
+
+        write_snapshot_file(store.engine.snapshot_all(), 4, &directory.paths).unwrap();
+        let recovered = ShardedStore::new();
+        load_data_from_paths(&recovered, &directory.paths).unwrap();
+
+        let binary_entry = recovered.engine.get(&binary_key).unwrap();
+        assert_eq!(binary_entry.expires_at, Some(u64::MAX));
+        assert!(matches!(binary_entry.value, OnyxValue::Blob(value) if value == binary_value));
+        let list_entry = recovered.engine.get(&Bytes::from_static(b"list")).unwrap();
+        assert!(matches!(
+            list_entry.value,
+            OnyxValue::List(values)
+                if values == vec![Bytes::from_static(b"left|right"), Bytes::from_static(b"line\n\xff")]
+        ));
+        let float_entry = recovered.engine.get(&Bytes::from_static(b"float")).unwrap();
+        assert!(matches!(
+            float_entry.value,
+            OnyxValue::Float(value) if value.to_bits() == (-0.0f64).to_bits()
+        ));
+        let vector_entry = recovered
+            .engine
+            .get(&Bytes::from_static(b"vector"))
+            .unwrap();
+        assert!(matches!(
+            vector_entry.value,
+            OnyxValue::Vector(values) if values == vec![1.25, -3.5, f32::INFINITY]
+        ));
+        let hash_entry = recovered.engine.get(&Bytes::from_static(b"hash")).unwrap();
+        assert!(matches!(hash_entry.value, OnyxValue::Hash(values) if values == hash));
+        let set_entry = recovered.engine.get(&Bytes::from_static(b"set")).unwrap();
+        assert!(matches!(set_entry.value, OnyxValue::Set(values) if values == set));
+    }
+
+    #[test]
+    fn ambiguous_legacy_snapshot_and_binlog_are_rejected() {
+        let directory = TestPersistenceDirectory::new();
+        let entry = DataEntry {
+            value: OnyxValue::Blob(Bytes::from("snapshot")),
+            expires_at: None,
+            created_at: 0,
+            last_accessed: 0,
+        };
+        let file = File::create(&directory.paths.snapshot).unwrap();
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        writeln!(encoder, "{}", value_to_line("key", &entry)).unwrap();
+        encoder.finish().unwrap().sync_all().unwrap();
+
+        let args = vec![
+            "APPEND".to_string(),
+            "key".to_string(),
+            "suffix".to_string(),
+        ];
+        let record = command_to_binary_record("APPEND", &args, None).unwrap();
+        let mut binlog = File::create(&directory.paths.binlog).unwrap();
+        binlog
+            .write_all(&(record.len() as u32).to_be_bytes())
+            .unwrap();
+        binlog.write_all(&record).unwrap();
+        binlog.sync_all().unwrap();
+
+        let error = load_data_from_paths(&ShardedStore::new(), &directory.paths).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported unsafe legacy snapshot format")
+        );
+    }
+
+    #[tokio::test]
+    async fn binlog_append_failure_is_not_acknowledged_or_replicated() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    LogMessage::Append { completion, .. } => {
+                        let _ = completion.send(Err("injected append failure".to_string()));
+                    }
+                    LogMessage::Flush { completion }
+                    | LogMessage::SyncData { completion }
+                    | LogMessage::Truncate { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let mut live_receiver = persistence.replica_tx.subscribe();
+        let store = Arc::new(ShardedStore::new());
+
+        let command = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
+        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
+        assert!(!is_write);
+        assert!(matches!(response, RESPValue::Error(message) if message.starts_with("MISCONF")));
+        assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
+        assert!(persistence.backlog.lock().unwrap().is_empty());
+        assert!(live_receiver.try_recv().is_err());
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 0);
+        assert_eq!(store.get("key"), None);
+
+        let second_command = vec![
+            "SET".to_string(),
+            "second".to_string(),
+            "rejected".to_string(),
+        ];
+        let (second_response, _) =
+            execute_ordered_command(&store, &persistence, &second_command).await;
+        assert!(matches!(second_response, RESPValue::Error(_)));
+        assert_eq!(store.get("second"), None);
+
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_mutations_share_binlog_backlog_and_live_sequence_order() {
+        const MUTATION_COUNT: u64 = 32;
+        let directory = TestPersistenceDirectory::new();
+        let store = Arc::new(ShardedStore::new());
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let mut live_receiver = persistence.replica_tx.subscribe();
+        let mut tasks = Vec::new();
+        for _ in 0..MUTATION_COUNT {
+            let store = Arc::clone(&store);
+            let persistence = Arc::clone(&persistence);
+            tasks.push(tokio::spawn(async move {
+                apply_test_command(&store, &persistence, &["INCR", "counter"]).await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let backlog_sequences: Vec<u64> = persistence
+            .backlog
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .collect();
+        assert_eq!(backlog_sequences, (1..=MUTATION_COUNT).collect::<Vec<_>>());
+        let mut live_sequences = Vec::new();
+        while let Ok((sequence, _)) = live_receiver.try_recv() {
+            live_sequences.push(sequence);
+        }
+        assert_eq!(live_sequences, backlog_sequences);
+        assert_eq!(
+            persistence.repl_offset.load(Ordering::SeqCst),
+            MUTATION_COUNT
+        );
+
+        request_log_flush(&persistence).await.unwrap();
+        let mut binlog_sequences = Vec::new();
+        for_each_binlog_record(&directory.paths.binlog, |record| {
+            let DecodedBinlogRecord::Versioned { sequence, .. } = decode_binlog_record(record)?;
+            binlog_sequences.push(sequence);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(binlog_sequences, backlog_sequences);
+        assert_eq!(store.get("counter"), Some(MUTATION_COUNT.to_string()));
+
+        drop(persistence);
+        worker.await.unwrap();
     }
 
     #[test]
@@ -5048,5 +7084,332 @@ mod tests {
         let record = command_to_binary_record("JSON.ARRAPPEND", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
         assert_eq!(decoded, vec!["JSON.ARRAPPEND", "user", "$.tag", "\"rust\""]);
+    }
+
+    fn persistent_state(store: &ShardedStore) -> std::collections::HashMap<Bytes, PersistentEntry> {
+        store
+            .engine
+            .snapshot_all()
+            .into_iter()
+            .map(|(key, entry)| (key, entry.into()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn failed_setnx_produces_no_committed_effect_or_replay_mutation() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let store = Arc::new(ShardedStore::new());
+
+        apply_test_command(&store, &persistence, &["SET", "key", "original"]).await;
+        let command = vec![
+            "SETNX".to_string(),
+            "key".to_string(),
+            "replacement".to_string(),
+        ];
+        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
+        assert!(matches!(response, RESPValue::Integer(0)));
+        assert!(!is_write);
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
+
+        request_log_flush(&persistence).await.unwrap();
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(recovered.get("key"), Some("original".to_string()));
+    }
+
+    #[tokio::test]
+    async fn signed_numeric_effects_and_overflow_recover_exactly() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let store = Arc::new(ShardedStore::new());
+
+        apply_test_command(&store, &persistence, &["SET", "counter", "10"]).await;
+        apply_test_command(&store, &persistence, &["INCRBY", "counter", "-2"]).await;
+        apply_test_command(&store, &persistence, &["DECRBY", "counter", "-2"]).await;
+        apply_test_command(&store, &persistence, &["INCRBY", "counter", "5"]).await;
+        apply_test_command(&store, &persistence, &["DECRBY", "counter", "3"]).await;
+        apply_test_command(
+            &store,
+            &persistence,
+            &["SET", "maximum", "9223372036854775807"],
+        )
+        .await;
+        let offset_before_overflow = persistence.repl_offset.load(Ordering::SeqCst);
+        let overflow = vec!["INCR".to_string(), "maximum".to_string()];
+        let (response, is_write) = execute_ordered_command(&store, &persistence, &overflow).await;
+        assert!(matches!(response, RESPValue::Error(message) if message.contains("overflow")));
+        assert!(!is_write);
+        assert_eq!(
+            persistence.repl_offset.load(Ordering::SeqCst),
+            offset_before_overflow
+        );
+
+        request_log_flush(&persistence).await.unwrap();
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovered.get("counter"), Some("12".to_string()));
+        assert_eq!(
+            recovered.get("maximum"),
+            Some("9223372036854775807".to_string())
+        );
+    }
+
+    #[test]
+    fn committed_effect_codec_is_binary_safe_and_strict() {
+        let batch = CommittedBatch {
+            effects: vec![
+                CommittedEffect::Put {
+                    key: Bytes::from_static(b"\xff\x00key"),
+                    entry: PersistentEntry {
+                        value: OnyxValue::Blob(Bytes::from_static(b"\x80\x00value\xff")),
+                        expires_at: Some(42),
+                    },
+                },
+                CommittedEffect::Delete {
+                    key: Bytes::from_static(b"\xfe\x00deleted"),
+                },
+            ],
+        };
+        let encoded = encode_committed_batch(&batch).unwrap();
+        assert_eq!(decode_committed_batch(&encoded).unwrap(), batch);
+        assert_eq!(
+            decode_replication_effect(&hex_encode(&encoded)).unwrap(),
+            batch
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(
+            decode_committed_batch(&trailing)
+                .unwrap_err()
+                .to_string()
+                .contains("Trailing bytes")
+        );
+        for truncated_length in 0..encoded.len() {
+            assert!(decode_committed_batch(&encoded[..truncated_length]).is_err());
+        }
+        let boundary_key = Bytes::from(vec![b'k'; u16::MAX as usize + 1]);
+        let boundary_batch = CommittedBatch {
+            effects: vec![CommittedEffect::Delete {
+                key: boundary_key.clone(),
+            }],
+        };
+        let boundary_encoded = encode_committed_batch(&boundary_batch).unwrap();
+        assert_eq!(
+            decode_committed_batch(&boundary_encoded).unwrap(),
+            boundary_batch
+        );
+        assert!(
+            encode_committed_batch(&CommittedBatch {
+                effects: Vec::new()
+            })
+            .is_err()
+        );
+        assert!(encode_versioned_binlog_record(0, &encoded).is_err());
+        if usize::BITS > 32 {
+            assert!(checked_u32_length(u32::MAX as usize + 1, "Test payload").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn obp_binary_set_and_delete_round_trip_through_recovery() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let store = Arc::new(ShardedStore::new());
+        let key = Bytes::from_static(b"\xff\x00binary-key");
+        let value = Bytes::from_static(b"\x80\x00binary-value\xfe");
+        let mut authenticated = true;
+
+        execute_obp_command(
+            &store,
+            &persistence,
+            OBPFrame {
+                cmd: 0x02,
+                flags: 0,
+                correlation_id: 1,
+                args: vec![key.clone(), value.clone()],
+                payload: None,
+            },
+            &mut authenticated,
+        )
+        .await;
+        request_log_flush(&persistence).await.unwrap();
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = Arc::new(ShardedStore::new());
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        let entry = recovered.engine.peek(&key).unwrap();
+        assert_eq!(entry.value, OnyxValue::Blob(value));
+
+        let (persistence, worker) =
+            start_test_persistence(directory.paths.clone(), recovery.last_sequence).await;
+        execute_obp_command(
+            &recovered,
+            &persistence,
+            OBPFrame {
+                cmd: 0x03,
+                flags: 0,
+                correlation_id: 2,
+                args: vec![key.clone()],
+                payload: None,
+            },
+            &mut authenticated,
+        )
+        .await;
+        request_log_flush(&persistence).await.unwrap();
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered_after_delete = ShardedStore::new();
+        load_data_from_paths(&recovered_after_delete, &directory.paths).unwrap();
+        assert!(recovered_after_delete.engine.peek(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn actual_eviction_victims_are_ordered_and_do_not_resurrect() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let store = Arc::new(ShardedStore::new());
+        apply_test_command(&store, &persistence, &["SET", "first", "aaaaaaaa"]).await;
+        apply_test_command(&store, &persistence, &["SET", "second", "bbbbbbbb"]).await;
+
+        let limit = store.engine.total_memory_bytes().saturating_sub(1);
+        let evicted = store.engine.evict_to_fit(limit, EvictionPolicy::AllKeysLru);
+        assert!(!evicted.is_empty());
+        let written_key = Bytes::from_static(b"causing-write");
+        store.engine.set(
+            written_key.clone(),
+            OnyxValue::Blob(Bytes::from_static(b"committed")),
+            None,
+        );
+        let written_entry = store
+            .engine
+            .peek(&written_key)
+            .map(PersistentEntry::from)
+            .unwrap();
+        let mut effects: Vec<CommittedEffect> = evicted
+            .iter()
+            .map(|(key, _)| CommittedEffect::Delete { key: key.clone() })
+            .collect();
+        effects.push(CommittedEffect::Put {
+            key: written_key,
+            entry: written_entry,
+        });
+        let batch = CommittedBatch { effects };
+        assert!(matches!(
+            batch.effects.last(),
+            Some(CommittedEffect::Put { .. })
+        ));
+        let sequence = persistence.repl_offset.load(Ordering::SeqCst) + 1;
+        persistence.repl_offset.store(sequence, Ordering::SeqCst);
+        persist_ordered_mutation(&persistence, sequence, &batch)
+            .await
+            .unwrap();
+        let expected = persistent_state(&store);
+
+        request_log_flush(&persistence).await.unwrap();
+        drop(persistence);
+        worker.await.unwrap();
+        let recovered = ShardedStore::new();
+        load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(persistent_state(&recovered), expected);
+        for (key, _) in evicted {
+            assert!(recovered.engine.peek(&key).is_none());
+        }
+    }
+
+    #[test]
+    fn evicted_target_recreated_with_same_value_is_replayed_as_delete_then_put() {
+        let store = ShardedStore::new();
+        let key = Bytes::from_static(b"target");
+        store.engine.set(
+            key.clone(),
+            OnyxValue::Blob(Bytes::from_static(b"same-value")),
+            None,
+        );
+        let keys = vec![key.clone()];
+        let before = capture_persistent_entries(&store, &keys);
+        let evicted_entry = store.engine.peek(&key).unwrap();
+        assert!(store.engine.delete(&key));
+        store.engine.set(
+            key.clone(),
+            OnyxValue::Blob(Bytes::from_static(b"same-value")),
+            None,
+        );
+
+        let batch = derive_committed_batch(&store, &keys, &before, &[(key.clone(), evicted_entry)])
+            .unwrap();
+        assert!(matches!(
+            batch.effects.as_slice(),
+            [CommittedEffect::Delete { .. }, CommittedEffect::Put { .. }]
+        ));
+
+        let replayed = ShardedStore::new();
+        replayed.engine.set(
+            key.clone(),
+            OnyxValue::Blob(Bytes::from_static(b"same-value")),
+            None,
+        );
+        apply_committed_batch(&replayed, &batch);
+        assert_eq!(persistent_state(&replayed), persistent_state(&store));
+    }
+
+    #[tokio::test]
+    async fn periodic_sync_failure_disables_subsequent_writes() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(4);
+        let worker = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    LogMessage::SyncData { completion } => {
+                        let _ = completion.send(Err("injected sync failure".to_string()));
+                    }
+                    LogMessage::Append { completion, .. }
+                    | LogMessage::Flush { completion }
+                    | LogMessage::Truncate { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        assert!(run_periodic_sync_once(&persistence).await.is_err());
+        assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
+        assert!(
+            persistence
+                .failure
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|message| message.contains("injected sync failure"))
+        );
+
+        let store = Arc::new(ShardedStore::new());
+        let command = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
+        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
+        assert!(!is_write);
+        assert!(
+            matches!(response, RESPValue::Error(message) if message.contains("injected sync failure"))
+        );
+        assert!(store.get("key").is_none());
+        drop(persistence);
+        worker.await.unwrap();
+    }
+
+    #[test]
+    fn partial_resync_rejects_ahead_and_overflowing_offsets() {
+        assert!(!partial_resync_possible(101, Some(1), 100));
+        assert!(!partial_resync_possible(u64::MAX, Some(1), u64::MAX - 1));
+        assert!(partial_resync_possible(u64::MAX, Some(u64::MAX), u64::MAX));
     }
 }

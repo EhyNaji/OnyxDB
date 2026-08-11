@@ -34,7 +34,7 @@ fn shard_for_key(key: &[u8]) -> usize {
 // TIPI DI DATI ONYX (più ricchi di Redis)
 // ============================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum OnyxValue {
     /// Blob opaco (stringa/bytes)
     Blob(Bytes),
@@ -54,7 +54,7 @@ pub enum OnyxValue {
     Vector(Vec<f32>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DataEntry {
     pub value: OnyxValue,
     pub expires_at: Option<u64>,
@@ -364,6 +364,25 @@ impl OnyxEngine {
         shard.get(key).cloned()
     }
 
+    /// Returns the persistent entry without updating access metadata.
+    /// This is used while deriving the canonical effect of a write.
+    pub fn peek(&self, key: &Bytes) -> Option<DataEntry> {
+        let shard_idx = shard_for_key(key);
+        let shard = self.shards[shard_idx].lock().unwrap();
+        let entry = shard.data.get(key)?;
+        if entry.expires_at.is_some_and(|expiry| now() >= expiry) {
+            return None;
+        }
+        Some(entry.clone())
+    }
+
+    /// Installs an entry exactly as described by a persistent committed effect.
+    pub fn apply_entry(&self, key: Bytes, entry: DataEntry) -> Option<DataEntry> {
+        let shard_idx = shard_for_key(&key);
+        let mut shard = self.shards[shard_idx].lock().unwrap();
+        shard.insert(key, entry)
+    }
+
     /// SET — single shard
     #[inline]
     pub fn set(&self, key: Bytes, value: OnyxValue, expires: Option<u64>) -> Option<DataEntry> {
@@ -613,21 +632,22 @@ impl OnyxEngine {
             .sum()
     }
 
-    /// Libera memoria finché si torna sotto `maxmemory_bytes`, secondo la
-    /// policy scelta. Ritorna quante chiavi ha dovuto rimuovere.
+    /// Frees memory until usage is at or below `maxmemory_bytes` and returns
+    /// the exact entries removed, in authoritative eviction order.
     ///
-    /// Approssimato per design (come l'LRU di Redis: non è un minimo globale
-    /// esatto — ogni shard propone il suo candidato locale, si sceglie il
-    /// migliore tra i 64 — ma è sufficiente per tenere la memoria sotto
-    /// controllo senza dover bloccare tutti gli shard insieme).
-    pub fn evict_to_fit(&self, maxmemory_bytes: usize, policy: EvictionPolicy) -> usize {
+    /// Candidate selection remains approximate by design: each shard proposes
+    /// one local candidate and the best candidate is selected globally.
+    pub fn evict_to_fit(
+        &self,
+        maxmemory_bytes: usize,
+        policy: EvictionPolicy,
+    ) -> Vec<(Bytes, DataEntry)> {
         if policy == EvictionPolicy::NoEviction || maxmemory_bytes == 0 {
-            return 0;
+            return Vec::new();
         }
-        let mut evicted = 0;
-        // Limite di sicurezza: non ciclare all'infinito se non si riesce a
-        // scendere sotto la soglia (es. policy volatile-* ma nessuna chiave
-        // ha un TTL impostato — non c'è nulla di legittimo da evictare).
+        let mut evicted = Vec::new();
+        // Do not loop indefinitely when the selected policy cannot evict any
+        // remaining entry, such as volatile policies with no expiring keys.
         for _ in 0..10_000 {
             if self.total_memory_bytes() <= maxmemory_bytes {
                 break;
@@ -648,10 +668,11 @@ impl OnyxEngine {
             match best {
                 Some((idx, key, _)) => {
                     let mut shard = self.shards[idx].lock().unwrap();
-                    shard.remove(&key);
-                    evicted += 1;
+                    if let Some(entry) = shard.remove(&key) {
+                        evicted.push((key, entry));
+                    }
                 }
-                None => break, // nessuna chiave evictable trovata
+                None => break,
             }
         }
         evicted
