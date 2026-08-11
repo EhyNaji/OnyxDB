@@ -240,6 +240,24 @@ fn send_command(port: u16, args: &[&[u8]]) -> Resp {
     read_resp(&mut BufReader::new(stream))
 }
 
+fn assert_protocol_error_and_closed(port: u16, request: &[u8]) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(request).unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reader = BufReader::new(stream);
+    let response = read_resp(&mut reader);
+    assert!(
+        matches!(response, Resp::Error(ref message) if message.starts_with("ERR Protocol error:")),
+        "expected a protocol error, got {response:?}"
+    );
+    let mut trailing = Vec::new();
+    reader.read_to_end(&mut trailing).unwrap();
+    assert!(trailing.is_empty(), "connection returned trailing data");
+}
+
 fn wait_for_response(port: u16, args: &[&[u8]], expected: &Resp) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -752,6 +770,94 @@ fn replica_applies_authoritative_state_even_when_it_exceeds_its_local_maxmemory(
 
     replica.stop();
     master.stop();
+}
+
+#[test]
+fn resp_malformed_array_header_is_fail_closed() {
+    let directory = TestDirectory::new("resp-malformed-array");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &[]);
+    let mut request = b"*invalid\r\n".to_vec();
+    request.extend_from_slice(&encode_command(&[b"SET", b"smuggled", b"value"]));
+
+    assert_protocol_error_and_closed(port, &request);
+    assert_eq!(send_command(port, &[b"GET", b"smuggled"]), Resp::Bulk(None));
+
+    server.stop();
+}
+
+#[test]
+fn resp_oversized_array_header_is_fail_closed() {
+    let directory = TestDirectory::new("resp-oversized-array");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &[]);
+    let mut request = b"*1025\r\n".to_vec();
+    request.extend_from_slice(&encode_command(&[b"SET", b"smuggled", b"value"]));
+
+    assert_protocol_error_and_closed(port, &request);
+    assert_eq!(send_command(port, &[b"GET", b"smuggled"]), Resp::Bulk(None));
+
+    server.stop();
+}
+
+#[test]
+fn resp_requires_crlf_for_array_and_bulk_headers() {
+    let directory = TestDirectory::new("resp-header-crlf");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &[]);
+    let request = b"*3\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n";
+
+    assert_protocol_error_and_closed(port, request);
+    assert_eq!(send_command(port, &[b"GET", b"key"]), Resp::Bulk(None));
+
+    server.stop();
+}
+
+#[test]
+fn resp_rejects_invalid_utf8_instead_of_mutating_lossily() {
+    let directory = TestDirectory::new("resp-invalid-utf8");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &[]);
+    let request = encode_command(&[b"SET", b"key", &[0xff, 0xfe]]);
+
+    assert_protocol_error_and_closed(port, &request);
+    assert_eq!(send_command(port, &[b"GET", b"key"]), Resp::Bulk(None));
+
+    server.stop();
+}
+
+#[test]
+fn resp_oversized_bulk_is_rejected_before_its_payload() {
+    let directory = TestDirectory::new("resp-oversized-bulk");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &[]);
+
+    assert_protocol_error_and_closed(port, b"*1\r\n$8388609\r\n");
+
+    server.stop();
+}
+
+#[test]
+fn resp_overlong_header_is_fail_closed() {
+    let directory = TestDirectory::new("resp-overlong-header");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &[]);
+    let request = format!("*{}\r\n", "1".repeat(64));
+
+    assert_protocol_error_and_closed(port, request.as_bytes());
+
+    server.stop();
+}
+
+#[test]
+fn resp_truncated_bulk_is_reported_and_closed() {
+    let directory = TestDirectory::new("resp-truncated-bulk");
+    let port = choose_port();
+    let server = start_server(&directory.0, port, &[]);
+
+    assert_protocol_error_and_closed(port, b"*1\r\n$4\r\nPI");
+
+    server.stop();
 }
 
 #[test]

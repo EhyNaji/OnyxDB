@@ -8,7 +8,7 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use protocol::{MAX_OBP_FRAME_SIZE, OBPFrame};
-use resp::{RESPValue, read_command, read_command_with_limits};
+use resp::{CLIENT_RESP_LIMITS, RESPReadLimits, RESPValue, read_command_with_timeouts};
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -45,6 +45,9 @@ const REPLICATION_CHUNK_SIZE: usize = 256 * 1024;
 const MAX_REPLICATION_FRAME_BULK_SIZE: i64 = (REPLICATION_CHUNK_SIZE * 2 + 64) as i64;
 const COMPACTION_THRESHOLD: usize = 100000;
 const MAX_KEYS: usize = 1_000_000;
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const CLIENT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLICATION_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 struct PersistencePaths {
@@ -3000,14 +3003,26 @@ fn encode_full_sync_entry(
 
 async fn read_replication_command(
     reader: &mut TokioBufReader<tokio::net::tcp::OwnedReadHalf>,
-    scratch: &mut String,
+    scratch: &mut Vec<u8>,
 ) -> std::io::Result<Option<Vec<String>>> {
-    read_command_with_limits(reader, scratch, 4, MAX_REPLICATION_FRAME_BULK_SIZE, 1024).await
+    read_command_with_timeouts(
+        reader,
+        scratch,
+        RESPReadLimits {
+            max_array_len: 4,
+            max_bulk_len: MAX_REPLICATION_FRAME_BULK_SIZE as usize,
+            max_inline_len: 1024,
+            max_frame_len: MAX_REPLICATION_FRAME_BULK_SIZE as usize + 4096,
+        },
+        None,
+        REPLICATION_FRAME_TIMEOUT,
+    )
+    .await
 }
 
 async fn read_chunked_replication_payload(
     reader: &mut TokioBufReader<tokio::net::tcp::OwnedReadHalf>,
-    scratch: &mut String,
+    scratch: &mut Vec<u8>,
     expected_length: usize,
     maximum_length: usize,
     chunk_command: &str,
@@ -3060,7 +3075,7 @@ async fn read_chunked_replication_payload(
 
 async fn read_full_sync_entry(
     reader: &mut TokioBufReader<tokio::net::tcp::OwnedReadHalf>,
-    scratch: &mut String,
+    scratch: &mut Vec<u8>,
 ) -> Result<(Bytes, DataEntry), PersistenceError> {
     let header = match read_replication_command(reader, scratch).await {
         Ok(Some(header)) => header,
@@ -3098,7 +3113,7 @@ async fn read_full_sync_entry(
 async fn read_replication_effect(
     header: &[String],
     reader: &mut TokioBufReader<tokio::net::tcp::OwnedReadHalf>,
-    scratch: &mut String,
+    scratch: &mut Vec<u8>,
 ) -> Result<(u64, CommittedBatch), PersistenceError> {
     if header.len() != 3 || header[0] != "APPLYEFFECT" {
         return Err(PersistenceError::new(
@@ -3724,7 +3739,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
     let peer_addr = stream
         .peer_addr()
         .map(|a| a.to_string())
-        .unwrap_or_else(|_| "sconosciuto".to_string());
+        .unwrap_or_else(|_| "unknown".to_string());
     ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
     struct ConnGuard;
     impl Drop for ConnGuard {
@@ -3736,17 +3751,41 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
     let (reader, writer) = stream.into_split();
     let mut buf_reader = TokioBufReader::with_capacity(65536, reader);
     let mut buf_writer = TokioBufWriter::with_capacity(65536, writer);
-    let mut scratch = String::with_capacity(256);
+    let mut scratch = Vec::with_capacity(256);
     let mut resp_buf = String::with_capacity(256);
     let mut authenticated = !auth_required();
     let mut in_transaction = false;
     let mut queued_commands: Vec<Vec<String>> = Vec::new();
 
     loop {
-        let mut args = match read_command(&mut buf_reader, &mut scratch).await {
+        let mut args = match read_command_with_timeouts(
+            &mut buf_reader,
+            &mut scratch,
+            CLIENT_RESP_LIMITS,
+            Some(CLIENT_IDLE_TIMEOUT),
+            CLIENT_FRAME_TIMEOUT,
+        )
+        .await
+        {
             Ok(Some(args)) if !args.is_empty() => args,
             Ok(Some(_)) => continue,
             Ok(None) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidData
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                warn!("Closing RESP connection from {}: {}", peer_addr, error);
+                resp_buf.clear();
+                RESPValue::Error(format!("ERR Protocol error: {}", error))
+                    .encode_into(&mut resp_buf);
+                let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
+                let _ = buf_writer.flush().await;
+                break;
+            }
             Err(_) => break,
         };
 
@@ -3937,9 +3976,17 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             let (chan_tx, mut chan_rx) =
                 tokio::sync::mpsc::unbounded_channel::<(bool, Vec<String>)>();
             let reader_task = tokio::spawn(async move {
-                let mut sub_scratch = String::new();
+                let mut sub_scratch = Vec::new();
                 loop {
-                    match read_command(&mut buf_reader, &mut sub_scratch).await {
+                    match read_command_with_timeouts(
+                        &mut buf_reader,
+                        &mut sub_scratch,
+                        CLIENT_RESP_LIMITS,
+                        None,
+                        CLIENT_FRAME_TIMEOUT,
+                    )
+                    .await
+                    {
                         Ok(Some(sub_args)) if !sub_args.is_empty() => {
                             let sub_cmd = sub_args[0].to_ascii_uppercase();
                             if sub_cmd == "SUBSCRIBE" {
@@ -4142,11 +4189,22 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             // select loop that could discard half a line and corrupt the
             // replication stream.
             let persistence_ack = Arc::clone(&persistence);
-            let reader_task = tokio::spawn(async move {
-                let mut ack_scratch = String::new();
+            let mut reader_task = tokio::spawn(async move {
+                let mut ack_scratch = Vec::new();
                 loop {
-                    match read_command_with_limits(&mut buf_reader, &mut ack_scratch, 3, 64, 128)
-                        .await
+                    match read_command_with_timeouts(
+                        &mut buf_reader,
+                        &mut ack_scratch,
+                        RESPReadLimits {
+                            max_array_len: 3,
+                            max_bulk_len: 64,
+                            max_inline_len: 128,
+                            max_frame_len: 512,
+                        },
+                        None,
+                        REPLICATION_FRAME_TIMEOUT,
+                    )
+                    .await
                     {
                         Ok(Some(ack_args)) if !ack_args.is_empty() => {
                             if ack_args[0].eq_ignore_ascii_case("REPLCONF")
@@ -4297,40 +4355,51 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             );
 
             loop {
-                match replica_rx.recv().await {
-                    Ok((offset, batch)) => {
-                        if offset <= last_sent_offset {
-                            // The initial backlog or snapshot already covers
-                            // this effect from the subscribe/capture window.
-                            continue;
-                        }
-                        let encoded = match encode_replication_effect(offset, &batch) {
-                            Ok(encoded) => encoded,
-                            Err(error) => {
-                                error!("Unable to encode live replication effect: {}", error);
-                                break;
-                            }
-                        };
-                        if write_chunked_replication_record(&mut buf_writer, &encoded)
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                        let _ = buf_writer.flush().await;
-                        last_sent_offset = offset;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // A lagged broadcast receiver has an irrecoverable gap
-                        // in this stream. Disconnect and negotiate from the
-                        // durable sequence again.
+                tokio::select! {
+                    _ = &mut reader_task => {
                         warn!(
-                            "Replica {} lagged behind the live stream; forcing resynchronization",
+                            "Replica {} stopped sending valid acknowledgements; closing the replication stream",
                             peer_addr
                         );
                         break;
                     }
-                    Err(_) => break,
+                    replication = replica_rx.recv() => {
+                        match replication {
+                            Ok((offset, batch)) => {
+                                if offset <= last_sent_offset {
+                                    // The initial backlog or snapshot already covers
+                                    // this effect from the subscribe/capture window.
+                                    continue;
+                                }
+                                let encoded = match encode_replication_effect(offset, &batch) {
+                                    Ok(encoded) => encoded,
+                                    Err(error) => {
+                                        error!("Unable to encode live replication effect: {}", error);
+                                        break;
+                                    }
+                                };
+                                if write_chunked_replication_record(&mut buf_writer, &encoded)
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                let _ = buf_writer.flush().await;
+                                last_sent_offset = offset;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                // A lagged broadcast receiver has an irrecoverable gap
+                                // in this stream. Disconnect and negotiate from the
+                                // durable sequence again.
+                                warn!(
+                                    "Replica {} lagged behind the live stream; forcing resynchronization",
+                                    peer_addr
+                                );
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
                 }
             }
 
@@ -6063,11 +6132,11 @@ async fn run_replica(
                 let _ = stream.set_nodelay(true);
                 let (reader, mut writer) = stream.into_split();
                 let mut buf_reader = TokioBufReader::with_capacity(65536, reader);
-                let mut scratch = String::new();
+                let mut scratch = Vec::new();
 
                 let starting_offset = local_offset.load(Ordering::SeqCst);
                 let known_replid = local_replid.load(Ordering::SeqCst);
-                let sync_cmd = format!("SYNC3 {} {}\n", known_replid, starting_offset);
+                let sync_cmd = format!("SYNC3 {} {}\r\n", known_replid, starting_offset);
                 if writer.write_all(sync_cmd.as_bytes()).await.is_err() {
                     warn!(
                         "Failed to send SYNC3 to master, retrying in {}s",
@@ -6168,7 +6237,7 @@ async fn run_replica(
                     loop {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         let off = ack_offset.load(Ordering::SeqCst);
-                        let ack_cmd = format!("REPLCONF ACK {}\n", off);
+                        let ack_cmd = format!("REPLCONF ACK {}\r\n", off);
                         if writer.write_all(ack_cmd.as_bytes()).await.is_err() {
                             break;
                         }
@@ -6736,8 +6805,8 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let (reader, _) = stream.into_split();
         let mut reader = TokioBufReader::new(reader);
-        let mut scratch = String::new();
-        let decoded = read_command(&mut reader, &mut scratch)
+        let mut scratch = Vec::new();
+        let decoded = resp::read_command_with_limits(&mut reader, &mut scratch, CLIENT_RESP_LIMITS)
             .await
             .unwrap()
             .unwrap();
@@ -6760,7 +6829,7 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let (reader, _) = stream.into_split();
         let mut reader = TokioBufReader::new(reader);
-        let mut scratch = String::new();
+        let mut scratch = Vec::new();
         let error = read_replication_command(&mut reader, &mut scratch)
             .await
             .unwrap_err();
@@ -6782,7 +6851,7 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let (reader, _) = stream.into_split();
         let mut reader = TokioBufReader::new(reader);
-        let mut scratch = String::new();
+        let mut scratch = Vec::new();
         let error = read_replication_command(&mut reader, &mut scratch)
             .await
             .unwrap_err();
@@ -7242,7 +7311,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, _) = stream.into_split();
             let mut reader = TokioBufReader::new(reader);
-            let mut scratch = String::new();
+            let mut scratch = Vec::new();
             let (actual_key, actual_entry) = read_full_sync_entry(&mut reader, &mut scratch)
                 .await
                 .unwrap();
@@ -7277,7 +7346,7 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let (reader, _) = stream.into_split();
         let mut reader = TokioBufReader::new(reader);
-        let mut scratch = String::new();
+        let mut scratch = Vec::new();
         let header = read_replication_command(&mut reader, &mut scratch)
             .await
             .unwrap()
