@@ -1,39 +1,59 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
+All notable changes to OnyxDB are documented in this file.
 
-## [0.1.0] — Initial public release
+## Unreleased
+
+### Reliability
+
+- Replaced command-text persistence with canonical committed-effect batches so
+  argument boundaries, expirations, non-idempotent mutations, eviction victims,
+  and transaction results recover exactly.
+- Established one authoritative sequence order across concurrent client writes,
+  binlog records, the partial-sync backlog, and live replication.
+- Made snapshot compaction install and synchronize a replacement snapshot before
+  binlog truncation. Recovery replays only sequences after the snapshot
+  watermark.
+- Added faithful SYNC3 full and partial replication for binary keys, TTLs, and
+  all internal value types, with staged atomic full-state installation.
+- Added durable `READY`, `INSTALLING`, and `DETACHED` replica lifecycle states.
+- Added upstream authentication, sequence-bound heartbeats, liveness deadlines,
+  and a hard promotion boundary that cancels and drains former-upstream tasks.
+- Added checksummed ONX4 binlog records and fail-closed recovery for complete
+  corruption, sequence gaps, and ambiguous legacy histories.
+- Enforced projected logical `maxmemory` admission for new keys and existing
+  value growth across RESP, OBP, transactions, recovery, and replication.
+- Bounded RESP and OBP headers, frames, aggregate arguments, pre-validation
+  allocation, idle peers, partial frames, and replication transfers.
+- Unified expired, missing, present, and wrong-type semantics across engine and
+  server mutation paths, including atomic deletion of empty collections.
+- Made write-containing transactions atomic in visibility, persistence, and
+  replication order, with rollback on batch persistence failure.
+
+### Architecture and maintainability
+
+- Extracted typed startup configuration parsing and validation into
+  `src/config.rs`, including command-line/environment precedence and redacted
+  secret debug output.
+- Rejected server ports that cannot safely reserve the derived OBP and metrics
+  listeners.
+- Normalized repository source comments, diagnostics, test names, and benchmark
+  fixtures to professional English.
+- Added current architecture and reliability invariant documentation.
+- Made continuous integration run locked formatting, lint, and all-target tests.
+
+## 0.1.0 - Initial development baseline
 
 ### Added
-- Core sharded storage engine (64 shards, FNV-1a hashed, per-shard locking)
-- RESP protocol support (Redis-compatible clients work out of the box)
-- OnyxDB Binary Protocol (OBP) — a compact custom protocol served alongside RESP
-- Data types: strings, lists, hashes, sets
-- **JSON document type with path-level access**: `JSON.SET`, `JSON.GET`, `JSON.DEL`,
-  `JSON.TYPE`, `JSON.NUMINCRBY`, `JSON.ARRAPPEND`, `JSON.ARRLEN`, `JSON.OBJKEYS`,
-  supporting nested field access (`$.a.b`) and array indexing (`$.a[N]`)
-- Binary write-ahead log (binlog) with per-command persistence and crash-tolerant recovery
-- Gzip-compressed snapshot compaction
-- Configurable fsync policy (`always` / `everysec` / `no`)
-- Master/replica replication with partial resync based on a per-process replication ID,
-  falling back to full resync automatically when a master restarts
-- Optional `--auto-failover` for single-replica setups
-- Multi-user authentication (`--user name:password`, repeatable) plus legacy
-  single-password mode (`--requirepass`)
-- `MULTI` / `EXEC` / `DISCARD` transactions
-- `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH` pub/sub
-- Configurable memory limit (`--maxmemory`) with `noeviction`, `allkeys-lru`,
-  `volatile-lru`, `allkeys-random`, `volatile-random` eviction policies
-- Prometheus-formatted metrics endpoint
-- 96 automated tests covering the JSON path parser, binlog round-trips for every
-  persisted command, snapshot serialization, and replication resync logic
 
-### Fixed during development (pre-release)
-- `DECRBY` was written to the binlog but never decoded on replay, silently
-  losing decrements across a restart
-- A replica reconnecting after a master restart could be told "you're already
-  up to date" based on a stale offset it had no way to verify, silently
-  missing writes — fixed by requiring the replica to present a replication ID
-  that matches the master's current process, not just an offset number
-- `JSON.SET` / `JSON.DEL` were assigned binlog op-codes but had no serialization
-  logic wired up, so JSON writes were never actually persisted despite appearing to work in memory
+- A 64-shard in-memory engine with strings, integers, lists, hashes, sets, JSON,
+  and an internal vector representation.
+- RESP and OBP listeners.
+- JSON field and array path commands.
+- Write-ahead logging, gzip-compressed snapshots, and asynchronous replication.
+- Authentication, bounded transactions, Pub/Sub, memory policies, metrics, a
+  minimal CLI, and a development benchmark.
+
+The `0.1.0` codebase was an early development baseline. The unreleased
+reliability work above supersedes its original persistence and replication
+behavior.

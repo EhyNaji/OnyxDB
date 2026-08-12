@@ -1,142 +1,215 @@
-OnyxDB
+# OnyxDB
 
-A Redis-compatible, in-memory key-value store written from scratch in Rust — with native JSON path queries, dual-protocol networking, and built-in replication.
+OnyxDB is an experimental in-memory data platform written in Rust. It exposes a
+bounded RESP interface for a Redis-like command subset and a compact native
+binary protocol (OBP). Its distinguishing data model is a native JSON value with
+path-level reads and mutations.
 
-OnyxDB is not a Redis clone. It speaks the RESP protocol Redis clients already understand, but it adds capabilities Redis itself doesn't ship with out of the box — most notably a JSON document type you can read and write at the field level, without pulling the whole document over the wire.
+The project is in active development. The persistence and replication paths have
+strong regression coverage, but OnyxDB is not yet presented as a production
+replacement for Redis. Review the [known limitations](#known-limitations) before
+using it with important data.
 
-Why OnyxDB?
+## Highlights
 
-Redis is mature, fast, and battle-tested — this project doesn't try to out-Redis Redis on raw throughput. Instead, it targets a gap: applications that need simple, fast, path-addressable JSON storage (session state, agent memory, configuration blobs, nested user profiles) without reaching for a module like RedisJSON or a heavier document database like MongoDB.
+- Strings, integers, lists, hashes, sets, and native JSON documents.
+- JSON field and array access such as `$.profile.name` and `$.items[2]`.
+- RESP and OBP listeners with bounded, fail-closed frame parsing.
+- Checksummed write-ahead logging and versioned gzip-compressed snapshots.
+- Ordered asynchronous master/replica synchronization with authenticated
+  upstream connections, partial resynchronization, and full-state replacement.
+- Projected `maxmemory` admission with optional LRU or random eviction.
+- Bounded `MULTI`/`EXEC` queues and atomic visibility for committed transaction
+  batches.
+- Prometheus-formatted metrics and a Redis-style `INFO` response.
 
-JSON.SET user:42 $ {"name":"Marco","address":{"city":"Rome"},"tags":["dev","rust"]}
-JSON.GET user:42 $.address.city        → "Rome"
+## Quick start
+
+OnyxDB requires a recent stable Rust toolchain.
+
+```bash
+git clone https://github.com/EhyNaji/OnyxDB.git
+cd OnyxDB
+cargo build --release --locked
+cargo run --release --locked -- --port 6380
+```
+
+The server binds only to loopback and opens three listeners derived from the
+configured port:
+
+| Listener | Default address | Purpose |
+| --- | --- | --- |
+| RESP | `127.0.0.1:6380` | Primary client protocol |
+| OBP | `127.0.0.1:6381` | Native binary protocol |
+| Metrics | `127.0.0.1:7380` | HTTP `/metrics` endpoint |
+
+Connect with the bundled interactive client:
+
+```bash
+cargo run --release --locked --bin onyx-cli -- --port 6380
+```
+
+The client is intentionally small and is not a full `redis-cli` replacement.
+For exact argument boundaries, binary data, or scripted use, prefer a RESP
+client library.
+
+## JSON example
+
+```text
+JSON.SET user:42 $ {"name":"Morgan","address":{"city":"Rome"},"tags":["dev","rust"]}
+JSON.GET user:42 $.address.city
 JSON.SET user:42 $.address.city "Milan"
 JSON.NUMINCRBY user:42 $.visits 1
 JSON.ARRAPPEND user:42 $.tags "backend"
+```
 
-Every JSON.* command is fully persisted (binlog + snapshot) and replicated to connected replicas — it isn't a bolted-on feature, it's part of the core write path.
-Note: the codebase is developed by an Italian author, and a fair amount of internal comments are still in Italian. The public interface (commands, this README, error messages) is in English throughout; comment translation is on the to-do list.
+Paths support object fields and non-negative array indices. Wildcards, filters,
+recursive descent, and automatic creation of missing intermediate objects are
+not supported.
 
+## Command surface
 
-Features:
-Data types — strings, lists, hashes, sets, and JSON documents with path-level access ($.field, $.nested.field, $.array[N]).
+- Strings and numbers: `SET`, `GET`, `GETSET`, `SETNX`, `MSET`, `MGET`,
+  `APPEND`, `STRLEN`, `INCR`, `INCRBY`, `DECRBY`
+- Keys: `DEL`, `EXISTS`, `TYPE`, `EXPIRE`, `EXPIREAT`, `TTL`, `RENAME`,
+  `COPY`, `KEYS`
+- Lists: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`
+- Hashes: `HSET`, `HGET`, `HGETALL`, `HDEL`, `HKEYS`, `HVALS`
+- Sets: `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`
+- JSON: `JSON.SET`, `JSON.GET`, `JSON.DEL`, `JSON.TYPE`,
+  `JSON.NUMINCRBY`, `JSON.ARRAPPEND`, `JSON.ARRLEN`, `JSON.OBJKEYS`
+- Transactions: `MULTI`, `EXEC`, `DISCARD`
+- Pub/Sub: `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`
+- Server: `PING`, `INFO`, `SAVE`, `AUTH`, `REPLICAOF NO ONE`
 
-Two wire protocols — RESP (Redis-compatible, works with existing Redis clients and tooling) and OBP (OnyxDB Binary Protocol, a compact custom protocol for lower-overhead access), served on adjacent ports simultaneously.
+This is a compatible subset, not a claim of complete Redis protocol or command
+compatibility.
 
-Replication — asynchronous master/replica replication with partial resync, optional upstream authentication, and sequence-bound heartbeats. Each master generates a replication ID on startup; a replica reconnecting after a network blip resumes from its last offset only if the master is provably the same process it was talking to before, otherwise it falls back to a full resync automatically. Optional --auto-failover lets a replica self-promote if its master stays unreachable past a configurable timeout (single-replica setups only — no split-brain coordination across multiple replicas yet).
+## Configuration
 
-Persistence — a checksummed binary write-ahead log (binlog) for durability plus periodic gzip-compressed snapshot compaction, with configurable fsync policy (always / everysec / no). Startup recovery truncates only a recognizable incomplete final record and fails closed on complete corrupted records.
+| Option | Meaning |
+| --- | --- |
+| `--port <n>` | RESP port; must leave room for OBP at `port+1` and metrics at `port+1000` (default `6380`) |
+| `--replica-of <host:port>` | Start as a replica of the specified master |
+| `--masterauth <password>` | Password used to authenticate to the master |
+| `--masteruser <name>` | Master authentication user; defaults to `default` and requires a password |
+| `--requirepass <password>` | Configure the legacy `default` user password |
+| `--user <name:password>` | Configure an authenticated user; repeatable |
+| `--appendfsync <always\|everysec\|no>` | Binlog synchronization policy (default `everysec`) |
+| `--maxmemory <size>` | Logical dataset limit, for example `100mb` or `1gb`; zero/unset disables it |
+| `--maxmemory-policy <policy>` | `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-random`, or `volatile-random` |
+| `--auto-failover` | Self-promote after the upstream remains unavailable beyond the timeout |
+| `--failover-timeout <seconds>` | Auto-failover threshold (default `30`) |
 
-Access control — multi-user authentication (--user name:password, repeatable) with AUTH user pass, plus legacy single-password mode via --requirepass for compatibility.
+`ONYXDB_PASSWORD`, `ONYXDB_MASTER_USER`, and `ONYXDB_MASTER_PASSWORD` are
+supported. Command-line values take precedence. Environment variables reduce
+credential exposure through process listings, but OnyxDB does not currently
+provide TLS.
 
-Transactions — MULTI / EXEC / DISCARD with queues bounded to 1,024 commands and 16 MiB. Successful mutations in one EXEC become a single visibility, persistence, and replication batch; per-command runtime errors do not roll back other successful queued commands.
+## Persistence
 
-Pub/Sub — SUBSCRIBE, UNSUBSCRIBE, PUBLISH, with dynamic channel subscription while a connection is already listening.
+Runtime data is written in the process working directory:
 
-Memory management — optional --maxmemory limit with noeviction, allkeys-lru, volatile-lru, allkeys-random, or volatile-random eviction policies.
+- `onyx.binlog`: ordered committed-effect records with sequence numbers and
+  CRC32 checksums.
+- `onyx.snapshot`: the current versioned, gzip-compressed snapshot.
+- `onyx.snapshot.previous`: the previous snapshot retained across replacement.
+- `onyx.replica`: durable replica lifecycle and synchronization identity.
 
-Observability — Prometheus-formatted metrics exposed over plain HTTP (/metrics) on a dedicated port, alongside a Redis-style INFO command.
+A mutation is published to replicas only after its binlog append succeeds. The
+acknowledgement durability depends on `--appendfsync`: `always` synchronizes each
+batch, `everysec` synchronizes in the background, and `no` relies on the
+operating system after userspace flush.
 
-Sharded engine — 64 independently-locked shards (FNV-1a hashed) to keep lock contention limited to keys that happen to collide on the same shard, instead of a single global lock.
+Recovery installs a snapshot and replays only binlog sequences after the
+snapshot watermark. A recognizable incomplete final record may be truncated;
+complete corrupted records, sequence gaps, and ambiguous legacy data fail
+startup rather than being skipped. Compaction installs and synchronizes the new
+snapshot before truncating the binlog.
 
-Quick start
+## Replication
 
-Requires a recent stable Rust toolchain.
+Start a master and a replica in separate working directories so their runtime
+files do not overlap:
 
-bash
-git clone https://github.com/<EhyNaji>/onyxdb.git
-cd onyxdb
-cargo build --release
+```bash
+# Master directory
+cargo run --release --locked -- --port 6380
 
-Start a server:
+# Replica directory
+cargo run --release --locked -- \
+  --port 6385 \
+  --replica-of 127.0.0.1:6380
+```
 
-bash
-cargo run --release -- --port 6380
+Replicas reject direct mutations. Incremental synchronization uses a master
+process identity and a contiguous committed sequence; otherwise the replica
+installs a complete snapshot. Full synchronization is staged and becomes
+visible only after its durable baseline is installed. Promotion first cancels
+and drains the old upstream lifecycle, then durably detaches the replica before
+accepting local writes.
 
-This opens three listeners:
+Upstream authentication is available through `--masteruser` and
+`--masterauth`, or their environment-variable equivalents.
 
-6380 — RESP (Redis protocol)
-6381 — OBP (OnyxDB binary protocol)
-7380 — Prometheus metrics (http://127.0.0.1:7380/metrics)
+`--auto-failover` is safe only when external deployment rules guarantee a
+single promotion candidate. OnyxDB has no quorum, fencing service, or consensus
+protocol and therefore cannot prevent split brain among multiple replicas.
 
-Connect with the bundled CLI:
+## Transactions and memory admission
 
-bash
-cargo run --release --bin onyx-cli -- --port 6380
+Transaction queues are limited to 1,024 commands and approximately 16 MiB of
+encoded arguments. A transaction containing writes is serialized through the
+same authoritative write order as a single mutation. Its successful state
+changes become one persistence and replication batch. Runtime errors for one
+queued command are returned in the result array and do not imply Redis-style
+rollback of unrelated successful commands.
 
-Or with any RESP-compatible client, including redis-cli.
+`maxmemory` is enforced against projected logical dataset usage after a
+mutation. Growth that cannot fit is rolled back. Eviction victims are part of
+the same committed batch, so recovery and replicas observe the same result.
+This limit is a stable logical accounting measure, not a process RSS limit.
 
-Replication
+## Verification
 
-Start a master, then point a second instance at it:
+Run the same checks used by continuous integration:
 
-bash
-cargo run --release -- --port 6380
-cargo run --release -- --port 6385 --replica-of 127.0.0.1:6380
+```bash
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+git diff --check
+```
 
-Writes on the master appear on the replica in real time. Replicas reject direct writes (READONLY) — all mutation flows through the master and gets replicated downstream.
+The suite includes unit, malformed-input, concurrency, persistence restart,
+replication, lifecycle, and real network/subprocess coverage.
 
-Command reference
+The bundled `onyx-bench` binary is currently a development smoke benchmark. It
+does not yet provide a controlled comparative methodology or latency
+percentiles and should not be used for public performance claims.
 
-Strings — SET key value [EX sec|PX ms|EXAT ts] [NX|XX], GET, GETSET, SETNX, MSET, MGET, APPEND, STRLEN, INCR, INCRBY, DECRBY
+## Architecture
 
-Keys — DEL, EXISTS, TYPE, EXPIRE [NX|XX], EXPIREAT, TTL, RENAME, COPY, KEYS pattern
+See [docs/architecture.md](docs/architecture.md) for the current module
+boundaries, mutation ordering, persistence and replication invariants, and the
+incremental decomposition plan.
 
-Lists — LPUSH, RPUSH, LPOP, RPOP, LRANGE start stop, LLEN
+## Known limitations
 
-Hashes — HSET, HGET, HGETALL, HDEL, HKEYS, HVALS
+- Loopback-only listeners; no configurable external bind address.
+- No TLS and no command-level authorization. Authenticated users have the same
+  command permissions.
+- No cluster mode, consensus, quorum, or automatic multi-replica fencing.
+- Replication is asynchronous; acknowledged master writes can be ahead of a
+  replica.
+- Pub/Sub is ephemeral and is neither persisted nor replicated.
+- OBP exposes only a small command subset and is not a stable public protocol.
+- JSON path support is deliberately limited as described above.
+- The engine contains an internal vector value representation, but no public
+  vector commands are implemented.
+- The server runtime remains concentrated in `main.rs`; decomposition is in
+  progress and is being performed in reviewable, invariant-preserving steps.
 
-Sets — SADD, SREM, SMEMBERS, SISMEMBER
+## License
 
-JSON — JSON.SET key path value, JSON.GET key [path], JSON.DEL key path, JSON.TYPE key [path], JSON.NUMINCRBY key path delta, JSON.ARRAPPEND key path value, JSON.ARRLEN key [path], JSON.OBJKEYS key [path]
-
-Path syntax supports field access ($.field) and array indexing ($.field[N]), including nesting ($.a.b[2].c). Wildcards and filters are not supported.
-
-Transactions — MULTI, EXEC, DISCARD
-
-Pub/Sub — SUBSCRIBE channel [channel ...], UNSUBSCRIBE [channel ...], PUBLISH channel message
-
-Server — PING, INFO, SAVE, AUTH [user] password, REPLICAOF NO ONE
-
-Configuration flags
-Flag	Description
---port <n>	RESP listener port (default 6380); OBP binds to port+1, metrics to port+1000
---replica-of <host:port>	Start as a replica of the given master
---masterauth <password>	Authenticate replication to the upstream master
---masteruser <name>	Upstream authentication user (default: default; requires --masterauth)
---requirepass <password>	Enable single-password auth (legacy, maps to the default user)
---user <name:password>	Add an authenticated user (repeatable)
---appendfsync <always|everysec|no>	Binlog fsync policy (default everysec)
---maxmemory <size>	Memory limit, accepts suffixes like 100mb, 1gb (default: unlimited)
---maxmemory-policy <policy>	Eviction policy when over the limit (default noeviction)
---auto-failover	Let a replica self-promote after losing its master (single-replica setups only)
---failover-timeout <secs>	Unreachable-master threshold before self-promotion (default 30)
-
-Upstream credentials can also be supplied through `ONYXDB_MASTER_PASSWORD` and `ONYXDB_MASTER_USER`. Prefer the environment variables when command-line arguments may be visible to other local users.
-Architecture notes
-
-Storage is a custom sharded engine (OnyxEngine), not a wrapper around an existing embedded database — 64 shards, each behind its own mutex, keyed by an FNV-1a hash. Cross-shard operations (like RENAME) lock shards in a fixed ascending order to avoid deadlocks between concurrent operations touching the same two shards.
-
-Every write command flows through a single choke point (persist_and_replicate) that assigns a monotonic replication offset, pushes the command onto a bounded in-memory backlog (for partial resync), broadcasts it to any subscribed replicas, and appends a binary record to the write-ahead log. Because there's exactly one path for this, JSON commands, string commands, and everything else stay consistent by construction rather than by convention.
-
-The binlog uses a compact, versioned binary format — each record is length-prefixed and self-describing enough that corruption or truncation (e.g. from a crash mid-write) causes that single record to be skipped during recovery, not a failed startup.
-
-Testing
-bash
-cargo test
-
-The suite (95+ tests at last count) covers binlog encode/decode round-trips for every persisted command, snapshot serialization, the JSON path parser and its edge cases (missing intermediate nodes, out-of-range indices, type mismatches), and the replication resync decision logic — including a regression test for a bug where a replica reconnecting after a master restart could silently miss writes (fixed by binding partial resync to a replication ID, not just an offset number).
-
-Known limitations
---auto-failover has no cross-replica coordination — safe with exactly one replica per master, not with multiple.
-JSON paths support field access and array indexing only; no wildcards, no filter expressions.
-Vector storage (OnyxValue::Vector) exists in the engine but has no commands wired up yet.
-No cluster mode / sharding across multiple nodes — single-master replication only.
-The OBP binary protocol currently exposes a small subset of commands (GET/SET/DEL/PING); RESP is the primary interface.
-Contributing
-
-Issues and pull requests are welcome. If you're proposing a new command or behavior change, a short description of the use case helps a lot — this project tries to stay focused on solving problems Redis doesn't already solve well, rather than re-implementing its full surface area.
-
-License
-
-MIT — see LICENSE.
+OnyxDB is licensed under the MIT License. See [License](License).
