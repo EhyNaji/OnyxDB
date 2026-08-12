@@ -1,8 +1,10 @@
+mod config;
 mod engine;
 mod protocol;
 mod resp;
 mod storage;
 use bytes::Bytes;
+use config::{FsyncPolicy, ServerConfig, UpstreamCredentials};
 use engine::{DataEntry, EntryMutation, EvictionPolicy, OnyxEngine, OnyxValue};
 use flate2::Compression;
 use flate2::read::GzDecoder;
@@ -10,7 +12,6 @@ use flate2::write::GzEncoder;
 use protocol::{MAX_OBP_FRAME_SIZE, OBPFrame};
 use resp::{CLIENT_RESP_LIMITS, RESPReadLimits, RESPValue, read_command_with_timeouts};
 use std::collections::HashSet;
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader as StdBufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -181,24 +182,6 @@ fn check_credentials(username: &str, password: &str) -> bool {
 // - EverySec: fsync once per second in the background. A system or hardware
 //   crash may lose up to approximately one second of acknowledged writes.
 // - No: flush userspace buffers without an explicit fsync.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FsyncPolicy {
-    Always,
-    EverySec,
-    No,
-}
-
-impl FsyncPolicy {
-    fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "always" => Some(FsyncPolicy::Always),
-            "everysec" => Some(FsyncPolicy::EverySec),
-            "no" => Some(FsyncPolicy::No),
-            _ => None,
-        }
-    }
-}
-
 static FSYNC_POLICY: std::sync::OnceLock<FsyncPolicy> = std::sync::OnceLock::new();
 
 fn fsync_policy() -> FsyncPolicy {
@@ -235,27 +218,6 @@ fn open_binlog_file(path: &Path) -> File {
 // Admission evaluates the authoritative post-mutation state. A value of zero
 // disables the limit; otherwise the configured policy decides whether the
 // command can evict unrelated keys or must fail without changing state.
-/// Parses memory sizes such as `100mb`, `1gb`, `500kb`, or a raw byte count.
-fn parse_memory_size(s: &str) -> Option<usize> {
-    let s = s.trim().to_ascii_lowercase();
-    let (number_part, multiplier) = if let Some(n) = s.strip_suffix("gb") {
-        (n, 1024 * 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix("mb") {
-        (n, 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix("kb") {
-        (n, 1024)
-    } else if let Some(n) = s.strip_suffix('b') {
-        (n, 1)
-    } else {
-        (s.as_str(), 1)
-    };
-    number_part
-        .trim()
-        .parse::<usize>()
-        .ok()
-        .and_then(|n| n.checked_mul(multiplier))
-}
-
 // Cached wall-clock time for inexpensive expiration checks.
 static CURRENT_TIME: AtomicU64 = AtomicU64::new(0);
 static START_TIME: AtomicU64 = AtomicU64::new(0);
@@ -6230,120 +6192,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     REPL_ID.set(repl_id_val).ok();
     info!("This instance's replication ID: {}", repl_id_val);
-    let args: Vec<String> = env::args().collect();
-    let mut master_addr: Option<String> = None;
-    let mut master_user: Option<String> = None;
-    let mut master_password: Option<String> = None;
-    let mut password: Option<String> = None;
-    let mut appendfsync: Option<String> = None;
-    let mut maxmemory_arg: Option<String> = None;
-    let mut maxmemory_policy_arg: Option<String> = None;
-    let mut users_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut auto_failover = false;
-    let mut failover_timeout_secs: u64 = 30;
-    for i in 0..args.len() {
-        if args[i] == "--replica-of" && i + 1 < args.len() {
-            master_addr = Some(args[i + 1].clone());
-        }
-        if args[i] == "--masteruser" && i + 1 < args.len() {
-            master_user = Some(args[i + 1].clone());
-        }
-        if args[i] == "--masterauth" && i + 1 < args.len() {
-            master_password = Some(args[i + 1].clone());
-        }
-        if args[i] == "--requirepass" && i + 1 < args.len() {
-            password = Some(args[i + 1].clone());
-        }
-        if args[i] == "--appendfsync" && i + 1 < args.len() {
-            appendfsync = Some(args[i + 1].clone());
-        }
-        if args[i] == "--maxmemory" && i + 1 < args.len() {
-            maxmemory_arg = Some(args[i + 1].clone());
-        }
-        if args[i] == "--maxmemory-policy" && i + 1 < args.len() {
-            maxmemory_policy_arg = Some(args[i + 1].clone());
-        }
-        // `--user name:password` may be repeated.
-        if args[i] == "--user" && i + 1 < args.len() {
-            match args[i + 1].split_once(':') {
-                Some((name, pw)) => {
-                    users_map.insert(name.to_string(), pw.to_string());
-                }
-                None => warn!("Invalid format for --user; expected name:password"),
-            }
-        }
-        if args[i] == "--auto-failover" {
-            auto_failover = true;
-        }
-        if args[i] == "--failover-timeout" && i + 1 < args.len() {
-            failover_timeout_secs = args[i + 1].parse::<u64>().unwrap_or(30);
-        }
+    let ServerConfig {
+        master_addr,
+        upstream_credentials,
+        users,
+        fsync_policy: policy,
+        maxmemory_bytes: maxmemory_val,
+        maxmemory_policy: mm_policy,
+        auto_failover,
+        failover_timeout_secs,
+        port,
+        warnings,
+    } = ServerConfig::from_process()?;
+    for warning in &warnings {
+        warn!("{}", warning);
     }
-    if password.is_none() {
-        password = env::var("ONYXDB_PASSWORD").ok();
-    }
-    if master_user.is_none() {
-        master_user = env::var("ONYXDB_MASTER_USER").ok();
-    }
-    if master_password.is_none() {
-        master_password = env::var("ONYXDB_MASTER_PASSWORD").ok();
-    }
-    if master_user.is_some() && master_password.is_none() {
-        return Err(
-            "upstream replication username requires --masterauth or ONYXDB_MASTER_PASSWORD".into(),
-        );
-    }
-    if master_addr.is_none() && (master_user.is_some() || master_password.is_some()) {
-        return Err("upstream replication credentials require --replica-of".into());
-    }
-    let upstream_credentials = master_password.map(|password| UpstreamCredentials {
-        username: master_user.unwrap_or_else(|| "default".to_string()),
-        password,
-    });
-    // Legacy single-password mode configures the `default` user.
-    if let Some(pw) = password {
-        users_map.insert("default".to_string(), pw);
-    }
-    let num_users = users_map.len();
-    USERS.set(users_map).ok();
+    let num_users = users.len();
+    USERS.set(users).ok();
     if num_users > 0 {
         info!("Authentication required: {} user(s) configured", num_users);
     }
-
-    let policy = match appendfsync.as_deref() {
-        Some(s) => FsyncPolicy::parse(s).unwrap_or_else(|| {
-            warn!(
-                "Invalid value for --appendfsync ('{}'), using 'everysec' as default",
-                s
-            );
-            FsyncPolicy::EverySec
-        }),
-        None => FsyncPolicy::EverySec,
-    };
     FSYNC_POLICY.set(policy).ok();
     info!("Binlog fsync policy: {:?}", policy);
-
-    // maxmemory accepts suffixes such as 100mb and 1gb, or a raw byte count.
-    let maxmemory_val: usize = match maxmemory_arg.as_deref() {
-        Some(s) => parse_memory_size(s).unwrap_or_else(|| {
-            warn!(
-                "Invalid value for --maxmemory ('{}'); memory limiting is disabled",
-                s
-            );
-            0
-        }),
-        None => 0,
-    };
-    let mm_policy = match maxmemory_policy_arg.as_deref() {
-        Some(s) => EvictionPolicy::parse(s).unwrap_or_else(|| {
-            warn!(
-                "Invalid value for --maxmemory-policy ('{}'); using 'noeviction'",
-                s
-            );
-            EvictionPolicy::NoEviction
-        }),
-        None => EvictionPolicy::NoEviction,
-    };
     if maxmemory_val > 0 {
         info!(
             "Dataset memory limit: {} bytes, policy {:?}",
@@ -6460,16 +6330,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let mut port = "6380".to_string();
-    for i in 0..args.len() {
-        if args[i] == "--port" && i + 1 < args.len() {
-            port = args[i + 1].clone();
-        }
-    }
     let bind_addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("Server listening on {}", bind_addr);
-    let obp_port = port.parse::<u16>().unwrap_or(6380) + 1;
+    let obp_port = port + 1;
     let obp_addr = format!("127.0.0.1:{}", obp_port);
     let obp_listener = TcpListener::bind(&obp_addr).await?;
     info!("OBP (binary) server listening on {}", obp_addr);
@@ -6489,7 +6353,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     });
-    let metrics_port: u16 = port.parse::<u16>().unwrap_or(6380) + 1000;
+    let metrics_port = port + 1000;
     let store_metrics = Arc::clone(&store);
     let persistence_metrics = Arc::clone(&persistence);
     tokio::spawn(async move {
@@ -6544,11 +6408,6 @@ struct ReplicaRuntimeConfig {
     liveness_timeout: Duration,
     initial_replid: u64,
     initial_offset: u64,
-}
-
-struct UpstreamCredentials {
-    username: String,
-    password: String,
 }
 
 fn parse_replica_sync_handshake(
@@ -7432,6 +7291,7 @@ async fn run_replica(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -7571,11 +7431,6 @@ mod tests {
         let store = ShardedStore::new();
         store.set("key1".to_string(), "value1".to_string());
         assert_eq!(store.get("key1"), Ok(Some("value1".to_string())));
-    }
-
-    #[test]
-    fn memory_size_parser_rejects_overflow() {
-        assert_eq!(parse_memory_size(&format!("{}gb", usize::MAX)), None);
     }
 
     #[test]
