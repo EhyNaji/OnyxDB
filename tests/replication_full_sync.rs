@@ -361,6 +361,32 @@ fn replica_authenticates_to_a_protected_master() {
 }
 
 #[test]
+fn obp_authentication_rejects_invalid_utf8_credentials() {
+    let directory = TestDirectory::new("obp-invalid-utf8-auth");
+    let port = choose_port();
+    let password = "\u{fffd}";
+    let server = start_server(
+        &directory.0,
+        port,
+        &["--requirepass".to_string(), password.to_string()],
+    );
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port + 1)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(&encode_obp_frame(0x10, 1, &[&[0xff]]))
+        .unwrap();
+    stream.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+
+    assert_eq!(read_obp_response(&mut reader), (1, b"WRONGPASS".to_vec()));
+
+    server.stop();
+}
+
+#[test]
 fn master_emits_sequence_bound_heartbeats_when_negotiated() {
     let master_directory = TestDirectory::new("heartbeat-master");
     let master_port = choose_port();

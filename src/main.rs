@@ -50,7 +50,10 @@ const COMPACTION_THRESHOLD: usize = 100000;
 const MAX_KEYS: usize = 1_000_000;
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const CLIENT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+const OBP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const OBP_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLICATION_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLICATION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLICATION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLICATION_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLICATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
@@ -3206,17 +3209,50 @@ struct ChunkedReplicationRecord {
     payload: Vec<u8>,
 }
 
+async fn write_replication_bytes_with_timeout<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    timeout: Duration,
+) -> std::io::Result<()> {
+    tokio::time::timeout(timeout, writer.write_all(bytes))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Replication peer write timeout",
+            )
+        })?
+}
+
+async fn write_replication_bytes<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    write_replication_bytes_with_timeout(writer, bytes, REPLICATION_WRITE_TIMEOUT).await
+}
+
+async fn flush_replication_writer<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+) -> std::io::Result<()> {
+    tokio::time::timeout(REPLICATION_WRITE_TIMEOUT, writer.flush())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Replication peer flush timeout",
+            )
+        })?
+}
+
 async fn write_chunked_replication_record<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     record: &ChunkedReplicationRecord,
 ) -> std::io::Result<()> {
-    writer
-        .write_all(&encode_replication_command(&record.header))
-        .await?;
+    write_replication_bytes(writer, &encode_replication_command(&record.header)).await?;
     for chunk in record.payload.chunks(REPLICATION_CHUNK_SIZE) {
         let frame =
             encode_replication_command(&[record.chunk_command.to_string(), hex_encode(chunk)]);
-        writer.write_all(&frame).await?;
+        write_replication_bytes(writer, &frame).await?;
     }
     Ok(())
 }
@@ -4597,7 +4633,10 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             if let Some(missing) = backlog_snapshot {
                 last_sent_offset = requested_offset;
                 let marker = format!("+CONTINUE3 {} {}\r\n", repl_id(), requested_offset);
-                if buf_writer.write_all(marker.as_bytes()).await.is_err() {
+                if write_replication_bytes(&mut buf_writer, marker.as_bytes())
+                    .await
+                    .is_err()
+                {
                     reader_task.abort();
                     persistence
                         .replica_status
@@ -4652,7 +4691,10 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     full_sync_offset,
                     snapshot_entries.len()
                 );
-                if buf_writer.write_all(marker.as_bytes()).await.is_err() {
+                if write_replication_bytes(&mut buf_writer, marker.as_bytes())
+                    .await
+                    .is_err()
+                {
                     reader_task.abort();
                     persistence
                         .replica_status
@@ -4696,8 +4738,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             }
 
             let syncdone_marker = format!("+SYNCDONE3 {} {}\r\n", repl_id(), last_sent_offset);
-            if buf_writer
-                .write_all(syncdone_marker.as_bytes())
+            if write_replication_bytes(&mut buf_writer, syncdone_marker.as_bytes())
                 .await
                 .is_err()
             {
@@ -4709,7 +4750,15 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     .remove(&replica_id);
                 return;
             }
-            let _ = buf_writer.flush().await;
+            if flush_replication_writer(&mut buf_writer).await.is_err() {
+                reader_task.abort();
+                persistence
+                    .replica_status
+                    .lock()
+                    .unwrap()
+                    .remove(&replica_id);
+                return;
+            }
 
             info!(
                 "Replica {} entered live streaming at sequence {}",
@@ -4733,8 +4782,8 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     }
                     _ = heartbeat.tick(), if heartbeat_enabled => {
                         let frame = format!("REPLCONF PING {}\r\n", last_sent_offset);
-                        if buf_writer.write_all(frame.as_bytes()).await.is_err()
-                            || buf_writer.flush().await.is_err()
+                        if write_replication_bytes(&mut buf_writer, frame.as_bytes()).await.is_err()
+                            || flush_replication_writer(&mut buf_writer).await.is_err()
                         {
                             break;
                         }
@@ -4760,7 +4809,9 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                                 {
                                     break;
                                 }
-                                let _ = buf_writer.flush().await;
+                                if flush_replication_writer(&mut buf_writer).await.is_err() {
+                                    break;
+                                }
                                 last_sent_offset = offset;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -5421,6 +5472,23 @@ async fn handle_obp_client(
     store: Arc<ShardedStore>,
     persistence: Arc<Persistence>,
 ) {
+    handle_obp_client_with_timeouts(
+        stream,
+        store,
+        persistence,
+        OBP_IDLE_TIMEOUT,
+        OBP_FRAME_TIMEOUT,
+    )
+    .await;
+}
+
+async fn handle_obp_client_with_timeouts(
+    stream: TcpStream,
+    store: Arc<ShardedStore>,
+    persistence: Arc<Persistence>,
+    idle_timeout: Duration,
+    frame_timeout: Duration,
+) {
     let _ = stream.set_nodelay(true);
     let peer_address = stream.peer_addr().ok();
     let (reader, writer) = stream.into_split();
@@ -5429,17 +5497,35 @@ async fn handle_obp_client(
     let mut buf = bytes::BytesMut::with_capacity(4096);
     let mut read_buffer = [0u8; 8192];
     let mut authenticated = !auth_required();
+    let mut frame_started_at: Option<tokio::time::Instant> = None;
     'connection: loop {
-        match buf_reader.read(&mut read_buffer).await {
-            Ok(0) => break,
-            Ok(bytes_read) => {
+        let read_timeout = frame_started_at.map_or(idle_timeout, |started_at| {
+            frame_timeout.saturating_sub(started_at.elapsed())
+        });
+        if read_timeout.is_zero() {
+            warn!("Closing OBP connection after frame assembly timeout");
+            break;
+        }
+        match tokio::time::timeout(read_timeout, buf_reader.read(&mut read_buffer)).await {
+            Err(_) => {
+                let reason = if frame_started_at.is_some() {
+                    "frame assembly timeout"
+                } else {
+                    "client idle timeout"
+                };
+                warn!("Closing OBP connection after {}", reason);
+                break;
+            }
+            Ok(Ok(0)) => break,
+            Ok(Ok(bytes_read)) => {
+                frame_started_at.get_or_insert_with(tokio::time::Instant::now);
                 if buf.len().saturating_add(bytes_read) > MAX_OBP_FRAME_SIZE + read_buffer.len() {
                     warn!("Closing OBP connection with an oversized incomplete frame");
                     break;
                 }
                 buf.extend_from_slice(&read_buffer[..bytes_read]);
             }
-            Err(_) => break,
+            Ok(Err(_)) => break,
         }
 
         let mut wrote_response = false;
@@ -5468,18 +5554,33 @@ async fn handle_obp_client(
             )
             .await;
             let mut out = bytes::BytesMut::new();
-            if response.encode(&mut out).is_err() || buf_writer.write_all(&out).await.is_err() {
+            if response.encode(&mut out).is_err() {
+                return;
+            }
+            let write_result = tokio::time::timeout(frame_timeout, buf_writer.write_all(&out));
+            if !matches!(write_result.await, Ok(Ok(()))) {
                 return;
             }
             wrote_response = true;
         }
 
-        if wrote_response && buf_writer.flush().await.is_err() {
-            return;
+        if buf.is_empty() {
+            frame_started_at = None;
+        } else if wrote_response {
+            // Do not charge server-side command execution time to the next
+            // pipelined frame's assembly budget.
+            frame_started_at = Some(tokio::time::Instant::now());
+        }
+
+        if wrote_response {
+            let flush_result = tokio::time::timeout(frame_timeout, buf_writer.flush()).await;
+            if !matches!(flush_result, Ok(Ok(()))) {
+                return;
+            }
         }
     }
 
-    let _ = buf_writer.flush().await;
+    let _ = tokio::time::timeout(frame_timeout, buf_writer.flush()).await;
 }
 
 async fn append_committed_batch(
@@ -5946,20 +6047,17 @@ async fn execute_obp_command(
 
     // AUTH via OBP (codice 0x10): arg[0]=password, oppure arg[0]=utente e arg[1]=password.
     if cmd == 0x10 {
-        let (user, pass) = if args.len() >= 2 {
-            (
-                String::from_utf8_lossy(&args[0]).to_string(),
-                String::from_utf8_lossy(&args[1]).to_string(),
-            )
+        let credentials = if args.len() >= 2 {
+            std::str::from_utf8(&args[0])
+                .ok()
+                .zip(std::str::from_utf8(&args[1]).ok())
         } else {
-            (
-                "default".to_string(),
-                args.first()
-                    .map(|a| String::from_utf8_lossy(a).to_string())
-                    .unwrap_or_default(),
-            )
+            args.first()
+                .and_then(|password| std::str::from_utf8(password).ok())
+                .map(|password| ("default", password))
         };
-        let ok = auth_required() && check_credentials(&user, &pass);
+        let ok = auth_required()
+            && credentials.is_some_and(|(user, password)| check_credentials(user, password));
         if ok {
             *authenticated = true;
         }
@@ -6257,10 +6355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some((name, pw)) => {
                     users_map.insert(name.to_string(), pw.to_string());
                 }
-                None => warn!(
-                    "Invalid format for --user ( expected name:password): '{}'",
-                    args[i + 1]
-                ),
+                None => warn!("Invalid format for --user; expected name:password"),
             }
         }
         if args[i] == "--auto-failover" {
@@ -6764,9 +6859,11 @@ async fn run_replica(
 
                 if let Some(credentials) = credentials.as_ref() {
                     let auth_command = encode_upstream_auth(credentials);
-                    let Some(auth_write) =
-                        await_or_stop(&mut stop_rx, writer.write_all(auth_command.as_bytes()))
-                            .await
+                    let Some(auth_write) = await_or_stop(
+                        &mut stop_rx,
+                        write_replication_bytes(&mut writer, auth_command.as_bytes()),
+                    )
+                    .await
                     else {
                         return;
                     };
@@ -6879,8 +6976,11 @@ async fn run_replica(
                 let starting_offset = local_offset.load(Ordering::SeqCst);
                 let known_replid = local_replid.load(Ordering::SeqCst);
                 let sync_cmd = format!("SYNC3 {} {} HEARTBEAT\r\n", known_replid, starting_offset);
-                let Some(sync_write) =
-                    await_or_stop(&mut stop_rx, writer.write_all(sync_cmd.as_bytes())).await
+                let Some(sync_write) = await_or_stop(
+                    &mut stop_rx,
+                    write_replication_bytes(&mut writer, sync_cmd.as_bytes()),
+                )
+                .await
                 else {
                     return;
                 };
@@ -7059,9 +7159,11 @@ async fn run_replica(
                         }
                         let off = ack_offset.load(Ordering::SeqCst);
                         let ack_cmd = format!("REPLCONF ACK {}\r\n", off);
-                        let Some(write_result) =
-                            await_or_stop(&mut ack_stop_rx, writer.write_all(ack_cmd.as_bytes()))
-                                .await
+                        let Some(write_result) = await_or_stop(
+                            &mut ack_stop_rx,
+                            write_replication_bytes(&mut writer, ack_cmd.as_bytes()),
+                        )
+                        .await
                         else {
                             break;
                         };
@@ -8016,6 +8118,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replication_writes_to_unresponsive_peers_are_bounded() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let error = write_replication_bytes_with_timeout(
+            &mut writer,
+            &[0u8; 4096],
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
     async fn replication_wire_preserves_argument_boundaries() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -8088,6 +8204,40 @@ mod tests {
         sender.await.unwrap();
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn obp_idle_and_partial_frames_have_bounded_lifetimes() {
+        for prefix in [Vec::new(), vec![protocol::OBP_MAGIC]] {
+            let directory = TestPersistenceDirectory::new();
+            let (log_tx, _log_rx) = mpsc::channel::<LogMessage>(1);
+            let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+            let store = Arc::new(ShardedStore::new());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                handle_obp_client_with_timeouts(
+                    stream,
+                    store,
+                    persistence,
+                    Duration::from_millis(25),
+                    Duration::from_millis(25),
+                )
+                .await;
+            });
+
+            let mut client = TcpStream::connect(address).await.unwrap();
+            if !prefix.is_empty() {
+                client.write_all(&prefix).await.unwrap();
+                client.flush().await.unwrap();
+            }
+
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .expect("OBP connection must close at its configured deadline")
+                .unwrap();
+        }
     }
 
     #[tokio::test]
