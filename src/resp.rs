@@ -11,7 +11,7 @@ pub enum RESPValue {
     Array(Vec<RESPValue>),
 }
 
-const MAX_RESP_HEADER_LINE_SIZE: usize = 64;
+pub(crate) const MAX_RESP_HEADER_LINE_SIZE: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RESPReadLimits {
@@ -28,11 +28,11 @@ pub const CLIENT_RESP_LIMITS: RESPReadLimits = RESPReadLimits {
     max_frame_len: 16 * 1024 * 1024,
 };
 
-fn invalid_data(message: &'static str) -> io::Error {
+pub(crate) fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-async fn read_bounded_line<R>(
+pub(crate) async fn read_bounded_line<R>(
     reader: &mut R,
     scratch: &mut Vec<u8>,
     maximum_size: usize,
@@ -68,7 +68,7 @@ where
     }
 }
 
-fn line_content(line: &[u8]) -> io::Result<&[u8]> {
+pub(crate) fn line_content(line: &[u8]) -> io::Result<&[u8]> {
     line.strip_suffix(b"\r\n")
         .ok_or_else(|| invalid_data("RESP line is missing its CRLF terminator"))
 }
@@ -83,6 +83,57 @@ fn parse_decimal(bytes: &[u8], field: &'static str) -> io::Result<usize> {
             .and_then(|value| value.checked_add((byte - b'0') as usize))
             .ok_or_else(|| invalid_data(field))
     })
+}
+
+/// Encodes one command as a RESP array without modifying `output` on failure.
+pub fn encode_command<T>(
+    arguments: &[T],
+    output: &mut Vec<u8>,
+    limits: RESPReadLimits,
+) -> io::Result<()>
+where
+    T: AsRef<[u8]>,
+{
+    if arguments.is_empty() {
+        return Err(invalid_data("RESP command must not be empty"));
+    }
+    if arguments.len() > limits.max_array_len {
+        return Err(invalid_data("RESP command has too many arguments"));
+    }
+
+    let decimal_length = |value: usize| value.to_string().len();
+    let mut frame_length = 1usize
+        .checked_add(decimal_length(arguments.len()))
+        .and_then(|length| length.checked_add(2))
+        .ok_or_else(|| invalid_data("RESP frame length overflow"))?;
+    for argument in arguments {
+        let argument = argument.as_ref();
+        if argument.len() > limits.max_bulk_len {
+            return Err(invalid_data("RESP bulk string exceeds the protocol limit"));
+        }
+        frame_length = frame_length
+            .checked_add(1)
+            .and_then(|length| length.checked_add(decimal_length(argument.len())))
+            .and_then(|length| length.checked_add(2))
+            .and_then(|length| length.checked_add(argument.len()))
+            .and_then(|length| length.checked_add(2))
+            .ok_or_else(|| invalid_data("RESP frame length overflow"))?;
+    }
+    if frame_length > limits.max_frame_len {
+        return Err(invalid_data(
+            "RESP frame exceeds the aggregate protocol limit",
+        ));
+    }
+
+    output.reserve(frame_length);
+    output.extend_from_slice(format!("*{}\r\n", arguments.len()).as_bytes());
+    for argument in arguments {
+        let argument = argument.as_ref();
+        output.extend_from_slice(format!("${}\r\n", argument.len()).as_bytes());
+        output.extend_from_slice(argument);
+        output.extend_from_slice(b"\r\n");
+    }
+    Ok(())
 }
 
 pub async fn read_command_with_limits<R>(
@@ -281,6 +332,29 @@ mod tests {
             error.to_string(),
             "RESP frame exceeds the aggregate protocol limit"
         );
+    }
+
+    #[test]
+    fn command_encoder_is_binary_safe_and_atomic_on_error() {
+        let mut encoded = b"prefix".to_vec();
+        encode_command(
+            &[b"SET".as_slice(), b"a b\0c".as_slice(), b"".as_slice()],
+            &mut encoded,
+            CLIENT_RESP_LIMITS,
+        )
+        .unwrap();
+        assert_eq!(
+            &encoded[6..],
+            b"*3\r\n$3\r\nSET\r\n$5\r\na b\0c\r\n$0\r\n\r\n"
+        );
+
+        let before = encoded.clone();
+        let limits = RESPReadLimits {
+            max_bulk_len: 2,
+            ..CLIENT_RESP_LIMITS
+        };
+        assert!(encode_command(&["GET", "key"], &mut encoded, limits).is_err());
+        assert_eq!(encoded, before);
     }
 
     #[tokio::test]

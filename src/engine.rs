@@ -443,6 +443,12 @@ pub struct OnyxEngine {
     shards: Vec<std::sync::Mutex<Shard>>,
 }
 
+impl Default for OnyxEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OnyxEngine {
     pub fn new() -> Self {
         let mut shards = Vec::with_capacity(NUM_SHARDS);

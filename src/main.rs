@@ -1,15 +1,17 @@
 mod config;
-mod engine;
-mod protocol;
-mod resp;
 use bytes::Bytes;
 use config::{FsyncPolicy, ServerConfig, UpstreamCredentials};
-use engine::{DataEntry, EntryMutation, EvictionPolicy, OnyxEngine, OnyxValue};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use protocol::{MAX_OBP_FRAME_SIZE, OBPFrame};
-use resp::{CLIENT_RESP_LIMITS, RESPReadLimits, RESPValue, read_command_with_timeouts};
+use onyxdb::command::is_write_command;
+use onyxdb::engine::{
+    DataEntry, EngineStats, EntryMutation, EvictionPolicy, OnyxEngine, OnyxValue,
+};
+use onyxdb::protocol::{MAX_OBP_FRAME_SIZE, OBPFrame};
+use onyxdb::resp::{CLIENT_RESP_LIMITS, RESPReadLimits, RESPValue, read_command_with_timeouts};
+#[cfg(test)]
+use onyxdb::{protocol, resp};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader as StdBufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -945,7 +947,7 @@ impl ShardedStore {
             .flatten()
     }
 
-    pub fn stats(&self) -> engine::EngineStats {
+    pub fn stats(&self) -> EngineStats {
         self.engine.stats()
     }
 
@@ -2305,37 +2307,6 @@ fn value_to_line(key: &str, entry: &DataEntry) -> String {
 }
 /// Classifies commands that can mutate authoritative state. The classification
 /// drives replica read-only enforcement and ordered persistence admission.
-fn is_write_command(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "SET"
-            | "GETSET"
-            | "SETNX"
-            | "MSET"
-            | "DEL"
-            | "EXPIRE"
-            | "EXPIREAT"
-            | "LPUSH"
-            | "RPUSH"
-            | "LPOP"
-            | "RPOP"
-            | "HSET"
-            | "SADD"
-            | "RENAME"
-            | "INCR"
-            | "INCRBY"
-            | "DECRBY"
-            | "APPEND"
-            | "HDEL"
-            | "SREM"
-            | "COPY"
-            | "JSON.SET"
-            | "JSON.DEL"
-            | "JSON.NUMINCRBY"
-            | "JSON.ARRAPPEND"
-    )
-}
-
 fn persistent_keys_for_command(args: &[String]) -> Vec<Bytes> {
     let command = args.first().map(String::as_str).unwrap_or("");
     let mut keys = Vec::new();

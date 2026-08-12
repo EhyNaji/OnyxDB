@@ -1,4 +1,4 @@
-use crate::engine::EvictionPolicy;
+use onyxdb::engine::EvictionPolicy;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;

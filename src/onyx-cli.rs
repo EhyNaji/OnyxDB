@@ -1,185 +1,173 @@
+use onyxdb::client::{RespClient, parse_command_line};
+use onyxdb::command::is_replica_routable_read;
 use std::io::{self, Write};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-fn encode_command(input: &str) -> String {
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    let mut out = format!("*{}\r\n", parts.len());
-    for p in &parts {
-        out.push_str(&format!("${}\r\n{}\r\n", p.len(), p));
-    }
-    out
+#[derive(Debug, PartialEq, Eq)]
+struct CliConfig {
+    master_address: String,
+    replica_addresses: Vec<String>,
 }
 
-async fn read_reply(reader: &mut BufReader<OwnedReadHalf>) -> std::io::Result<String> {
-    let mut header = String::new();
-    let n = reader.read_line(&mut header).await?;
-    if n == 0 {
-        return Ok("(connection closed)".to_string());
-    }
-    let header = header.trim_end();
-    if header.is_empty() {
-        return Ok(String::new());
-    }
-    let prefix = header.chars().next().unwrap();
-    let rest = &header[1..];
-    match prefix {
-        '+' => Ok(rest.to_string()),
-        '-' => Ok(format!("(error) {}", rest)),
-        ':' => Ok(rest.to_string()),
-        '$' => {
-            let len: i64 = rest.parse().unwrap_or(-1);
-            if len < 0 {
-                Ok("(nil)".to_string())
-            } else {
-                let mut buf = vec![0u8; len as usize + 2];
-                reader.read_exact(&mut buf).await?;
-                buf.truncate(len as usize);
-                Ok(String::from_utf8_lossy(&buf).to_string())
+impl CliConfig {
+    fn parse(arguments: &[String]) -> Result<Self, String> {
+        let mut master_address = "127.0.0.1:6380".to_string();
+        let mut replica_addresses = Vec::new();
+        let mut index = 1;
+        while index < arguments.len() {
+            match arguments[index].as_str() {
+                "--port" => {
+                    let port = arguments
+                        .get(index + 1)
+                        .ok_or_else(|| "--port requires a value".to_string())?;
+                    port.parse::<u16>()
+                        .map_err(|_| format!("invalid port: {port}"))?;
+                    master_address = format!("127.0.0.1:{port}");
+                    index += 2;
+                }
+                "--master" => {
+                    master_address = arguments
+                        .get(index + 1)
+                        .ok_or_else(|| "--master requires an address".to_string())?
+                        .clone();
+                    index += 2;
+                }
+                "--replicas" => {
+                    replica_addresses = arguments
+                        .get(index + 1)
+                        .ok_or_else(|| {
+                            "--replicas requires a comma-separated address list".to_string()
+                        })?
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|address| !address.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    index += 2;
+                }
+                "--help" | "-h" => return Err(String::new()),
+                option => return Err(format!("unknown option: {option}")),
             }
         }
-        '*' => {
-            let count: i64 = rest.parse().unwrap_or(0);
-            if count <= 0 {
-                return Ok("(empty array)".to_string());
-            }
-            let mut items = Vec::new();
-            for _ in 0..count {
-                items.push(Box::pin(read_reply(reader)).await?);
-            }
-            Ok(format!("[{}]", items.join(", ")))
-        }
-        _ => Ok(header.to_string()),
+        Ok(Self {
+            master_address,
+            replica_addresses,
+        })
     }
 }
 
-// Read-only commands may be routed to replicas. All other commands use the master.
-fn is_read_command(cmd: &str) -> bool {
-    matches!(
-        cmd.to_ascii_uppercase().as_str(),
-        "GET"
-            | "MGET"
-            | "LRANGE"
-            | "LLEN"
-            | "HGET"
-            | "HGETALL"
-            | "SMEMBERS"
-            | "SISMEMBER"
-            | "EXISTS"
-            | "TYPE"
-            | "TTL"
-            | "KEYS"
-            | "STRLEN"
-    )
-}
-
-struct Connection {
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
-}
-
-async fn connect(addr: &str) -> Option<Connection> {
-    match TcpStream::connect(addr).await {
-        Ok(stream) => {
-            let (r, w) = stream.into_split();
-            Some(Connection {
-                reader: BufReader::new(r),
-                writer: w,
-            })
-        }
-        Err(e) => {
-            println!("Unable to connect to {}: {}", addr, e);
-            None
-        }
-    }
-}
-
-async fn send_and_read(conn: &mut Connection, command: &str) -> String {
-    let encoded = encode_command(command);
-    if conn.writer.write_all(encoded.as_bytes()).await.is_err() {
-        return "(write error: connection lost)".to_string();
-    }
-    read_reply(&mut conn.reader)
-        .await
-        .unwrap_or_else(|e| format!("(read error: {})", e))
+fn print_usage() {
+    println!("Usage: onyx-cli [--port <port> | --master <host:port>] [--replicas <host:port,...>]");
+    println!("Quoted and escaped command arguments are preserved.");
 }
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-
-    let mut master_addr = "127.0.0.1:6380".to_string();
-    let mut replica_addrs: Vec<String> = Vec::new();
-
-    for i in 0..args.len() {
-        if args[i] == "--port" && i + 1 < args.len() {
-            master_addr = format!("127.0.0.1:{}", args[i + 1]);
+    let arguments: Vec<String> = std::env::args().collect();
+    let config = match CliConfig::parse(&arguments) {
+        Ok(config) => config,
+        Err(error) => {
+            if !error.is_empty() {
+                eprintln!("Configuration error: {error}");
+            }
+            print_usage();
+            return;
         }
-        if args[i] == "--master" && i + 1 < args.len() {
-            master_addr = args[i + 1].clone();
-        }
-        if args[i] == "--replicas" && i + 1 < args.len() {
-            replica_addrs = args[i + 1]
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect();
-        }
-    }
-
-    println!("OnyxDB CLI - Master: {}", master_addr);
-    if !replica_addrs.is_empty() {
-        println!("Read replicas: {:?}", replica_addrs);
-    }
-
-    let mut master_conn = match connect(&master_addr).await {
-        Some(c) => c,
-        None => return,
     };
 
-    // Keep each address paired with its live connection so routing and
-    // diagnostics cannot become misaligned when a replica is unavailable.
-    let mut replica_conns: Vec<(String, Connection)> = Vec::new();
-    for addr in &replica_addrs {
-        if let Some(c) = connect(addr).await {
-            replica_conns.push((addr.clone(), c));
+    println!("OnyxDB CLI - master: {}", config.master_address);
+    let mut master = match RespClient::connect(&config.master_address).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            eprintln!(
+                "Unable to connect to master {}: {}",
+                config.master_address, error
+            );
+            return;
+        }
+    };
+
+    let mut replicas = Vec::new();
+    for address in config.replica_addresses {
+        match RespClient::connect(&address).await {
+            Ok(connection) => replicas.push((address, connection)),
+            Err(error) => eprintln!("Unable to connect to replica {address}: {error}"),
         }
     }
-    let mut replica_index = 0usize;
-
-    println!("Connected! Type 'exit' to quit.\n");
+    if !replicas.is_empty() {
+        println!("Connected read replicas: {}", replicas.len());
+    }
+    println!("Type 'exit' to quit.");
 
     let stdin = io::stdin();
+    let mut replica_index = 0usize;
     loop {
         print!("onyx> ");
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        if stdin.read_line(&mut input).unwrap() == 0 {
+        if io::stdout().flush().is_err() {
             break;
         }
-        let command = input.trim();
-        if command.is_empty() {
-            continue;
+
+        let mut input = String::new();
+        match stdin.read_line(&mut input) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
-        if command.eq_ignore_ascii_case("exit") {
+        let arguments = match parse_command_line(input.trim_end()) {
+            Ok(arguments) if arguments.is_empty() => continue,
+            Ok(arguments) => arguments,
+            Err(error) => {
+                eprintln!("Parse error: {error}");
+                continue;
+            }
+        };
+        if arguments.len() == 1 && arguments[0].eq_ignore_ascii_case("exit") {
             println!("Goodbye!");
             break;
         }
 
-        let cmd_name = command.split_whitespace().next().unwrap_or("");
-
-        let reply = if is_read_command(cmd_name) && !replica_conns.is_empty() {
-            let idx = replica_index % replica_conns.len();
-            replica_index += 1;
-            let (target, conn) = &mut replica_conns[idx];
-            let reply = send_and_read(conn, command).await;
-            println!("[reading from replica {}]", target);
-            reply
+        let command = arguments[0].to_ascii_uppercase();
+        let result = if is_replica_routable_read(&command) && !replicas.is_empty() {
+            let index = replica_index % replicas.len();
+            replica_index = replica_index.wrapping_add(1);
+            let (address, connection) = &mut replicas[index];
+            println!("[reading from replica {address}]");
+            connection.send(&arguments).await
         } else {
-            send_and_read(&mut master_conn, command).await
+            master.send(&arguments).await
         };
 
-        println!("{}", reply);
+        match result {
+            Ok(response) => println!("{response}"),
+            Err(error) => eprintln!("Connection error: {error}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn cli_configuration_is_strict_and_deterministic() {
+        let config = CliConfig::parse(&arguments(&[
+            "onyx-cli",
+            "--port",
+            "7000",
+            "--master",
+            "db.example:7001",
+            "--replicas",
+            "replica-a:7001, replica-b:7001",
+        ]))
+        .unwrap();
+        assert_eq!(config.master_address, "db.example:7001");
+        assert_eq!(
+            config.replica_addresses,
+            ["replica-a:7001", "replica-b:7001"]
+        );
+        assert!(CliConfig::parse(&arguments(&["onyx-cli", "--port"])).is_err());
+        assert!(CliConfig::parse(&arguments(&["onyx-cli", "--unknown"])).is_err());
     }
 }
