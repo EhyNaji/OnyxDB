@@ -1,12 +1,12 @@
 # Build artifacts
 /target/
 
-# Dati generati a runtime (non vanno versionati)
+# Runtime-generated data must not be versioned.
 onyx.snapshot
+onyx.snapshot.previous
 onyx.binlog
+onyx.replica
 onyx.log
 *.tmp
 
-# Cargo.lock: lo escludo per ora
-# finché la struttura del progetto non è più stabile
-Cargo.lock
+# The application dependency lockfile is versioned for reproducible builds.
