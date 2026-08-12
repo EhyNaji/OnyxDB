@@ -1020,7 +1020,7 @@ fn parse_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
     if path != "$" && !path.starts_with('$') {
         return None; // Every valid path begins with '$'.
     }
-    let rest = &path[1..]; // scarta il '$' iniziale
+    let rest = &path[1..]; // Skip the leading '$'.
     if rest.is_empty() {
         return Some(Vec::new()); // `$` addresses the complete document.
     }
@@ -1058,9 +1058,9 @@ fn parse_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
                 let idx_str: String = chars[start..i].iter().collect();
                 let idx: usize = idx_str.parse().ok()?; // Only non-negative indices.
                 segments.push(JsonPathSegment::Index(idx));
-                i += 1; // salta il ']'
+                i += 1; // Skip the closing ']'.
             }
-            _ => return None, // carattere inatteso fuori da un segmento . o [
+            _ => return None, // Reject characters outside field or array segments.
         }
     }
 
@@ -10220,7 +10220,7 @@ mod tests {
         record.extend_from_slice(&[0x00, 0x01]); // key_len = 1
         record.push(b'k');
         record.push(1); // String value type.
-        record.extend_from_slice(&[0x00, 0x00, 0x03, 0xE8]); // val_len = 1000, ma non seguono byte
+        record.extend_from_slice(&[0x00, 0x00, 0x03, 0xE8]); // Declared value length is 1,000 bytes.
         assert!(binary_record_to_args(&record).is_none());
     }
 
