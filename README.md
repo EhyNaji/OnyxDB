@@ -184,9 +184,12 @@ git diff --check
 The suite includes unit, malformed-input, concurrency, persistence restart,
 replication, lifecycle, and real network/subprocess coverage.
 
-The bundled `onyx-bench` binary is currently a development smoke benchmark. It
-does not yet provide a controlled comparative methodology or latency
-percentiles and should not be used for public performance claims.
+The bundled `onyx-bench` supports bounded, repeatable GET, SET, mixed, and native
+JSON workloads with warmup, concurrency, pipelining, error accounting,
+p50/p95/p99/p99.9 completion latency, and JSON output. See
+[docs/benchmarking.md](docs/benchmarking.md) for the methodology and comparison
+rules. Benchmark output is evidence from one environment, not a general
+performance claim.
 
 ## Architecture
 

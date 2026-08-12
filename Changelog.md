@@ -35,6 +35,14 @@ All notable changes to OnyxDB are documented in this file.
 - Extracted typed startup configuration parsing and validation into
   `src/config.rs`, including command-line/environment precedence and redacted
   secret debug output.
+- Established an experimental library boundary for the engine, protocol,
+  command classification, and bounded RESP client components.
+- Consolidated CLI and benchmark RESP handling onto one binary-safe, bounded
+  response parser and command encoder.
+- Added a deterministic benchmark methodology with warmup, configurable GET,
+  SET, mixed and JSON workloads, concurrency, pipelining, repeated runs, error
+  accounting, p50/p95/p99/p99.9 latency, environment metadata, cleanup, and
+  machine-readable output.
 - Rejected server ports that cannot safely reserve the derived OBP and metrics
   listeners.
 - Removed unused concurrency/CPU dependencies and the empty storage module

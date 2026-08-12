@@ -14,8 +14,8 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_HEADER_SIZE: usize = 64 * 1024;
-const MAX_PIPELINE_COMMANDS: usize = 4096;
-const MAX_PIPELINE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_PIPELINE_COMMANDS: usize = 4096;
+pub const MAX_PIPELINE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RESPResponseLimits {
@@ -87,9 +87,8 @@ fn parse_signed_decimal(bytes: &[u8], field: &'static str) -> io::Result<i64> {
     let text = std::str::from_utf8(bytes).map_err(|_| invalid_data(field))?;
     if text.is_empty()
         || text == "-"
-        || text == "+"
         || text
-            .strip_prefix(['-', '+'])
+            .strip_prefix('-')
             .unwrap_or(text)
             .bytes()
             .any(|byte| !byte.is_ascii_digit())
@@ -97,6 +96,22 @@ fn parse_signed_decimal(bytes: &[u8], field: &'static str) -> io::Result<i64> {
         return Err(invalid_data(field));
     }
     text.parse::<i64>().map_err(|_| invalid_data(field))
+}
+
+fn parse_response_length(bytes: &[u8], field: &'static str) -> io::Result<Option<usize>> {
+    if bytes == b"-1" {
+        return Ok(None);
+    }
+    if bytes.is_empty() || bytes.iter().any(|byte| !byte.is_ascii_digit()) {
+        return Err(invalid_data(field));
+    }
+    let length = bytes.iter().try_fold(0usize, |length, byte| {
+        length
+            .checked_mul(10)
+            .and_then(|length| length.checked_add((byte - b'0') as usize))
+            .ok_or_else(|| invalid_data(field))
+    })?;
+    Ok(Some(length))
 }
 
 fn account_frame_bytes(consumed: &mut usize, added: usize, limit: usize) -> io::Result<()> {
@@ -148,14 +163,8 @@ where
             "RESP integer response is invalid",
         )?)),
         b'$' => {
-            let length = parse_signed_decimal(content, "RESP bulk response length is invalid")?;
-            if length == -1 {
-                ResponseToken::Value(RESPResponse::BulkString(None))
-            } else if length < 0 {
-                return Err(invalid_data("RESP bulk response length is invalid"));
-            } else {
-                let length = usize::try_from(length)
-                    .map_err(|_| invalid_data("RESP bulk response length is invalid"))?;
+            let length = parse_response_length(content, "RESP bulk response length is invalid")?;
+            if let Some(length) = length {
                 if length > limits.max_bulk_len {
                     return Err(invalid_data(
                         "RESP bulk response exceeds the protocol limit",
@@ -172,23 +181,21 @@ where
                     ));
                 }
                 ResponseToken::Value(RESPResponse::BulkString(Some(Bytes::from(payload))))
+            } else {
+                ResponseToken::Value(RESPResponse::BulkString(None))
             }
         }
         b'*' => {
-            let length = parse_signed_decimal(content, "RESP array response length is invalid")?;
-            if length == -1 {
-                ResponseToken::Value(RESPResponse::Array(None))
-            } else if length < 0 {
-                return Err(invalid_data("RESP array response length is invalid"));
-            } else {
-                let length = usize::try_from(length)
-                    .map_err(|_| invalid_data("RESP array response length is invalid"))?;
+            let length = parse_response_length(content, "RESP array response length is invalid")?;
+            if let Some(length) = length {
                 if length > limits.max_array_len {
                     return Err(invalid_data(
                         "RESP array response exceeds the protocol limit",
                     ));
                 }
                 ResponseToken::Array(length)
+            } else {
+                ResponseToken::Value(RESPResponse::Array(None))
             }
         }
         _ => return Err(invalid_data("RESP response type is unsupported")),
@@ -464,6 +471,9 @@ mod tests {
         let malformed: &[&[u8]] = &[
             b"+OK\n",
             b"$-2\r\n",
+            b"$+1\r\na\r\n",
+            b"*+1\r\n+value\r\n",
+            b":+1\r\n",
             b"$9\r\n",
             b"$3\r\nabcXX",
             b"*5\r\n",

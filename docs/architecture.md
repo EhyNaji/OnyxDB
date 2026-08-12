@@ -23,12 +23,14 @@ the authoritative boundary for state changes.
 | Module | Responsibility | Current constraint |
 | --- | --- | --- |
 | `src/config.rs` | Startup argument/environment parsing, defaults, validation, secret-safe debug output | Pure configuration boundary; it does not start runtime services |
+| `src/client.rs` | Bounded RESP response parsing, command encoding, connections, and interactive argument tokenization | Tooling client; the server runtime does not depend on it |
+| `src/command.rs` | Shared mutation and replica-read command classification | Command names must be normalized before classification |
 | `src/engine.rs` | Sharded in-memory values, expiration, type-safe mutation primitives, logical memory accounting, eviction | 64 mutex-protected shards selected by FNV-1a |
 | `src/resp.rs` | Bounded RESP command framing and response encoding | RESP command subset, not complete Redis compatibility |
 | `src/protocol.rs` | Bounded OBP framing and encoding | Internal/experimental protocol with a small command subset |
 | `src/main.rs` | Store facade, command dispatch, authoritative mutation ordering, persistence, replication, networking, metrics, lifecycle | Still too broad; extraction remains incremental |
 | `src/onyx-cli.rs` | Minimal interactive RESP client | Not a complete shell parser or `redis-cli` replacement |
-| `src/onyx-bench.rs` | Development throughput smoke test | Not suitable for comparative performance claims |
+| `src/onyx-bench.rs` | Bounded RESP benchmark runner with repeatable workloads, percentiles, and error accounting | No OBP workload or coordinated-omission correction yet |
 
 ## Authoritative state transition
 
@@ -242,14 +244,13 @@ must follow the actual dependency graph rather than target file size alone.
 
 The preferred dependency order, subject to new evidence, is:
 
-1. Establish a reusable library boundary for engine and protocol code so the
-   CLI, benchmark, and integration tests do not duplicate framing behavior.
-2. Extract the store/value semantics and JSON path implementation.
-3. Extract committed effects plus persistence codecs/recovery as one cohesive
+1. Extract the store/value semantics and JSON path implementation.
+2. Extract committed effects plus persistence codecs/recovery as one cohesive
    subsystem.
-4. Extract replication only after its ownership of durable identity, task
+3. Extract replication only after its ownership of durable identity, task
    cancellation, and sequence publication is explicit.
-5. Reduce `main.rs` to bootstrap, listener supervision, and process shutdown.
+4. Extract listener ownership, connection supervision, metrics, and shutdown.
+5. Reduce `main.rs` to process bootstrap and top-level error reporting.
 
 Benchmark modernization should precede performance optimization. Public
 performance claims require reproducible workloads, latency percentiles,
