@@ -24,7 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
-// 1. ALLOCATORE DI MEMORIA AD ALTE PRESTAZIONI
+// High-performance allocator.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -158,11 +158,9 @@ impl From<std::io::Error> for PersistenceError {
         Self::new(error.to_string())
     }
 }
-/// Utenti autorizzati (nome -> password). Nessuna granularità per comando
-/// (quello sarebbe un'altra feature a parte) — qui
-/// è "chi ha una password valida può fare tutto", ma con utenti multipli
-/// invece di un'unica password condivisa. `--requirepass`/`ONYXDB_PASSWORD`
-/// restano supportati per compatibilità: diventano l'utente "default".
+/// Configured users keyed by username. Authentication grants full command
+/// access; command-level authorization is not implemented. `--requirepass`
+/// and `ONYXDB_PASSWORD` remain compatible aliases for the `default` user.
 static USERS: std::sync::OnceLock<std::collections::HashMap<String, String>> =
     std::sync::OnceLock::new();
 
@@ -178,15 +176,11 @@ fn check_credentials(username: &str, password: &str) -> bool {
 }
 
 // ============================================================
-// FSYNC POLICY — quanto spesso forzare la scrittura fisica su disco del
-// binlog.
-// - Always:    fsync dopo ogni batch di scritture. Massima durabilità,
-//              più latenza per comando.
-// - EverySec:  fsync una volta al secondo in background (default, come Redis).
-//              Nel peggiore dei casi si perde fino a ~1s di scritture se il
-//              sistema operativo/hardware crasha (non il solo processo).
-// - No:        nessun fsync esplicito, solo il flush dei buffer userspace.
-//              Più veloce, ma affidato completamente al SO per la durabilità.
+// FSYNC POLICY
+// - Always: fsync after every committed batch for maximum durability.
+// - EverySec: fsync once per second in the background. A system or hardware
+//   crash may lose up to approximately one second of acknowledged writes.
+// - No: flush userspace buffers without an explicit fsync.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FsyncPolicy {
     Always,
@@ -262,17 +256,13 @@ fn parse_memory_size(s: &str) -> Option<usize> {
         .and_then(|n| n.checked_mul(multiplier))
 }
 
-// 2. FAST TIME (Orologio di Sistema Cachato)
+// Cached wall-clock time for inexpensive expiration checks.
 static CURRENT_TIME: AtomicU64 = AtomicU64::new(0);
 static START_TIME: AtomicU64 = AtomicU64::new(0);
 static IS_REPLICA: AtomicBool = AtomicBool::new(false);
-// Replication ID: generato una volta ad ogni avvio del Master (casuale,
-// derivato dal tempo di avvio + PID). Serve a distinguere "sono lo stesso
-// processo Master di prima" da "sono ripartito da zero" — senza questo,
-// una Replica che si riconnette con un vecchio offset dopo un riavvio del
-// Master rischia di credersi "già allineata" quando in realtà il nuovo
-// processo non ha alcuna memoria di quell'offset. 0 è riservato per
-// "replication ID sconosciuto" lato Replica (prima connessione mai fatta).
+// A master gets a new replication ID on every process start. The ID binds an
+// offset to one specific master history so a replica cannot partially resume
+// against an unrelated process. Zero means that no upstream identity is known.
 static REPL_ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 fn repl_id() -> u64 {
@@ -359,8 +349,7 @@ impl ShardedStore {
     }
 
     pub fn expire_at(&self, key: &str, timestamp: u64) -> bool {
-        // Un solo lock: imposta solo la scadenza, senza clonare il valore
-        // (prima: get() dell'intera entry + set() di rimpiazzo).
+        // Update expiration under one engine lock without cloning the value.
         self.engine
             .set_expiry(&Bytes::from(key.to_string()), timestamp)
     }
@@ -416,8 +405,7 @@ impl ShardedStore {
 
     pub fn append(&self, key: &str, suffix: &str) -> Result<usize, StoreError> {
         let suffix_owned = suffix.to_string();
-        // Stesso discorso di incrby: un solo lock, niente APPEND persi sotto
-        // concorrenza.
+        // Append under one engine lock so concurrent suffixes are not lost.
         self.engine.update_or_insert(
             Bytes::from(key.to_string()),
             || OnyxValue::Blob(Bytes::new()),
@@ -459,9 +447,7 @@ impl ShardedStore {
     }
 
     pub fn setnx(&self, key: &str, value: &str) -> bool {
-        //prima era exists()+set(), con una
-        // finestra in cui due SETNX concorrenti potevano credere entrambi
-        // di aver "vinto" — il che vanificava il suo uso come lock.
+        // The engine performs the presence check and insertion atomically.
         self.engine.set_if_absent(
             Bytes::from(key.to_string()),
             OnyxValue::Blob(Bytes::from(value.to_string())),
@@ -539,11 +525,8 @@ impl ShardedStore {
         result.unwrap_or(Ok(None))
     }
 
-    /// LRANGE con start/stop stile Redis: indici 0-based inclusivi su
-    /// entrambi gli estremi, indici negativi contano dalla fine (-1 =
-    /// ultimo elemento), fuori range vengono "clampati" invece di dare
-    /// errore. `LRANGE chiave` (senza indici, dal vecchio comportamento)
-    /// continua a funzionare passando start=0, stop=-1 dal chiamante.
+    /// Implements inclusive Redis-style LRANGE bounds. Negative indices count
+    /// from the end and out-of-range values are clamped.
     pub fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, StoreError> {
         let result = self
             .engine
@@ -715,9 +698,8 @@ impl ShardedStore {
     }
     // --- JSON operations ---
 
-    /// JSON.SET: se path == "$", sostituisce l'intero documento (creandolo
-    /// se la chiave non esiste). Con un path parziale, la chiave deve già
-    /// esistere e contenere un valore JSON.
+    /// Replaces the complete document at `$`, or updates an existing JSON
+    /// document at a partial path.
     pub fn json_set(
         &self,
         key: &str,
@@ -741,10 +723,10 @@ impl ShardedStore {
             );
         }
 
-        // Path parziale: la chiave deve già esistere con un valore JSON.
+        // A partial path requires an existing JSON document.
         let result = self.engine.update_if_exists(&key_b, move |v| match v {
             OnyxValue::Json(root) => Some(set_json_path(root, &segments, new_value)),
-            _ => None, // esiste ma non è JSON: tipo sbagliato
+            _ => None, // Existing non-JSON value: wrong type.
         });
         match result {
             Some(Some(true)) => Ok(()),
@@ -799,7 +781,7 @@ impl ShardedStore {
         match result {
             Some(Some(deleted)) => Ok(deleted),
             Some(None) => Err(StoreError::WrongType.message()),
-            None => Ok(false), // chiave inesistente: nulla da cancellare
+            None => Ok(false), // Missing key: nothing to delete.
         }
     }
 
@@ -1022,8 +1004,7 @@ fn is_expired(entry: &DataEntry) -> bool {
 }
 
 // ============================================================
-// JSON PATH — parser ridotto: solo campi (.nome) e indici di array ([N]).
-// Niente wildcard e niente filtri.
+// JSON PATH — field access and array indices only; no wildcards or filters.
 // ============================================================
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1031,22 +1012,20 @@ enum JsonPathSegment {
     Field(String),
     Index(usize),
 }
-/// Interpreta un path stile "$.a.b[2].c" in una sequenza di passi da
-/// seguire dentro un serde_json::Value. "$" da solo (documento intero)
-/// ritorna un vettore vuoto. Ritorna None se il path è sintatticamente
-/// malformato (non se il path "non esiste" nei dati. Quello viene scoperto
-/// solo in get_json_path/set_json_path).
+/// Parses a path such as `$.a.b[2].c` into navigation segments. `$` denotes
+/// the document root and produces an empty segment list. Syntactically invalid
+/// paths return `None`; data presence is evaluated during navigation.
 fn parse_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
     let path = path.trim();
     if path != "$" && !path.starts_with('$') {
-        return None; // ogni path valido inizia con '$'
+        return None; // Every valid path begins with '$'.
     }
     let rest = &path[1..]; // scarta il '$' iniziale
     if rest.is_empty() {
-        return Some(Vec::new()); // "$" da solo: documento intero
+        return Some(Vec::new()); // `$` addresses the complete document.
     }
     if !rest.starts_with('.') && !rest.starts_with('[') {
-        return None; // dopo '$' deve seguire '.' o '['
+        return None; // `$` must be followed by `.` or `[`.
     }
 
     let mut segments = Vec::new();
@@ -1062,7 +1041,7 @@ fn parse_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
                     i += 1;
                 }
                 if start == i {
-                    return None; // ".." o "." finale senza nome di campo
+                    return None; // Reject empty or trailing field segments.
                 }
                 let field: String = chars[start..i].iter().collect();
                 segments.push(JsonPathSegment::Field(field));
@@ -1074,10 +1053,10 @@ fn parse_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
                     i += 1;
                 }
                 if i >= chars.len() {
-                    return None; // '[' senza ']' di chiusura
+                    return None; // Reject an unclosed array index.
                 }
                 let idx_str: String = chars[start..i].iter().collect();
-                let idx: usize = idx_str.parse().ok()?; // solo indici >= 0
+                let idx: usize = idx_str.parse().ok()?; // Only non-negative indices.
                 segments.push(JsonPathSegment::Index(idx));
                 i += 1; // salta il ']'
             }
@@ -1087,9 +1066,7 @@ fn parse_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
 
     Some(segments)
 }
-/// Naviga `root` seguendo `segments` e ritorna un riferimento al nodo
-/// finale, se esiste. None se un passo intermedio non esiste o non è del
-/// tipo giusto.
+/// Returns the node addressed by `segments`, or `None` on absence/type mismatch.
 fn get_json_path<'a>(
     root: &'a serde_json::Value,
     segments: &[JsonPathSegment],
@@ -1105,9 +1082,8 @@ fn get_json_path<'a>(
     Some(current)
 }
 
-/// Imposta il valore al path indicato, creando l'ultimo passo se manca ma
-/// SENZA creare automaticamente livelli intermedi assenti. Ritorna true se ha scritto, false se il genitore del
-/// passo finale non esiste o non è del tipo compatibile.
+/// Sets the addressed value and may create only the final segment. Missing or
+/// incompatible intermediate segments cause the operation to fail.
 fn set_json_path(
     root: &mut serde_json::Value,
     segments: &[JsonPathSegment],
@@ -1123,7 +1099,7 @@ fn set_json_path(
             (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => {
                 match map.get_mut(f) {
                     Some(v) => v,
-                    None => return false, // livello intermedio assente: niente auto-creazione
+                    None => return false, // Intermediate objects are not created.
                 }
             }
             (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => {
@@ -1145,20 +1121,20 @@ fn set_json_path(
                 arr[*idx] = new_value;
                 true
             } else if *idx == arr.len() {
-                arr.push(new_value); // append in coda, come farebbe un push naturale
+                arr.push(new_value); // An index at the array length appends.
                 true
             } else {
-                false // indice troppo avanti, buco non ammesso
+                false // Do not create sparse arrays.
             }
         }
         _ => false,
     }
 }
 
-/// Rimuove il nodo al path indicato. Ritorna true se ha rimosso qualcosa.
+/// Removes the addressed node and reports whether a value was removed.
 fn delete_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment]) -> bool {
     if segments.is_empty() {
-        return false; // DEL sul documento intero non passa da qui (si usa DEL normale sulla chiave)
+        return false; // Root deletion is handled by normal key deletion.
     }
     let mut current = root;
     for seg in &segments[..segments.len() - 1] {
@@ -1185,10 +1161,7 @@ fn delete_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment]) 
         _ => false,
     }
 }
-/// Naviga fino al nodo indicato e ritorna un riferimento MUTABILE (a
-/// differenza di get_json_path che ritorna solo &). Serve per
-/// NUMINCRBY/ARRAPPEND, che modificano il nodo in-place invece di
-/// sostituirlo interamente come fa SET.
+/// Returns a mutable reference to the addressed node for in-place operations.
 fn get_json_path_mut<'a>(
     root: &'a mut serde_json::Value,
     segments: &[JsonPathSegment],
@@ -1204,10 +1177,7 @@ fn get_json_path_mut<'a>(
     Some(current)
 }
 
-/// Incrementa un numero al path indicato. Niente auto-creazione a 0 se il
-/// path non esiste (comportamento diverso da INCR su chiave stringa): dentro
-/// un documento JSON un path assente è più probabilmente un errore di
-/// battitura da segnalare che un "parti da zero" implicito.
+/// Increments an existing JSON number. Missing paths are not created as zero.
 fn numincrby_json_path(
     root: &mut serde_json::Value,
     segments: &[JsonPathSegment],
@@ -1228,8 +1198,7 @@ fn numincrby_json_path(
     Ok(new_val)
 }
 
-/// Aggiunge un elemento in coda all'array al path indicato. Errore se il
-/// path non esiste o non punta a un array.
+/// Appends to an existing JSON array and rejects missing or incompatible paths.
 fn arrappend_json_path(
     root: &mut serde_json::Value,
     segments: &[JsonPathSegment],
@@ -1254,13 +1223,12 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
     while t_idx < t.len() {
         if p_idx < p.len() && p[p_idx] == t[t_idx] {
-            // Match letterale: avanza entrambi
+            // Literal match: advance both inputs.
             p_idx += 1;
             t_idx += 1;
         } else if p_idx < p.len() && p[p_idx] == '*' {
-            // Il '*' e' un punto di backtrack: prova prima a matchare zero
-            // caratteri (lo si espandera' un carattere alla volta solo se
-            // serve, nel ramo sotto).
+            // `*` is a backtracking point. First match zero characters, then
+            // expand it one character at a time if later input requires it.
             star_idx = Some(p_idx);
             match_idx = t_idx;
             p_idx += 1;
@@ -1279,11 +1247,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     p_idx == p.len()
 }
 
-/// Quante voci tiene al massimo il backlog di replica (in numero di
-/// comandi, (non byte) — semplificazione voluta:
-/// più facile da ragionare Replica staccata a lungo
-/// perde "N comandi" invece di "N byte", è comunque un buon
-/// proxy dello stesso concetto).
+/// Maximum number of committed batches retained for partial synchronization.
 const BACKLOG_CAPACITY: usize = 10_000;
 
 enum LogMessage {
@@ -1303,7 +1267,7 @@ enum LogMessage {
     },
 }
 
-/// Stato di una Replica connessa, per il monitoraggio del lag.
+/// Monitoring state for a connected replica.
 struct ReplicaStatus {
     addr: String,
     last_ack_offset: u64,
@@ -1440,33 +1404,21 @@ struct Persistence {
     visibility_gate: tokio::sync::RwLock<()>,
     write_gate: tokio::sync::Mutex<()>,
     paths: PersistencePaths,
-    // Canale broadcast: ogni comando di scrittura viene trasmesso a tutte le
-    // Replica connesse in tempo reale (in aggiunta al log su disco), taggato
-    // con l'offset di replicazione a cui corrisponde.
+    // Broadcasts each committed batch to connected replicas with its sequence.
     replica_tx: tokio::sync::broadcast::Sender<(u64, CommittedBatch)>,
-    // Se true, questa istanza smette di comportarsi da Replica e diventa
-    // un Master indipendente (promozione manuale via REPLICAOF NO ONE).
+    // Marks a replica that has crossed the authoritative promotion boundary.
     promote_to_master: Arc<AtomicBool>,
-    // Offset di replicazione: cresce di 1 a ogni comando di scrittura
-    // replicato. Non è byte-accurato ma basta per capire
-    // "quanti comandi indietro" è una Replica.
+    // Monotonic committed-batch sequence used by persistence and replication.
     repl_offset: AtomicU64,
-    // Buffer circolare degli ultimi BACKLOG_CAPACITY comandi, con il loro
-    // offset. Usato per il resync parziale: una Replica che si riconnette
-    // con un offset ancora presente qui riceve solo i comandi mancanti,
-    // invece di un dump completo.
+    // Recent committed batches retained for gap-free partial synchronization.
     backlog: std::sync::Mutex<std::collections::VecDeque<(u64, CommittedBatch)>>,
     next_replica_id: AtomicU64,
     replica_status: std::sync::Mutex<std::collections::HashMap<u64, ReplicaStatus>>,
-    // Pub/Sub: un unico canale broadcast per tutti i canali applicativi
-    // (channel_name, payload) — ogni subscriber filtra da solo i messaggi
-    // dei canali a cui è iscritto, invece di avere un canale broadcast
-    // dedicato per ogni nome di canale (che andrebbe creato/distrutto
-    // dinamicamente, più complicato da gestire in modo sicuro).
+    // One broadcast channel carries all ephemeral Pub/Sub messages; each
+    // subscriber filters the channels it currently follows.
     pubsub_tx: tokio::sync::broadcast::Sender<(String, String)>,
     next_subscriber_id: AtomicU64,
-    // canale -> insieme di id di subscriber iscritti, usato solo per dare
-    // a PUBLISH il numero di destinatari (Redis fa lo stesso).
+    // Channel-to-subscriber IDs used to report PUBLISH recipient counts.
     subscriptions:
         std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<u64>>>,
     failure: std::sync::Mutex<Option<String>>,
@@ -1549,7 +1501,7 @@ impl CommittedBatch {
 }
 
 // ============================================================
-// LOG BINARIO - Formato compatto per operazioni di scrittura
+// LEGACY COMMAND BINLOG CODEC
 // ============================================================
 #[cfg(test)]
 const OP_SET: u8 = 1;
@@ -1617,12 +1569,9 @@ fn write_u64_be(buf: &mut Vec<u8>, val: u64) {
     buf.push(val as u8);
 }
 
-// Versioni "checked": ritornano None invece di andare in panic se il
-// binlog è troncato o corrotto (bit-flip, scrittura interrotta a metà da
-// un crash) e i byte richiesti non ci sono davvero. Usate durante il
-// recovery all'avvio, dove un binlog danneggiato non deve MAI far
-// crashare il processo — nel peggiore dei casi si perde quel singolo
-// record, non l'intero avvio.
+// Checked decoding primitives return `None` instead of panicking on truncated
+// or corrupt input. Recovery decides separately whether a recognizable final
+// partial record is truncatable or corruption must fail startup closed.
 #[cfg(test)]
 fn read_u16_be(bytes: &[u8], offset: &mut usize) -> Option<u16> {
     if offset.checked_add(2)? > bytes.len() {
@@ -1661,8 +1610,7 @@ fn read_u64_be(bytes: &[u8], offset: &mut usize) -> Option<u64> {
     Some(val)
 }
 
-/// Estrae una fetta di `len` byte a partire da `offset`, senza andare in
-/// panic se non ci stanno (record troncato/corrotto).
+/// Returns a bounded slice and rejects truncated or corrupt record offsets.
 fn safe_slice(bytes: &[u8], offset: usize, len: usize) -> Option<&[u8]> {
     let end = offset.checked_add(len)?;
     bytes.get(offset..end)
@@ -1792,7 +1740,7 @@ fn decode_binlog_record(record: &[u8]) -> Result<DecodedBinlogRecord<'_>, Persis
     })
 }
 
-/// Converte un comando + entry in record binario per il log
+/// Encodes a legacy command record used for backward-compatible decoding tests.
 #[cfg(test)]
 fn command_to_binary_record(
     cmd: &str,
@@ -1821,7 +1769,7 @@ fn command_to_binary_record(
         "HDEL" => OP_HDEL,
         "SREM" => OP_SREM,
         "COPY" => OP_COPY,
-        _ => return None, // Comando non persistente
+        _ => return None, // Non-persistent command.
     };
 
     buf.push(op_code);
@@ -1835,13 +1783,11 @@ fn command_to_binary_record(
             let value = &args[2];
             write_u16_be(&mut buf, key.len() as u16);
             buf.extend_from_slice(key.as_bytes());
-            buf.push(1); // tipo: stringa
+            buf.push(1); // String value type.
             write_u32_be(&mut buf, value.len() as u32);
             buf.extend_from_slice(value.as_bytes());
-            // Scadenza assoluta, se presente (SET normalizzato con "EXAT
-            // <timestamp>" da normalize_for_log — vedi lì per il perché):
-            // senza questo, un SET con EX/PX sopravviverebbe alla
-            // persistenza/replica perdendo silenziosamente la scadenza.
+            // Persist the normalized absolute expiration so replay does not
+            // reinterpret a relative TTL at a later wall-clock time.
             let expiry: u64 = if args.len() >= 5 && args[3].eq_ignore_ascii_case("EXAT") {
                 args[4].parse().unwrap_or(0)
             } else {
@@ -1892,7 +1838,7 @@ fn command_to_binary_record(
             }
             let key = &args[1];
             let timestamp = args[2].parse::<u64>().unwrap_or(0);
-            buf[0] = OP_EXPIRE; // stesso codice, timestamp assoluto
+            buf[0] = OP_EXPIRE; // Same opcode with an absolute timestamp.
             write_u16_be(&mut buf, key.len() as u16);
             buf.extend_from_slice(key.as_bytes());
             write_u64_be(&mut buf, timestamp);
@@ -2010,7 +1956,7 @@ fn command_to_binary_record(
             buf.extend_from_slice(field.as_bytes());
         }
         "JSON.SET" => {
-            // args: ["JSON.SET", key, path, value_json_compatto]
+            // Arguments: command, key, path, compact JSON value.
             if args.len() < 4 {
                 return None;
             }
@@ -2025,7 +1971,7 @@ fn command_to_binary_record(
             buf.extend_from_slice(value.as_bytes());
         }
         "JSON.DEL" => {
-            // args: ["JSON.DEL", key, path]
+            // Arguments: command, key, path.
             if args.len() < 3 {
                 return None;
             }
@@ -2037,7 +1983,7 @@ fn command_to_binary_record(
             buf.extend_from_slice(path.as_bytes());
         }
         "JSON.NUMINCRBY" => {
-            // args: ["JSON.NUMINCRBY", key, path, delta_come_stringa]
+            // Arguments: command, key, path, numeric delta as text.
             if args.len() < 4 {
                 return None;
             }
@@ -2052,7 +1998,7 @@ fn command_to_binary_record(
             buf.extend_from_slice(delta.as_bytes());
         }
         "JSON.ARRAPPEND" => {
-            // args: ["JSON.ARRAPPEND", key, path, value_json_compatto]
+            // Arguments: command, key, path, compact JSON value.
             if args.len() < 4 {
                 return None;
             }
@@ -2083,7 +2029,7 @@ fn command_to_binary_record(
     Some(buf)
 }
 
-/// Legge un record binario e lo converte in args per execute_command
+/// Decodes a legacy command record into command arguments.
 #[cfg(test)]
 fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
     if record.is_empty() {
@@ -2103,9 +2049,8 @@ fn binary_record_to_args(record: &[u8]) -> Option<Vec<String>> {
             let val_len = read_u32_be(record, &mut offset)? as usize;
             let value = String::from_utf8_lossy(safe_slice(record, offset, val_len)?).to_string();
             offset += val_len;
-            // I record scritti prima di questa versione non hanno questi 8
-            // byte finali con la scadenza: se mancano, va bene lo stesso,
-            // significa che "nessuna scadenza" (comportamento invariato).
+            // Older records omit the final expiration field and therefore
+            // represent a value without expiration.
             let expiry = read_u64_be(record, &mut offset).unwrap_or(0);
             if expiry > 0 {
                 Some(vec![
@@ -2390,17 +2335,15 @@ fn value_to_line(key: &str, entry: &DataEntry) -> String {
                 .join("|"),
         ),
         OnyxValue::Json(j) => ("JSON", j.to_string()),
-        // Vector: non ancora supportato nel formato snapshot testuale
+        // The legacy text snapshot format does not support vectors.
         _ => ("STR", String::new()),
     };
 
     let exp_val = entry.expires_at.unwrap_or(0);
     format!("{}\t{}\t{}\t{}", key, val_type, exp_val, val_str)
 }
-/// Elenco dei comandi che scrivono (usato sia per il gate READONLY sulle
-/// Replica, sia — indirettamente — coerente con quello che command_to_binary_record
-/// sa mappare su un op-code per il binlog). Va prima del dispatch, quindi
-/// non richiede aver già eseguito il comando per saperlo.
+/// Classifies commands that can mutate authoritative state. The classification
+/// drives replica read-only enforcement and ordered persistence admission.
 fn is_write_command(cmd: &str) -> bool {
     matches!(
         cmd,
@@ -2534,18 +2477,12 @@ fn rollback_attempted_mutation(
         }
     }
 }
-/// Un resync parziale è ammissibile solo se il replication ID richiesto
-/// dalla Replica coincide con quello attuale del Master: garantisce che
-/// stiamo parlando con lo stesso identico processo Master di prima, non
-/// con uno ripartito da zero (nel qual caso il vecchio offset non ha più
-/// alcun significato, anche se per coincidenza "sembra" plausibile).
-/// requested_replid == 0 vuol dire "la Replica non conosce ancora nessun
-/// replid" (prima connessione in assoluto): mai ammesso a resync parziale.
+/// Allows partial synchronization only when the replica names the current
+/// master's non-zero replication identity.
 fn replid_allows_partial(requested_replid: u64, current_replid: u64) -> bool {
     requested_replid != 0 && requested_replid == current_replid
 }
-/// Dato che il replication ID combacia, decide se il backlog attuale
-/// permette davvero un resync parziale senza buchi.
+/// Determines whether retained history covers a requested sequence without gaps.
 fn partial_resync_possible(
     requested_offset: u64,
     backlog_oldest: Option<u64>,
@@ -2630,11 +2567,8 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
 
     match cmd {
         "SET" if args.len() >= 3 => {
-            // Opzioni extra, in qualsiasi ordine come in Redis: EX secondi |
-            // PX millisecondi | EXAT timestamp_assoluto (quest'ultima solo
-            // per uso interno: è così che persistenza/replica ripropongono
-            // in modo deterministico un SET con scadenza, senza rivalutare
-            // "adesso" al momento del replay), NX | XX.
+            // Accept Redis-compatible EX/PX/NX/XX options plus internal EXAT,
+            // which makes expiration deterministic during replay.
             let mut expires_at: Option<u64> = None;
             let mut condition: Option<bool> = None; // Some(true)=NX, Some(false)=XX
             let mut i = 3;
@@ -2698,8 +2632,7 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
                 if ok {
                     (RESPValue::SimpleString("OK".to_string()), true)
                 } else {
-                    // NX con chiave già esistente, o XX con chiave assente:
-                    // nessuna scrittura avvenuta, come in Redis risponde nil.
+                    // A failed NX/XX condition performs no write and returns nil.
                     (RESPValue::BulkString(None), false)
                 }
             }
@@ -3138,13 +3071,8 @@ fn normalize_for_log(store: &ShardedStore, args: &[String]) -> Vec<String> {
         return vec!["EXPIREAT".to_string(), key.to_string(), exp.to_string()];
     }
     if cmd == "SET" && args.len() > 3 {
-        // SET con opzioni (EX/PX/NX/XX): NX/XX sono a posto così come sono
-        // (existence-based, replay deterministico), ma EX/PX sono relativi
-        // ad "adesso" — se li rigiocassimo alla lettera in fase di replay
-        // (binlog o Replica), "adesso" sarebbe un istante diverso da quello
-        // originale. Normalizziamo quindi in "SET chiave valore EXAT
-        // <timestamp_assoluto>" quando è risultata una scadenza, così il
-        // replay riproduce esattamente la stessa scadenza, non una nuova.
+        // Normalize relative EX/PX expirations to EXAT so persistence and
+        // replication reproduce the original absolute deadline.
         if let Some(exp) = store.get_expiry(key) {
             let value = args.get(2).map(|s| s.as_str()).unwrap_or("");
             return vec![
@@ -4179,16 +4107,12 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             Err(_) => break,
         };
 
-        // Normalizza il nome del comando in maiuscolo UNA VOLTA sola, in-place
-        // (make_ascii_uppercase non alloca): prima il match in execute_command
-        // era case-sensitive, quindi "set" minuscolo non funzionava — un vero
-        // bug di compatibilità, non solo una questione di stile. Farlo qui,
-        // prima di ogni uso, garantisce che dispatch, coda di EXEC, e stream
-        // di replica vedano tutti la stessa versione normalizzata.
+        // Normalize the command name once so dispatch, transactions, and
+        // replication all observe the same case-insensitive command identity.
         args[0].make_ascii_uppercase();
         let cmd = args[0].as_str();
 
-        // AUTH: sia `AUTH password` (utente "default") sia `AUTH utente password`
+        // AUTH accepts either `AUTH password` or `AUTH username password`.
         if cmd.eq_ignore_ascii_case("AUTH") {
             let (username, provided_password) = if args.len() >= 3 {
                 (args[1].clone(), args[2].clone())
@@ -4212,8 +4136,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             let _ = buf_writer.flush().await;
             continue;
         }
-        // Autenticazione: da qui in poi, se serve login e non è stato fatto,
-        // nessun altro comando è ammesso (nemmeno MULTI/EXEC/SYNC/SUBSCRIBE).
+        // No command, including replication and Pub/Sub, bypasses authentication.
         if !authenticated {
             resp_buf.clear();
             RESPValue::Error("NOAUTH authentication required. Use AUTH password".to_string())
@@ -4281,7 +4204,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             continue;
         }
 
-        // Se in transazione, accoda
+        // Queue commands while a transaction is active.
         if let Some(transaction) = transaction.as_mut() {
             resp_buf.clear();
             match transaction.enqueue(args.clone()) {
@@ -4293,9 +4216,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             continue;
         }
 
-        // PUBLISH — non richiede modalità speciale, un comando normale come
-        // gli altri, solo che non passa da execute_command/persistenza (i
-        // messaggi pub/sub sono effimeri, non finiscono nel binlog).
+        // Pub/Sub messages are ephemeral and never enter persistence.
         if cmd == "PUBLISH" {
             let channel = args.get(1).cloned().unwrap_or_default();
             let message = args.get(2).cloned().unwrap_or_default();
@@ -4314,9 +4235,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             continue;
         }
 
-        // SUBSCRIBE — entra in "modalità pub/sub": da qui la connessione
-        // smette di eseguire comandi normali e resta bloccata a inoltrare
-        // messaggi dei canali sottoscritti, finché il client si disconnette.
+        // SUBSCRIBE enters RESP2-style Pub/Sub mode for this connection.
         if cmd == "SUBSCRIBE" {
             let sub_id = persistence
                 .next_subscriber_id
@@ -4350,11 +4269,8 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
 
             let mut pubsub_rx = persistence.pubsub_tx.subscribe();
 
-            // Task dedicato a leggere ulteriori SUBSCRIBE/UNSUBSCRIBE dal
-            // client mentre restiamo in ascolto dei messaggi pubblicati.
-            // Stesso schema usato per gli ACK delle Repliche: un task
-            // possiede la metà "lettura", il ciclo principale sceglie tra
-            // canali cancel-safe (mpsc/broadcast), mai su read_line diretto.
+            // A dedicated task owns the read half for later subscription
+            // changes while the main loop forwards published messages.
             let (chan_tx, mut chan_rx) =
                 tokio::sync::mpsc::unbounded_channel::<(bool, Vec<String>)>();
             let reader_task = tokio::spawn(async move {
@@ -4381,9 +4297,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                                 };
                                 let _ = chan_tx.send((false, chans));
                             }
-                            // Altri comandi vengono ignorati finché si è in
-                            // modalità pub/sub (limitazione nota, come nella
-                            // sottoscrizione RESP2 di base di Redis).
+                            // RESP2-style Pub/Sub mode ignores unrelated commands.
                         }
                         Ok(Some(_)) => continue,
                         Ok(None) | Err(_) => break,
@@ -4396,7 +4310,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     update = chan_rx.recv() => {
                         let (is_subscribe, channels) = match update {
                             Some(u) => u,
-                            None => break, // connessione chiusa dal client
+                            None => break, // The client closed the connection.
                         };
                         if is_subscribe {
                             for channel in channels {
@@ -5380,37 +5294,37 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
     drop(statuses);
 
     format!(
-        "# HELP onyxdb_uptime_seconds Tempo di attivita' del server in secondi\n\
+        "# HELP onyxdb_uptime_seconds Server uptime in seconds\n\
          # TYPE onyxdb_uptime_seconds counter\n\
          onyxdb_uptime_seconds {}\n\
-         # HELP onyxdb_keys_total Numero di chiavi attualmente presenti\n\
+         # HELP onyxdb_keys_total Number of currently present keys\n\
         TYPE onyxdb_keys_total gauge\n\
          onyxdb_keys_total {}\n\
-         # HELP onyxdb_active_connections Numero di connessioni client attive\n\
+         # HELP onyxdb_active_connections Number of active client connections\n\
          # TYPE onyxdb_active_connections gauge\n\
          onyxdb_active_connections {}\n\
-         # HELP onyxdb_commands_total Numero totale di comandi eseguiti\n\
+         # HELP onyxdb_commands_total Total number of executed commands\n\
          # TYPE onyxdb_commands_total counter\n\
          onyxdb_commands_total {}\n\
-         # HELP onyxdb_cache_hits_total Numero di letture andate a buon fine\n\
+         # HELP onyxdb_cache_hits_total Number of successful key reads\n\
          # TYPE onyxdb_cache_hits_total counter\n\
          onyxdb_cache_hits_total {}\n\
-         # HELP onyxdb_cache_misses_total Numero di letture su chiavi inesistenti\n\
+         # HELP onyxdb_cache_misses_total Number of reads for missing keys\n\
          # TYPE onyxdb_cache_misses_total counter\n\
          onyxdb_cache_misses_total {}\n\
-         # HELP onyxdb_is_master 1 se questa istanza e' un Master, 0 se e' una Replica\n\
+         # HELP onyxdb_is_master 1 when this instance is a master, 0 when it is a replica\n\
          # TYPE onyxdb_is_master gauge\n\
          onyxdb_is_master {}\n\
-         # HELP onyxdb_replication_offset Offset di replicazione corrente (numero di comandi replicati)\n\
+         # HELP onyxdb_replication_offset Current committed replication sequence\n\
          # TYPE onyxdb_replication_offset counter\n\
          onyxdb_replication_offset {}\n\
-         # HELP onyxdb_connected_replicas Numero di Replica attualmente connesse\n\
+         # HELP onyxdb_connected_replicas Number of currently connected replicas\n\
          # TYPE onyxdb_connected_replicas gauge\n\
          onyxdb_connected_replicas {}\n\
-         # HELP onyxdb_max_replica_lag Quanto e' indietro la Replica piu' lenta, in numero di comandi\n\
+         # HELP onyxdb_max_replica_lag Largest connected-replica sequence lag\n\
          # TYPE onyxdb_max_replica_lag gauge\n\
          onyxdb_max_replica_lag {}\n\
-         # HELP onyxdb_memory_bytes Byte occupati (stima approssimativa)\n\
+         # HELP onyxdb_memory_bytes Approximate logical dataset bytes\n\
          # TYPE onyxdb_memory_bytes gauge\n\
          onyxdb_memory_bytes {}\n",
         uptime,
@@ -5464,7 +5378,7 @@ async fn run_metrics_server(store: Arc<ShardedStore>, persistence: Arc<Persisten
     }
 }
 // ============================================================
-// HANDLER OBP (Onyx Binary Protocol) - Listener parallelo
+// OBP CONNECTION HANDLER
 // ============================================================
 
 async fn handle_obp_client(
@@ -6045,7 +5959,7 @@ async fn execute_obp_command(
     let cmd = frame.cmd;
     let args = frame.args;
 
-    // AUTH via OBP (codice 0x10): arg[0]=password, oppure arg[0]=utente e arg[1]=password.
+    // OBP AUTH (0x10) accepts a password or a username/password pair.
     if cmd == 0x10 {
         let credentials = if args.len() >= 2 {
             std::str::from_utf8(&args[0])
@@ -6070,14 +5984,14 @@ async fn execute_obp_command(
         };
     }
 
-    // Se serve login e non è stato fatto, rifiuta qualsiasi altro comando.
+    // Reject every non-authentication command until authentication succeeds.
     if !*authenticated {
         return OBPFrame {
             cmd: 0x00,
             flags: 0,
             correlation_id: frame.correlation_id,
             args: Vec::new(),
-            payload: Some(Bytes::from("NOAUTH auth richiesta")),
+            payload: Some(Bytes::from("NOAUTH authentication required")),
         };
     }
 
@@ -6310,8 +6224,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
             .as_nanos() as u64;
         let pid = std::process::id() as u64;
-        // Non serve crittograficamente sicuro, solo "diverso ad ogni avvio
-        // con probabilità di collisione trascurabile".
+        // This identity is not cryptographic; it only needs negligible restart
+        // collision probability.
         nanos.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(pid)
     };
     REPL_ID.set(repl_id_val).ok();
@@ -6349,7 +6263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args[i] == "--maxmemory-policy" && i + 1 < args.len() {
             maxmemory_policy_arg = Some(args[i + 1].clone());
         }
-        // --user nome:password — ripetibile, un utente per occorrenza.
+        // `--user name:password` may be repeated.
         if args[i] == "--user" && i + 1 < args.len() {
             match args[i + 1].split_once(':') {
                 Some((name, pw)) => {
@@ -6386,9 +6300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         username: master_user.unwrap_or_else(|| "default".to_string()),
         password,
     });
-    // Compatibilità con la vecchia modalità a password unica: diventa
-    // l'utente "default", utilizzabile anche con `AUTH password` (senza
-    // nome utente esplicito).
+    // Legacy single-password mode configures the `default` user.
     if let Some(pw) = password {
         users_map.insert("default".to_string(), pw);
     }
@@ -6494,10 +6406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let binlog_shared: Arc<std::sync::Mutex<File>> =
         Arc::new(std::sync::Mutex::new(open_binlog_file(&paths.binlog)));
 
-    // Task periodico di fsync: solo se la policy e' "everysec" (il default,
-    // come in Redis). Ogni secondo forza la scrittura fisica su disco del
-    // binlog corrente, indipendentemente da quanto e' stato scritto nel
-    // frattempo — se non c'e' nulla di nuovo l'fsync e' comunque economico.
+    // The default `everysec` policy synchronizes the current binlog once per second.
     if fsync_policy() == FsyncPolicy::EverySec {
         let persistence_fsync = Arc::clone(&persistence);
         tokio::spawn(async move {
@@ -7699,7 +7608,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lpush_e_lrange() {
+    fn test_lpush_and_lrange() {
         let store = ShardedStore::new();
         assert_eq!(store.lpush("list", "one".to_string()), Ok(1));
         assert_eq!(store.lpush("list", "two".to_string()), Ok(2));
@@ -8046,8 +7955,7 @@ mod tests {
         assert_eq!(store.strlen("non_esiste"), Ok(0));
     }
     // ============================================================
-    // Round-trip binlog binario: ogni comando che scrive deve sopravvivere
-    // intatto a command_to_binary_record -> binary_record_to_args.
+    // Every persisted command must survive a legacy command-record round trip.
     // ============================================================
 
     #[test]
@@ -10050,7 +9958,7 @@ mod tests {
 
     #[test]
     fn test_binlog_roundtrip_set_without_expiration_does_not_include_exat() {
-        // Un SET senza scadenza non deve risorgere con un EXAT fantasma.
+        // A SET without expiration must not acquire an EXAT during round trip.
         let args = vec!["SET".to_string(), "k".to_string(), "v".to_string()];
         let record = command_to_binary_record("SET", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
@@ -10080,8 +9988,7 @@ mod tests {
 
     #[test]
     fn test_binlog_roundtrip_expire_becomes_expireat() {
-        // EXPIRE (relativo) va persistito come EXPIREAT (assoluto): il
-        // record binario stesso è già in forma assoluta.
+        // Relative EXPIRE is encoded as an absolute EXPIREAT deadline.
         let args = vec!["EXPIRE".to_string(), "key".to_string(), "12345".to_string()];
         let record = command_to_binary_record("EXPIRE", &args, None).unwrap();
         let decoded = binary_record_to_args(&record).unwrap();
@@ -10120,13 +10027,13 @@ mod tests {
         let args = vec![
             "HSET".to_string(),
             "h".to_string(),
-            "campo".to_string(),
-            "valore".to_string(),
+            "field".to_string(),
+            "value".to_string(),
         ];
         let record = command_to_binary_record("HSET", &args, None).unwrap();
         assert_eq!(
             binary_record_to_args(&record).unwrap(),
-            vec!["HSET", "h", "campo", "valore"]
+            vec!["HSET", "h", "field", "value"]
         );
     }
 
@@ -10189,11 +10096,11 @@ mod tests {
 
     #[test]
     fn test_binlog_roundtrip_hdel() {
-        let args = vec!["HDEL".to_string(), "h".to_string(), "campo".to_string()];
+        let args = vec!["HDEL".to_string(), "h".to_string(), "field".to_string()];
         let record = command_to_binary_record("HDEL", &args, None).unwrap();
         assert_eq!(
             binary_record_to_args(&record).unwrap(),
-            vec!["HDEL", "h", "campo"]
+            vec!["HDEL", "h", "field"]
         );
     }
 
@@ -10285,54 +10192,54 @@ mod tests {
 
     #[test]
     fn test_binlog_insufficient_args_returns_none() {
-        // Niente panic su un array troppo corto: solo None.
+        // A short argument array is rejected without panicking.
         let args = vec!["SET".to_string()];
         assert!(command_to_binary_record("SET", &args, None).is_none());
     }
 
     // ============================================================
-    // Binlog corrotto: mai panic, solo None.
+    // Corrupt legacy records are rejected without panicking.
     // ============================================================
 
     #[test]
-    fn test_record_vuoto_non_va_in_panic() {
+    fn empty_record_does_not_panic() {
         assert!(binary_record_to_args(&[]).is_none());
     }
 
     #[test]
-    fn test_record_troncato_a_meta_chiave_non_va_in_panic() {
-        // OP_SET, poi dichiara una chiave di 100 byte ma ne fornisce solo 2.
+    fn record_truncated_mid_key_does_not_panic() {
+        // Declare a 100-byte key but provide only two bytes.
         let record = vec![OP_SET, 0x00, 0x64, b'a', b'b'];
         assert!(binary_record_to_args(&record).is_none());
     }
 
     #[test]
     fn truncated_record_mid_value_does_not_panic() {
-        // Chiave valida "k", poi dichiara un valore di 1000 byte inesistente.
+        // Provide a valid key, then declare a missing 1,000-byte value.
         let mut record = vec![OP_SET];
         record.extend_from_slice(&[0x00, 0x01]); // key_len = 1
         record.push(b'k');
-        record.push(1); // tipo stringa
+        record.push(1); // String value type.
         record.extend_from_slice(&[0x00, 0x00, 0x03, 0xE8]); // val_len = 1000, ma non seguono byte
         assert!(binary_record_to_args(&record).is_none());
     }
 
     #[test]
-    fn test_read_u16_be_su_buffer_troncato() {
-        let buf = [0x00u8]; // solo 1 byte, ne servono 2
+    fn read_u16_be_rejects_a_truncated_buffer() {
+        let buf = [0x00u8]; // One byte is insufficient for a u16.
         let mut offset = 0;
         assert_eq!(read_u16_be(&buf, &mut offset), None);
     }
 
     #[test]
-    fn test_read_u64_be_su_buffer_troncato() {
-        let buf = [0x00u8, 0x01, 0x02]; // solo 3 byte, ne servono 8
+    fn read_u64_be_rejects_a_truncated_buffer() {
+        let buf = [0x00u8, 0x01, 0x02]; // Three bytes are insufficient for a u64.
         let mut offset = 0;
         assert_eq!(read_u64_be(&buf, &mut offset), None);
     }
 
     #[test]
-    fn test_safe_slice_oltre_i_limiti() {
+    fn safe_slice_rejects_out_of_bounds_ranges() {
         let buf = [1u8, 2, 3];
         assert!(safe_slice(&buf, 0, 10).is_none());
         assert!(safe_slice(&buf, 5, 1).is_none());
@@ -10340,11 +10247,11 @@ mod tests {
     }
 
     // ============================================================
-    // Round-trip formato snapshot testuale (value_to_line / line_to_entry)
+    // Legacy text snapshot round trips.
     // ============================================================
 
     #[test]
-    fn test_snapshot_roundtrip_stringa() {
+    fn test_snapshot_roundtrip_string() {
         let entry = DataEntry {
             value: OnyxValue::Blob(Bytes::from("ciao")),
             expires_at: None,
@@ -10361,7 +10268,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_roundtrip_con_scadenza() {
+    fn test_snapshot_roundtrip_with_expiration() {
         let entry = DataEntry {
             value: OnyxValue::Blob(Bytes::from("v")),
             expires_at: Some(123456),
@@ -10408,78 +10315,65 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_riga_malformata_ritorna_none() {
-        assert!(line_to_entry("questa non e' una riga valida").is_none());
+    fn malformed_snapshot_line_returns_none() {
+        assert!(line_to_entry("this is not a valid snapshot line").is_none());
         assert!(line_to_entry("").is_none());
     }
     // ============================================================
-    // Logica di resync: qui vive il regression test del bug che ha
-    // scoperto Marco (backlog vuoto dopo un riavvio del Master scambiato
-    // per "già allineati").
+    // Partial synchronization boundary regression coverage.
     // ============================================================
 
     #[test]
-    fn test_replid_stesso_id_permette_parziale() {
+    fn matching_replication_id_allows_partial_sync() {
         assert!(replid_allows_partial(42, 42));
     }
 
     #[test]
-    fn test_replid_diverso_richiede_full() {
+    fn different_replication_id_requires_full_sync() {
         assert!(!replid_allows_partial(42, 99));
     }
 
     #[test]
-    fn test_replid_sconosciuto_richiede_full() {
-        // requested_replid = 0: la Replica non ha ancora mai visto un
-        // replid valido (prima connessione in assoluto).
+    fn unknown_replication_id_requires_full_sync() {
+        // Zero means that the replica has never installed an upstream identity.
         assert!(!replid_allows_partial(0, 99));
     }
 
     #[test]
-    fn test_partial_resync_backlog_copre_offset() {
-        // Backlog parte da 5, richiesto offset 4 (il prossimo da mandare
-        // sarebbe proprio il 5): nessun buco, parziale ammesso.
+    fn partial_sync_backlog_covers_the_requested_offset() {
+        // A backlog beginning at 5 can continue a replica installed through 4.
         assert!(partial_resync_possible(4, Some(5), 100));
     }
 
     #[test]
-    fn test_partial_resync_gap_nel_backlog() {
-        // Backlog parte da 20, ma si chiede di ripartire da 4: mancano i
-        // comandi 5..19, non più recuperabili. Serve full resync.
+    fn partial_sync_rejects_a_backlog_gap() {
+        // A backlog beginning at 20 cannot continue a replica installed through 4.
         assert!(!partial_resync_possible(4, Some(20), 100));
     }
 
     #[test]
-    fn test_partial_resync_backlog_vuoto_ma_davvero_allineati() {
-        // Nessuna scrittura in backlog, ma l'offset richiesto combacia
-        // esattamente con quello corrente del Master: qui è legittimo
-        // concludere "non c'è nulla da rimandare".
+    fn empty_backlog_allows_an_exactly_aligned_replica() {
+        // An empty backlog is sufficient only at the master's current sequence.
         assert!(partial_resync_possible(9, None, 9));
     }
 
     #[test]
-    fn test_partial_resync_backlog_vuoto_dopo_riavvio_master_e_il_bug_originale() {
-        // Scenario esatto del bug: il Master è ripartito da zero
-        // (repl_offset azzerato a 0, backlog vuoto perché nessuna
-        // scrittura è ancora avvenuta nel nuovo processo), ma la Replica
-        // si presenta con un offset "9" ereditato dal vecchio Master.
-        // PRIMA del fix, backlog vuoto da solo bastava per concludere
-        // "già allineati" — qui verifichiamo che NON sia più così: serve
-        // che l'offset richiesto combaci con quello corrente (0), non con
-        // un numero qualsiasi lasciato da un processo precedente.
+    fn empty_backlog_after_master_restart_rejects_a_stale_offset() {
+        // A restarted master at sequence zero cannot accept an offset inherited
+        // from the previous process merely because its backlog is empty.
         assert!(!partial_resync_possible(9, None, 0));
     }
     // ============================================================
-    // JSON path: parser e navigazione
+    // JSON path parsing and navigation.
     // ============================================================
 
     #[test]
-    fn test_parse_path_radice() {
+    fn parse_json_root_path() {
         assert_eq!(parse_json_path("$"), Some(vec![]));
     }
 
     #[test]
-    fn test_parse_path_campo_singolo() {
+    fn parse_single_json_field() {
         assert_eq!(
             parse_json_path("$.name"),
             Some(vec![JsonPathSegment::Field("name".to_string())])
@@ -10487,7 +10381,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_path_annidato() {
+    fn parse_nested_json_fields() {
         assert_eq!(
             parse_json_path("$.address.city"),
             Some(vec![
@@ -10498,7 +10392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_path_indice_array() {
+    fn parse_json_array_index() {
         assert_eq!(
             parse_json_path("$.tag[0]"),
             Some(vec![
@@ -10509,7 +10403,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_path_misto_lungo() {
+    fn parse_long_mixed_json_path() {
         assert_eq!(
             parse_json_path("$.a[1].b[2]"),
             Some(vec![
@@ -10522,27 +10416,27 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_path_senza_dollaro_iniziale_none() {
+    fn json_path_requires_a_root_marker() {
         assert_eq!(parse_json_path("name"), None);
     }
 
     #[test]
-    fn test_parse_path_doppio_punto_none() {
+    fn json_path_rejects_an_empty_field_segment() {
         assert_eq!(parse_json_path("$..name"), None);
     }
 
     #[test]
-    fn test_parse_path_parentesi_non_chiusa_none() {
+    fn json_path_rejects_an_unclosed_array_index() {
         assert_eq!(parse_json_path("$.tag[0"), None);
     }
 
     #[test]
-    fn test_parse_path_indice_non_numerico_none() {
+    fn json_path_rejects_a_non_numeric_array_index() {
         assert_eq!(parse_json_path("$.tag[x]"), None);
     }
 
     #[test]
-    fn test_get_json_path_campo_esistente() {
+    fn get_json_path_returns_an_existing_field() {
         let val: serde_json::Value = serde_json::json!({"name": "Marco", "age": 18});
         let path = parse_json_path("$.name").unwrap();
         assert_eq!(
@@ -10552,28 +10446,28 @@ mod tests {
     }
 
     #[test]
-    fn test_get_json_path_annidato() {
+    fn get_json_path_returns_a_nested_field() {
         let val: serde_json::Value = serde_json::json!({"address": {"city": "Rome"}});
         let path = parse_json_path("$.address.city").unwrap();
         assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("Rome")));
     }
 
     #[test]
-    fn test_get_json_path_campo_assente_none() {
+    fn get_json_path_returns_none_for_a_missing_field() {
         let val: serde_json::Value = serde_json::json!({"name": "Marco"});
         let path = parse_json_path("$.surname").unwrap();
         assert_eq!(get_json_path(&val, &path), None);
     }
 
     #[test]
-    fn test_get_json_path_indice_array() {
+    fn get_json_path_returns_an_array_element() {
         let val: serde_json::Value = serde_json::json!({"tag": ["dev", "rust"]});
         let path = parse_json_path("$.tag[1]").unwrap();
         assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("rust")));
     }
 
     #[test]
-    fn test_get_json_path_indice_fuori_range_none() {
+    fn get_json_path_rejects_an_out_of_range_index() {
         let val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
         let path = parse_json_path("$.tag[5]").unwrap();
         assert_eq!(get_json_path(&val, &path), None);
@@ -10581,14 +10475,14 @@ mod tests {
 
     #[test]
     fn test_get_json_path_wrong_type_none() {
-        // Indice su un oggetto (non un array): non ha senso, deve dare None.
+        // Array indexing is invalid on an object.
         let val: serde_json::Value = serde_json::json!({"name": "Marco"});
         let path = parse_json_path("$.name[0]").unwrap();
         assert_eq!(get_json_path(&val, &path), None);
     }
 
     #[test]
-    fn test_set_json_path_documento_intero() {
+    fn set_json_path_replaces_the_complete_document() {
         let mut val: serde_json::Value = serde_json::json!({"old": true});
         let path = parse_json_path("$").unwrap();
         assert!(set_json_path(
@@ -10600,7 +10494,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_json_path_campo_esistente() {
+    fn set_json_path_replaces_an_existing_field() {
         let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
         let path = parse_json_path("$.name").unwrap();
         assert!(set_json_path(&mut val, &path, serde_json::json!("Ahmed")));
@@ -10608,7 +10502,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_json_path_campo_nuovo_su_oggetto_esistente() {
+    fn set_json_path_adds_a_field_to_an_existing_object() {
         let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
         let path = parse_json_path("$.age").unwrap();
         assert!(set_json_path(&mut val, &path, serde_json::json!(18)));
@@ -10616,15 +10510,15 @@ mod tests {
     }
 
     #[test]
-    fn test_set_json_path_genitore_assente_fallisce() {
-        // $.a.b.c ma "a" non esiste: niente auto-creazione, deve fallire.
+    fn set_json_path_rejects_a_missing_parent() {
+        // Intermediate objects are not created automatically.
         let mut val: serde_json::Value = serde_json::json!({});
         let path = parse_json_path("$.a.b.c").unwrap();
         assert!(!set_json_path(&mut val, &path, serde_json::json!(1)));
     }
 
     #[test]
-    fn test_set_json_path_indice_array_esistente() {
+    fn set_json_path_replaces_an_existing_array_element() {
         let mut val: serde_json::Value = serde_json::json!({"tag": ["dev", "rust"]});
         let path = parse_json_path("$.tag[0]").unwrap();
         assert!(set_json_path(&mut val, &path, serde_json::json!("go")));
@@ -10632,7 +10526,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_json_path_append_in_coda_array() {
+    fn set_json_path_appends_at_the_array_end() {
         let mut val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
         let path = parse_json_path("$.tag[1]").unwrap();
         assert!(set_json_path(&mut val, &path, serde_json::json!("rust")));
@@ -10640,14 +10534,14 @@ mod tests {
     }
 
     #[test]
-    fn test_set_json_path_indice_troppo_avanti_fallisce() {
+    fn set_json_path_rejects_an_index_past_the_array_end() {
         let mut val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
         let path = parse_json_path("$.tag[5]").unwrap();
         assert!(!set_json_path(&mut val, &path, serde_json::json!("x")));
     }
 
     #[test]
-    fn test_delete_json_path_campo() {
+    fn delete_json_path_removes_a_field() {
         let mut val: serde_json::Value = serde_json::json!({"name": "Marco", "age": 18});
         let path = parse_json_path("$.age").unwrap();
         assert!(delete_json_path(&mut val, &path));
@@ -10655,7 +10549,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_json_path_indice_array() {
+    fn delete_json_path_removes_an_array_element() {
         let mut val: serde_json::Value = serde_json::json!({"tag": ["dev", "rust"]});
         let path = parse_json_path("$.tag[0]").unwrap();
         assert!(delete_json_path(&mut val, &path));
@@ -10663,16 +10557,15 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_json_path_campo_assente_fallisce() {
+    fn delete_json_path_returns_false_for_a_missing_field() {
         let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
         let path = parse_json_path("$.surname").unwrap();
         assert!(!delete_json_path(&mut val, &path));
     }
 
     #[test]
-    fn test_delete_json_path_radice_fallisce() {
-        // DEL su "$" (documento intero) non passa da qui, va gestito
-        // separatamente con un DEL normale sulla chiave.
+    fn delete_json_path_rejects_the_document_root() {
+        // Root deletion is handled as a normal key deletion.
         let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
         let path = parse_json_path("$").unwrap();
         assert!(!delete_json_path(&mut val, &path));
@@ -10682,7 +10575,7 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn test_numincrby_json_path_su_intero() {
+    fn json_numincrby_updates_an_integer() {
         let mut val: serde_json::Value = serde_json::json!({"visits": 5});
         let path = parse_json_path("$.visits").unwrap();
         let result = numincrby_json_path(&mut val, &path, 3.0);
@@ -10714,14 +10607,14 @@ mod tests {
     }
 
     #[test]
-    fn test_numincrby_json_path_assente_fallisce() {
+    fn json_numincrby_rejects_a_missing_path() {
         let mut val: serde_json::Value = serde_json::json!({});
         let path = parse_json_path("$.counter").unwrap();
         assert!(numincrby_json_path(&mut val, &path, 1.0).is_err());
     }
 
     #[test]
-    fn test_arrappend_json_path_su_array_esistente() {
+    fn json_arrappend_updates_an_existing_array() {
         let mut val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
         let path = parse_json_path("$.tag").unwrap();
         let result = arrappend_json_path(&mut val, &path, serde_json::json!("rust"));
@@ -10730,7 +10623,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arrappend_json_path_su_array_vuoto() {
+    fn json_arrappend_updates_an_empty_array() {
         let mut val: serde_json::Value = serde_json::json!({"tag": []});
         let path = parse_json_path("$.tag").unwrap();
         let result = arrappend_json_path(&mut val, &path, serde_json::json!("primo"));
@@ -10738,20 +10631,20 @@ mod tests {
     }
 
     #[test]
-    fn test_arrappend_json_path_su_non_array_fallisce() {
+    fn json_arrappend_rejects_a_non_array() {
         let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
         let path = parse_json_path("$.name").unwrap();
         assert!(arrappend_json_path(&mut val, &path, serde_json::json!("x")).is_err());
     }
 
     #[test]
-    fn test_arrappend_json_path_assente_fallisce() {
+    fn json_arrappend_rejects_a_missing_path() {
         let mut val: serde_json::Value = serde_json::json!({});
         let path = parse_json_path("$.tag").unwrap();
         assert!(arrappend_json_path(&mut val, &path, serde_json::json!("x")).is_err());
     }
     #[test]
-    fn test_json_arrlen_e_objkeys_via_store() {
+    fn json_arrlen_and_objkeys_work_through_the_store() {
         let store = ShardedStore::new();
         store
             .json_set(

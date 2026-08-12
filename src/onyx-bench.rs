@@ -15,7 +15,7 @@ fn encode_command(parts: &[String]) -> String {
     out
 }
 
-// Legge e scarta UNA risposta RESP (ci basta sapere che e' arrivata, per il benchmark).
+// Reads and discards one RESP response.
 async fn skip_reply(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> std::io::Result<()> {
     let mut header = String::new();
     reader.read_line(&mut header).await?;
@@ -41,7 +41,7 @@ async fn skip_reply(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> s
                 Box::pin(skip_reply(reader)).await?;
             }
         }
-        _ => {} // +OK, -ERR, :123 sono gia' consumati dalla read_line
+        _ => {} // Simple strings, errors, and integers end at the first line.
     }
     Ok(())
 }
@@ -57,8 +57,7 @@ async fn run_worker_sync(thread_id: usize) -> u128 {
 
     for i in 0..OPS_PER_THREAD {
         let key = format!("bench_{}_{}", thread_id, i);
-        let _value = format!("valore_{}", i);
-        let set_cmd = encode_command(&["SET".to_string(), key.clone(), format!("valore_{}", i)]);
+        let set_cmd = encode_command(&["SET".to_string(), key.clone(), format!("value_{}", i)]);
         writer.write_all(set_cmd.as_bytes()).await.unwrap();
         skip_reply(&mut reader).await.unwrap();
 

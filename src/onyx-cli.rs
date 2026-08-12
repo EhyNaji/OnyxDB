@@ -54,8 +54,7 @@ async fn read_reply(reader: &mut BufReader<OwnedReadHalf>) -> std::io::Result<St
     }
 }
 
-// Comandi che leggono soltanto: possono essere instradati verso una Replica.
-// Tutto il resto (scritture, PING, INFO, SAVE, SYNC) va sempre al Master.
+// Read-only commands may be routed to replicas. All other commands use the master.
 fn is_read_command(cmd: &str) -> bool {
     matches!(
         cmd.to_ascii_uppercase().as_str(),
@@ -138,10 +137,8 @@ async fn main() {
         None => return,
     };
 
-    // Teniamo indirizzo e connessione ACCOPPIATI: se una Replica fallisce la
-    // connessione all'avvio viene scartata insieme al suo indirizzo, cosi'
-    // gli indici restano sempre allineati (niente piu' mismatch tra "quale
-    // connessione uso" e "quale indirizzo stampo nel log").
+    // Keep each address paired with its live connection so routing and
+    // diagnostics cannot become misaligned when a replica is unavailable.
     let mut replica_conns: Vec<(String, Connection)> = Vec::new();
     for addr in &replica_addrs {
         if let Some(c) = connect(addr).await {

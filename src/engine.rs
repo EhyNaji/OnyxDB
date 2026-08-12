@@ -1,17 +1,16 @@
-//! OnyxDB Engine — Lock-free, shard-per-core storage
+//! OnyxDB engine — sharded in-memory storage.
 //!
-//! Ogni core logico ha il proprio shard. Le chiavi vengono distribuite
-//! tramite consistent hashing sui shard. Ogni shard è protetto da un
-//! Mutex indipendente, quindi la contesa è limitata alle chiavi che
-//! cadono sullo stesso shard.
+//! Keys are distributed across a fixed number of shards using FNV-1a hashing.
+//! Each shard has an independent mutex, so contention is limited to keys that
+//! map to the same shard.
 
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 
-// Numero di shard: potenza di 2 per hashing veloce con bitmask
+// The shard count is a power of two so routing can use a bitmask.
 pub const NUM_SHARDS: usize = 64; // 64 shard, bitmask 0x3F
 
-/// Hash veloce per distribuire le chiavi (FNV-1a, ottimizzato per stringhe corte)
+/// Hashes keys with FNV-1a, which is inexpensive for short keys.
 #[inline]
 fn hash_key(key: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -24,33 +23,33 @@ fn hash_key(key: &[u8]) -> u64 {
     hash
 }
 
-/// Determina lo shard per una chiave (bitmask invece di modulo, più veloce)
+/// Selects a key's shard with a bitmask instead of modulo.
 #[inline]
 fn shard_for_key(key: &[u8]) -> usize {
     (hash_key(key) as usize) & (NUM_SHARDS - 1)
 }
 
 // ============================================================
-// TIPI DI DATI ONYX (più ricchi di Redis)
+// ONYX VALUE TYPES
 // ============================================================
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum OnyxValue {
-    /// Blob opaco (stringa/bytes)
+    /// Opaque string or byte payload.
     Blob(Bytes),
-    /// Intero nativo (64-bit signed)
+    /// Native signed 64-bit integer.
     Int(i64),
-    /// Float nativo (64-bit)
+    /// Native 64-bit floating-point value.
     Float(f64),
-    /// Lista di blob
+    /// Ordered list of byte payloads.
     List(Vec<Bytes>),
-    /// Hash map campo->valore
+    /// Field-to-value map.
     Hash(HashMap<Bytes, Bytes>),
-    /// Set di blob
+    /// Set of byte payloads.
     Set(std::collections::HashSet<Bytes>),
-    /// JSON nativo (con path query)
+    /// Native JSON document with path access.
     Json(serde_json::Value),
-    /// Vector per AI/ML (embeddings)
+    /// Floating-point vector intended for embeddings.
     Vector(Vec<f32>),
 }
 
@@ -90,12 +89,10 @@ fn approx_entry_size(key: &Bytes, entry: &DataEntry) -> usize {
     key.len().saturating_add(value_size).saturating_add(64)
 }
 
-/// Politica di eviction quando si supera `--maxmemory`. Stesso vocabolario
-/// di Redis, con lo stesso livello di approssimazione: anche Redis non fa
-/// un vero minimo globale per LRU/random, campiona un sottoinsieme di
-/// chiavi per restare economico. Qui il "campione" è per-shard: quando
-/// serve liberare spazio, ogni shard propone il suo miglior candidato
-/// locale e si sceglie il migliore tra quelli.
+/// Eviction policy used when the dataset exceeds `--maxmemory`.
+///
+/// Candidate selection is intentionally approximate. Each shard proposes its
+/// best local candidate and the engine selects the best of those candidates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvictionPolicy {
     NoEviction,
@@ -126,22 +123,21 @@ fn cheap_random_index(len: usize) -> usize {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .subsec_nanos() as usize;
-    // Moltiplicatore di Knuth: mescola bene senza bisogno di un vero RNG
-    // (non serve crittograficamente sicuro, solo "abbastanza sparso").
+    // Knuth's multiplier provides adequate dispersion without a full RNG.
     nanos.wrapping_mul(2654435761) % len
 }
 
 // ============================================================
-// SHARD — Owned da un singolo thread alla volta (via Mutex)
+// SHARD — exclusively owned while its mutex guard is held
 // ============================================================
 
 pub struct Shard {
     data: HashMap<Bytes, DataEntry>,
-    /// Contatore operazioni per trigger snapshot incrementale
+    /// Operation counter retained for engine statistics.
     op_count: u64,
-    /// Timestamp ultima modifica
+    /// Timestamp of the most recent modification.
     last_modified: u64,
-    /// Somma approssimativa dei byte occupati dalle entry di questo shard.
+    /// Approximate logical bytes occupied by entries in this shard.
     mem_bytes: usize,
 }
 
@@ -171,11 +167,8 @@ impl Shard {
         true
     }
 
-    /// Legge un'entry aggiornando last_accessed (necessario per un LRU vero:
-    /// senza questo, "last accessed" sarebbe in realtà "last written").
-    /// Prende `&mut self` apposta: lo shard è comunque dietro un Mutex, quindi
-    /// anche una "lettura" ha già l'esclusività necessaria per aggiornare lo
-    /// stato — non costa nulla in più rispetto a prima.
+    /// Reads an entry and updates `last_accessed` for LRU candidate selection.
+    /// The mutable receiver is safe because callers already hold the shard mutex.
     #[inline]
     fn get(&mut self, key: &Bytes) -> Option<&DataEntry> {
         let ts = now();
@@ -214,7 +207,7 @@ impl Shard {
         removed
     }
 
-    /// Rimuove le chiavi scadute, ritorna quante ne ha pulite
+    /// Removes expired keys and returns the number removed.
     fn expire_keys(&mut self) -> usize {
         let now = now();
         let expired: Vec<Bytes> = self
@@ -238,7 +231,7 @@ impl Shard {
         self.data.len()
     }
 
-    /// Legge l'entry SENZA clonarla (solo riferimento, per la durata della chiusura).
+    /// Reads an entry by reference for the duration of the closure.
     fn read<F, R>(&mut self, key: &Bytes, f: F) -> Option<R>
     where
         F: FnOnce(&DataEntry) -> R,
@@ -246,8 +239,7 @@ impl Shard {
         self.get(key).map(f)
     }
 
-    /// Modifica in-place il valore di una chiave se esiste già; se non esiste,
-    /// non fa nulla e ritorna None. Un solo lock, nessun clone della collezione.
+    /// Mutates an existing value under one shard lock and returns `None` when absent.
     fn update_if_exists<F, R>(&mut self, key: &Bytes, f: F) -> Option<R>
     where
         F: FnOnce(&mut OnyxValue) -> R,
@@ -291,9 +283,7 @@ impl Shard {
         }
     }
 
-    /// Modifica in-place il valore di una chiave, creandola con `default()` se
-    /// non esiste ancora. Un solo lock, nessun clone della collezione: usa
-    /// l'API `entry()` di HashMap per get-or-insert in un colpo solo.
+    /// Mutates a value in place, inserting `default()` when the key is absent.
     fn update_or_insert<F, R>(&mut self, key: Bytes, default: impl FnOnce() -> OnyxValue, f: F) -> R
     where
         F: FnOnce(&mut OnyxValue) -> R,
@@ -350,8 +340,7 @@ impl Shard {
         result
     }
 
-    /// Imposta solo la scadenza di una chiave esistente, senza toccare (né
-    /// clonare) il valore. Ritorna false se la chiave non esiste.
+    /// Updates only the expiration of an existing key without cloning its value.
     fn set_expiry(&mut self, key: &Bytes, timestamp: u64) -> bool {
         self.set_expiry_conditional(key, timestamp, None)
     }
@@ -386,9 +375,7 @@ impl Shard {
         }
     }
 
-    /// Inserisce solo se la chiave non esiste già — atomico rispetto ad altri
-    /// insert_if_absent/insert/remove sullo stesso shard, perché tutto avviene
-    /// sotto lo stesso lock (a differenza di un get()+set() separati).
+    /// Inserts only when the key is absent, atomically under the shard lock.
     fn insert_if_absent(&mut self, key: Bytes, entry: DataEntry) -> bool {
         self.purge_if_expired(&key, now());
         if self.data.contains_key(&key) {
@@ -449,7 +436,7 @@ impl Shard {
 }
 
 // ============================================================
-// ENGINE — Coordina gli shard, dispatch cross-shard
+// ENGINE — shard coordination and cross-shard operations
 // ============================================================
 
 pub struct OnyxEngine {
@@ -465,7 +452,7 @@ impl OnyxEngine {
         Self { shards }
     }
 
-    /// GET — single shard, no cross-shard needed
+    /// Reads one entry from a single shard.
     #[inline]
     pub fn get(&self, key: &Bytes) -> Option<DataEntry> {
         let shard_idx = shard_for_key(key);
@@ -515,7 +502,7 @@ impl OnyxEngine {
         }
     }
 
-    /// SET — single shard
+    /// Sets one entry in a single shard.
     #[inline]
     pub fn set(&self, key: Bytes, value: OnyxValue, expires: Option<u64>) -> Option<DataEntry> {
         let shard_idx = shard_for_key(&key);
@@ -533,7 +520,7 @@ impl OnyxEngine {
         shard.insert(key, entry)
     }
 
-    /// DEL — single shard
+    /// Deletes one entry from a single shard.
     #[inline]
     pub fn delete(&self, key: &Bytes) -> bool {
         let shard_idx = shard_for_key(key);
@@ -541,10 +528,7 @@ impl OnyxEngine {
         shard.remove(key).is_some()
     }
 
-    /// Legge l'entry senza clonarla: il lock resta preso solo per la durata
-    /// della chiusura `f`. Da preferire a `get()` ogni volta che serve solo
-    /// leggere un pezzo dell'entry (un campo di un hash, la lunghezza di una
-    /// lista, ecc.) invece di tutta la collezione.
+    /// Reads an entry without cloning it while the closure holds the shard lock.
     pub fn read<F, R>(&self, key: &Bytes, f: F) -> Option<R>
     where
         F: FnOnce(&DataEntry) -> R,
@@ -554,10 +538,7 @@ impl OnyxEngine {
         shard.read(key, f)
     }
 
-    /// Modifica in-place una chiave esistente (no-op se non esiste). Un solo
-    /// lock, nessun clone: sostituisce il pattern "get() + modifica + set()"
-    /// che non era atomico (due scritture concorrenti potevano pestarsi i
-    /// piedi, perdendo un aggiornamento).
+    /// Mutates an existing value under one shard lock.
     pub fn update_if_exists<F, R>(&self, key: &Bytes, f: F) -> Option<R>
     where
         F: FnOnce(&mut OnyxValue) -> R,
@@ -576,8 +557,7 @@ impl OnyxEngine {
         shard.update_if_exists_with_action(key, f)
     }
 
-    /// Modifica in-place una chiave, creandola se non esiste. Stesso discorso
-    /// di `update_if_exists`, ma con upsert (usato da HSET, SADD, LPUSH, INCR...).
+    /// Mutates a value in place, inserting a default value when absent.
     pub fn update_or_insert<F, R>(&self, key: Bytes, default: impl FnOnce() -> OnyxValue, f: F) -> R
     where
         F: FnOnce(&mut OnyxValue) -> R,
@@ -615,7 +595,7 @@ impl OnyxEngine {
         shard.update_entry_or_insert_with_presence(key, default, f)
     }
 
-    /// Imposta solo la scadenza, senza clonare il valore.
+    /// Updates only the expiration without cloning the value.
     pub fn set_expiry(&self, key: &Bytes, timestamp: u64) -> bool {
         let shard_idx = shard_for_key(key);
         let mut shard = self.shards[shard_idx].lock().unwrap();
@@ -633,11 +613,8 @@ impl OnyxEngine {
         shard.set_expiry_conditional(key, timestamp, require_expiry)
     }
 
-    /// SET condizionale, tutto sotto lo stesso lock (niente finestra
-    /// exists()+set() come nell'implementazione precedente di NX/XX).
-    /// `condition`: Some(true) = NX (solo se assente), Some(false) = XX
-    /// (solo se già presente), None = incondizionato. Ritorna true se ha
-    /// scritto.
+    /// Applies a conditional set atomically under one shard lock.
+    /// `Some(true)` means NX, `Some(false)` means XX, and `None` is unconditional.
     pub fn set_conditional(
         &self,
         key: Bytes,
@@ -669,10 +646,7 @@ impl OnyxEngine {
         allowed
     }
 
-    /// Inserisce solo se assente, in modo atomico (per SETNX usato come lock
-    /// distribuito: prima non lo era davvero, perché get()+set() lasciava una
-    /// finestra in cui due SETNX concorrenti potevano credere entrambi di
-    /// aver vinto la corsa).
+    /// Inserts only when absent, atomically under one shard lock.
     pub fn set_if_absent(&self, key: Bytes, value: OnyxValue) -> bool {
         let shard_idx = shard_for_key(&key);
         let mut shard = self.shards[shard_idx].lock().unwrap();
@@ -688,10 +662,7 @@ impl OnyxEngine {
         )
     }
 
-    /// RENAME — puo' toccare due shard diversi. Per evitare deadlock quando
-    /// due RENAME concorrenti si "incrociano" tra gli stessi due shard,
-    /// blocchiamo SEMPRE nello stesso ordine (indice di shard crescente),
-    /// indipendentemente da chi e' 'from' e chi e' 'to'.
+    /// Renames across shards while locking shard indices in ascending order.
     pub fn rename(&self, from: &Bytes, to: Bytes) -> bool {
         let from_shard = shard_for_key(from);
         let to_shard = shard_for_key(&to);
@@ -791,8 +762,7 @@ impl OnyxEngine {
         true
     }
 
-    /// MGET — può toccare multipli shard. Blocca uno shard alla volta
-    /// (mai due contemporaneamente), quindi non c'è rischio di deadlock.
+    /// Reads multiple keys while locking at most one shard at a time.
     pub fn mget(&self, keys: &[Bytes]) -> Vec<Option<DataEntry>> {
         let mut by_shard: Vec<Vec<(usize, Bytes)>> = vec![Vec::new(); NUM_SHARDS];
         for (idx, key) in keys.iter().enumerate() {
@@ -815,8 +785,7 @@ impl OnyxEngine {
         results
     }
 
-    /// Ritorna solo le chiavi non scadute, su tutti gli shard. Più leggero
-    /// di `snapshot_all` (non clona i valori), usato dal comando KEYS.
+    /// Returns all non-expired keys without cloning their values.
     pub fn all_keys(&self) -> Vec<Bytes> {
         let mut out = Vec::new();
         for shard in &self.shards {
@@ -829,10 +798,7 @@ impl OnyxEngine {
         out
     }
 
-    /// Ritorna una copia di tutte le entry non scadute, su tutti gli shard.
-    /// Costoso (clona tutto): va usato solo per operazioni "rare" come
-    /// snapshot su disco e dump iniziale verso una Replica in SYNC, mai
-    /// sul percorso caldo di un singolo comando.
+    /// Clones every non-expired entry for snapshots and full synchronization.
     pub fn snapshot_all(&self) -> Vec<(Bytes, DataEntry)> {
         let mut out = Vec::new();
         for shard in &self.shards {
@@ -845,7 +811,7 @@ impl OnyxEngine {
         out
     }
 
-    /// Stats aggregate
+    /// Returns aggregate engine statistics.
     pub fn stats(&self) -> EngineStats {
         let mut total_keys = 0;
         let mut total_ops = 0;
@@ -916,7 +882,7 @@ impl OnyxEngine {
         evicted
     }
 
-    /// GC: pulisce chiavi scadute su tutti gli shard
+    /// Removes expired keys from every shard.
     pub fn gc_expired(&self) -> usize {
         let mut total = 0;
         for shard in &self.shards {

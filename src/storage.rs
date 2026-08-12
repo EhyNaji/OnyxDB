@@ -1,2 +1,1 @@
-// Modulo storage: in attesa di refactoring.
-// La persistenza attuale vive in main.rs (canale mpsc + BufWriter).
+// Reserved for the persistence module extraction.
