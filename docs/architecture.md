@@ -30,9 +30,6 @@ the authoritative boundary for state changes.
 | `src/onyx-cli.rs` | Minimal interactive RESP client | Not a complete shell parser or `redis-cli` replacement |
 | `src/onyx-bench.rs` | Development throughput smoke test | Not suitable for comparative performance claims |
 
-`src/storage.rs` is currently a reserved placeholder and does not own the
-persistence implementation yet.
-
 ## Authoritative state transition
 
 All client mutation paths, including RESP, OBP, and transactions, must converge
@@ -245,15 +242,14 @@ must follow the actual dependency graph rather than target file size alone.
 
 The preferred dependency order, subject to new evidence, is:
 
-1. Remove dead dependencies and the unused storage placeholder.
-2. Establish a reusable library boundary for engine and protocol code so the
+1. Establish a reusable library boundary for engine and protocol code so the
    CLI, benchmark, and integration tests do not duplicate framing behavior.
-3. Extract the store/value semantics and JSON path implementation.
-4. Extract committed effects plus persistence codecs/recovery as one cohesive
+2. Extract the store/value semantics and JSON path implementation.
+3. Extract committed effects plus persistence codecs/recovery as one cohesive
    subsystem.
-5. Extract replication only after its ownership of durable identity, task
+4. Extract replication only after its ownership of durable identity, task
    cancellation, and sequence publication is explicit.
-6. Reduce `main.rs` to bootstrap, listener supervision, and process shutdown.
+5. Reduce `main.rs` to bootstrap, listener supervision, and process shutdown.
 
 Benchmark modernization should precede performance optimization. Public
 performance claims require reproducible workloads, latency percentiles,

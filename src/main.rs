@@ -2,7 +2,6 @@ mod config;
 mod engine;
 mod protocol;
 mod resp;
-mod storage;
 use bytes::Bytes;
 use config::{FsyncPolicy, ServerConfig, UpstreamCredentials};
 use engine::{DataEntry, EntryMutation, EvictionPolicy, OnyxEngine, OnyxValue};

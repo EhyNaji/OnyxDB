@@ -37,6 +37,8 @@ All notable changes to OnyxDB are documented in this file.
   secret debug output.
 - Rejected server ports that cannot safely reserve the derived OBP and metrics
   listeners.
+- Removed unused concurrency/CPU dependencies and the empty storage module
+  placeholder.
 - Normalized repository source comments, diagnostics, test names, and benchmark
   fixtures to professional English.
 - Added current architecture and reliability invariant documentation.
