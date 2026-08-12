@@ -43,6 +43,12 @@ All notable changes to OnyxDB are documented in this file.
   SET, mixed and JSON workloads, concurrency, pipelining, repeated runs, error
   accounting, p50/p95/p99/p99.9 latency, environment metadata, cleanup, and
   machine-readable output.
+- Added explicit shared listener binding and isolated runtime data directories,
+  with canonical-path process ownership acquired before persistence recovery.
+- Made startup reserve RESP, OBP, and metrics listeners as one all-or-fail
+  precondition instead of silently continuing without metrics.
+- Made startup option parsing reject unknown options and missing values instead
+  of silently accepting an ambiguous runtime configuration.
 - Rejected server ports that cannot safely reserve the derived OBP and metrics
   listeners.
 - Removed unused concurrency/CPU dependencies and the empty storage module

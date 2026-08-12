@@ -6,7 +6,7 @@ This document describes the current implementation, not a target architecture.
 It records the boundaries that reliability work must preserve while the server
 is decomposed incrementally.
 
-OnyxDB is one process with three loopback listeners:
+OnyxDB is one process with three listeners on one validated bind address:
 
 ```text
 RESP clients ─┐
@@ -31,6 +31,20 @@ the authoritative boundary for state changes.
 | `src/main.rs` | Store facade, command dispatch, authoritative mutation ordering, persistence, replication, networking, metrics, lifecycle | Still too broad; extraction remains incremental |
 | `src/onyx-cli.rs` | Minimal interactive RESP client | Not a complete shell parser or `redis-cli` replacement |
 | `src/onyx-bench.rs` | Bounded RESP benchmark runner with repeatable workloads, percentiles, and error accounting | No OBP workload or coordinated-omission correction yet |
+
+## Runtime ownership and network exposure
+
+The configured data directory is created and canonicalized before recovery.
+The process then acquires an exclusive operating-system lock on the persistent
+`onyx.lock` file and holds it for the complete runtime lifetime. Every durable
+path is derived from that locked canonical directory. Two processes must never
+recover or mutate the same persistence files concurrently.
+
+RESP, OBP, and metrics use the same numeric IPv4 or IPv6 bind address. The
+default is IPv4 loopback. A non-loopback bind is an explicit trust-boundary
+decision: OnyxDB has no TLS, and its metrics endpoint has no authentication.
+All three listeners are bound before recovery and background task startup; a
+partial listener set is not an accepted runtime state.
 
 ## Authoritative state transition
 
@@ -105,6 +119,8 @@ because local eviction would cause divergence.
 - Structurally valid legacy `ONX3` checksumless records remain readable with a
   warning. Ambiguous or unsafe legacy histories are rejected.
 - Replica lifecycle state is stored separately in a versioned `ONYXREPL` file.
+- Runtime ownership uses a persistent `onyx.lock` file; it is not durable data
+  and contains no credentials or state.
 
 All length and collection fields are bounded before allocation. Decoders reject
 unknown types, trailing bytes, impossible counts, invalid checksums, and

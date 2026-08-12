@@ -34,8 +34,8 @@ cargo build --release --locked
 cargo run --release --locked -- --port 6380
 ```
 
-The server binds only to loopback and opens three listeners derived from the
-configured port:
+By default the server binds to IPv4 loopback and opens three listeners derived
+from the configured port. `--bind` changes all three listeners together:
 
 | Listener | Default address | Purpose |
 | --- | --- | --- |
@@ -90,6 +90,8 @@ compatibility.
 | Option | Meaning |
 | --- | --- |
 | `--port <n>` | RESP port; must leave room for OBP at `port+1` and metrics at `port+1000` (default `6380`) |
+| `--bind <ip>` | Numeric IPv4 or IPv6 address used by RESP, OBP, and metrics (default `127.0.0.1`) |
+| `--data-dir <path>` | Directory containing all persistent runtime state (default current directory) |
 | `--replica-of <host:port>` | Start as a replica of the specified master |
 | `--masterauth <password>` | Password used to authenticate to the master |
 | `--masteruser <name>` | Master authentication user; defaults to `default` and requires a password |
@@ -101,20 +103,40 @@ compatibility.
 | `--auto-failover` | Self-promote after the upstream remains unavailable beyond the timeout |
 | `--failover-timeout <seconds>` | Auto-failover threshold (default `30`) |
 
-`ONYXDB_PASSWORD`, `ONYXDB_MASTER_USER`, and `ONYXDB_MASTER_PASSWORD` are
-supported. Command-line values take precedence. Environment variables reduce
-credential exposure through process listings, but OnyxDB does not currently
-provide TLS.
+`ONYXDB_BIND`, `ONYXDB_DATA_DIR`, `ONYXDB_PASSWORD`, `ONYXDB_MASTER_USER`, and
+`ONYXDB_MASTER_PASSWORD` are supported. Command-line values take precedence.
+Environment variables reduce credential exposure through process listings, but
+OnyxDB does not currently provide TLS. Unknown options and missing option values
+fail startup instead of being ignored.
+
+Binding to a non-loopback address exposes RESP, OBP, and the unauthenticated
+metrics endpoint on that interface. Use only trusted network controls; client
+and replication credentials are not protected in transit.
 
 ## Persistence
 
-Runtime data is written in the process working directory:
+Runtime data is written under `--data-dir`, which defaults to the process
+working directory:
 
+- `onyx.lock`: persistent lock-file name used to establish exclusive process
+  ownership of the canonical data directory.
 - `onyx.binlog`: ordered committed-effect records with sequence numbers and
   CRC32 checksums.
 - `onyx.snapshot`: the current versioned, gzip-compressed snapshot.
 - `onyx.snapshot.previous`: the previous snapshot retained across replacement.
 - `onyx.replica`: durable replica lifecycle and synchronization identity.
+
+Startup creates and canonicalizes the data directory, then acquires its
+exclusive operating-system file lock before recovery. A second OnyxDB process
+using the same canonical directory fails startup. The lock is released by the
+operating system on clean exit or process termination; the empty lock file is
+intentionally retained to avoid lock-identity races. Advisory locking semantics
+on network filesystems vary, so use a local filesystem or provide equivalent
+single-writer fencing externally.
+
+OnyxDB also reserves the RESP, OBP, and metrics listeners as one startup
+precondition. If any required address is unavailable, startup fails before
+recovery or background replication begins.
 
 A mutation is published to replicas only after its binlog append succeeds. The
 acknowledgement durability depends on `--appendfsync`: `always` synchronizes each
@@ -129,16 +151,17 @@ snapshot before truncating the binlog.
 
 ## Replication
 
-Start a master and a replica in separate working directories so their runtime
-files do not overlap:
+Start a master and a replica with separate data directories so their runtime
+files cannot overlap:
 
 ```bash
-# Master directory
-cargo run --release --locked -- --port 6380
+# Master
+cargo run --release --locked -- --port 6380 --data-dir ./data/master
 
-# Replica directory
+# Replica
 cargo run --release --locked -- \
   --port 6385 \
+  --data-dir ./data/replica \
   --replica-of 127.0.0.1:6380
 ```
 
@@ -199,9 +222,9 @@ incremental decomposition plan.
 
 ## Known limitations
 
-- Loopback-only listeners; no configurable external bind address.
-- No TLS and no command-level authorization. Authenticated users have the same
-  command permissions.
+- No TLS and no command-level authorization. Non-loopback binding therefore
+  requires trusted external network controls, and authenticated users have the
+  same command permissions. The metrics endpoint is unauthenticated.
 - No cluster mode, consensus, quorum, or automatic multi-replica fencing.
 - Replication is asynchronous; acknowledged master writes can be ahead of a
   replica.

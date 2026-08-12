@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
+use std::net::IpAddr;
+use std::path::PathBuf;
 
 const DEFAULT_PORT: u16 = 6380;
 const DEFAULT_FAILOVER_TIMEOUT_SECS: u64 = 30;
@@ -42,14 +44,20 @@ pub(crate) struct ServerConfig {
     pub(crate) maxmemory_policy: EvictionPolicy,
     pub(crate) auto_failover: bool,
     pub(crate) failover_timeout_secs: u64,
+    pub(crate) bind_address: IpAddr,
+    pub(crate) data_directory: PathBuf,
     pub(crate) port: u16,
     pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigError {
+    MissingOptionValue(&'static str),
+    UnknownOption(String),
     UpstreamUsernameWithoutPassword,
     UpstreamCredentialsWithoutReplica,
+    InvalidBindAddress(String),
+    EmptyDataDirectory,
     InvalidPort(String),
 }
 
@@ -75,6 +83,8 @@ impl fmt::Debug for ServerConfig {
             .field("maxmemory_policy", &self.maxmemory_policy)
             .field("auto_failover", &self.auto_failover)
             .field("failover_timeout_secs", &self.failover_timeout_secs)
+            .field("bind_address", &self.bind_address)
+            .field("data_directory", &self.data_directory)
             .field("port", &self.port)
             .field("warnings", &self.warnings)
             .finish()
@@ -84,12 +94,22 @@ impl fmt::Debug for ServerConfig {
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingOptionValue(option) => {
+                write!(formatter, "{} requires a value", option)
+            }
+            Self::UnknownOption(option) => write!(formatter, "unknown option: {}", option),
             Self::UpstreamUsernameWithoutPassword => formatter.write_str(
                 "upstream replication username requires --masterauth or ONYXDB_MASTER_PASSWORD",
             ),
             Self::UpstreamCredentialsWithoutReplica => {
                 formatter.write_str("upstream replication credentials require --replica-of")
             }
+            Self::InvalidBindAddress(value) => write!(
+                formatter,
+                "invalid bind address '{}'; expected an IPv4 or IPv6 address",
+                value
+            ),
+            Self::EmptyDataDirectory => formatter.write_str("data directory must not be empty"),
             Self::InvalidPort(value) => write!(
                 formatter,
                 "invalid server port '{}'; expected a value between 1 and {}",
@@ -122,45 +142,61 @@ impl ServerConfig {
         let mut warnings = Vec::new();
         let mut auto_failover = false;
         let mut failover_timeout_secs = DEFAULT_FAILOVER_TIMEOUT_SECS;
+        let mut bind_address = None;
+        let mut data_directory = None;
         let mut port = DEFAULT_PORT.to_string();
 
-        for index in 0..args.len() {
-            let next = || args.get(index + 1).cloned();
+        let mut index = 1;
+        while index < args.len() {
+            let required_value = |option| {
+                args.get(index + 1)
+                    .cloned()
+                    .ok_or(ConfigError::MissingOptionValue(option))
+            };
             match args[index].as_str() {
-                "--replica-of" => master_addr = next().or(master_addr),
-                "--masteruser" => master_user = next().or(master_user),
-                "--masterauth" => master_password = next().or(master_password),
-                "--requirepass" => password = next().or(password),
-                "--appendfsync" => appendfsync = next().or(appendfsync),
-                "--maxmemory" => maxmemory = next().or(maxmemory),
-                "--maxmemory-policy" => maxmemory_policy = next().or(maxmemory_policy),
+                "--replica-of" => master_addr = Some(required_value("--replica-of")?),
+                "--masteruser" => master_user = Some(required_value("--masteruser")?),
+                "--masterauth" => master_password = Some(required_value("--masterauth")?),
+                "--requirepass" => password = Some(required_value("--requirepass")?),
+                "--appendfsync" => appendfsync = Some(required_value("--appendfsync")?),
+                "--maxmemory" => maxmemory = Some(required_value("--maxmemory")?),
+                "--maxmemory-policy" => {
+                    maxmemory_policy = Some(required_value("--maxmemory-policy")?)
+                }
                 "--user" => {
-                    if let Some(value) = next() {
-                        match value.split_once(':') {
-                            Some((name, user_password)) => {
-                                users.insert(name.to_string(), user_password.to_string());
-                            }
-                            None => warnings
-                                .push("Invalid format for --user; expected name:password".into()),
+                    let value = required_value("--user")?;
+                    match value.split_once(':') {
+                        Some((name, user_password)) => {
+                            users.insert(name.to_string(), user_password.to_string());
                         }
+                        None => warnings
+                            .push("Invalid format for --user; expected name:password".into()),
                     }
                 }
-                "--auto-failover" => auto_failover = true,
+                "--auto-failover" => {
+                    auto_failover = true;
+                    index += 1;
+                    continue;
+                }
                 "--failover-timeout" => {
-                    if let Some(value) = next() {
-                        failover_timeout_secs = value
-                            .parse::<u64>()
-                            .unwrap_or(DEFAULT_FAILOVER_TIMEOUT_SECS);
-                    }
+                    let value = required_value("--failover-timeout")?;
+                    failover_timeout_secs = value
+                        .parse::<u64>()
+                        .unwrap_or(DEFAULT_FAILOVER_TIMEOUT_SECS);
                 }
-                "--port" => port = next().unwrap_or(port),
-                _ => {}
+                "--bind" => bind_address = Some(required_value("--bind")?),
+                "--data-dir" => data_directory = Some(required_value("--data-dir")?),
+                "--port" => port = required_value("--port")?,
+                option => return Err(ConfigError::UnknownOption(option.to_string())),
             }
+            index += 2;
         }
 
         password = password.or_else(|| get_env("ONYXDB_PASSWORD"));
         master_user = master_user.or_else(|| get_env("ONYXDB_MASTER_USER"));
         master_password = master_password.or_else(|| get_env("ONYXDB_MASTER_PASSWORD"));
+        bind_address = bind_address.or_else(|| get_env("ONYXDB_BIND"));
+        data_directory = data_directory.or_else(|| get_env("ONYXDB_DATA_DIR"));
 
         if master_user.is_some() && master_password.is_none() {
             return Err(ConfigError::UpstreamUsernameWithoutPassword);
@@ -212,6 +248,20 @@ impl ServerConfig {
             .ok()
             .filter(|port| (1..=MAX_SERVER_PORT).contains(port))
             .ok_or_else(|| ConfigError::InvalidPort(port.clone()))?;
+        let bind_address = bind_address
+            .as_deref()
+            .unwrap_or("127.0.0.1")
+            .parse::<IpAddr>()
+            .map_err(|_| {
+                ConfigError::InvalidBindAddress(
+                    bind_address.unwrap_or_else(|| "127.0.0.1".to_string()),
+                )
+            })?;
+        let data_directory = data_directory.unwrap_or_else(|| ".".to_string());
+        if data_directory.is_empty() {
+            return Err(ConfigError::EmptyDataDirectory);
+        }
+        let data_directory = PathBuf::from(data_directory);
 
         Ok(Self {
             master_addr,
@@ -222,6 +272,8 @@ impl ServerConfig {
             maxmemory_policy,
             auto_failover,
             failover_timeout_secs,
+            bind_address,
+            data_directory,
             port,
             warnings,
         })
@@ -268,6 +320,11 @@ mod tests {
         assert_eq!(config.maxmemory_bytes, 0);
         assert_eq!(config.maxmemory_policy, EvictionPolicy::NoEviction);
         assert_eq!(config.failover_timeout_secs, DEFAULT_FAILOVER_TIMEOUT_SECS);
+        assert_eq!(
+            config.bind_address,
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(config.data_directory, PathBuf::from("."));
         assert!(config.users.is_empty());
         assert!(config.warnings.is_empty());
     }
@@ -301,6 +358,19 @@ mod tests {
                 password: "cli-secret".into(),
             })
         );
+    }
+
+    #[test]
+    fn command_line_runtime_layout_overrides_environment() {
+        let args = arguments(&["onyxdb", "--bind", "::1", "--data-dir", "cli-data"]);
+        let config = ServerConfig::parse(&args, |name| match name {
+            "ONYXDB_BIND" => Some("0.0.0.0".into()),
+            "ONYXDB_DATA_DIR" => Some("environment-data".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.bind_address, "::1".parse::<IpAddr>().unwrap());
+        assert_eq!(config.data_directory, PathBuf::from("cli-data"));
     }
 
     #[test]
@@ -351,6 +421,26 @@ mod tests {
             ConfigError::InvalidPort("invalid".into())
         );
         assert_eq!(parse(&["onyxdb", "--port", "64535"]).unwrap().port, 64535);
+    }
+
+    #[test]
+    fn runtime_layout_rejects_ambiguous_values() {
+        assert_eq!(
+            parse(&["onyxdb", "--bind", "localhost"]).unwrap_err(),
+            ConfigError::InvalidBindAddress("localhost".into())
+        );
+        assert_eq!(
+            parse(&["onyxdb", "--data-dir", ""]).unwrap_err(),
+            ConfigError::EmptyDataDirectory
+        );
+        assert_eq!(
+            parse(&["onyxdb", "--data-dir"]).unwrap_err(),
+            ConfigError::MissingOptionValue("--data-dir")
+        );
+        assert_eq!(
+            parse(&["onyxdb", "--unknown"]).unwrap_err(),
+            ConfigError::UnknownOption("--unknown".into())
+        );
     }
 
     #[test]

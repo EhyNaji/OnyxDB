@@ -15,6 +15,7 @@ use onyxdb::{protocol, resp};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader as StdBufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -33,6 +34,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const SNAPSHOT_PATH: &str = "onyx.snapshot";
 const BINLOG_PATH: &str = "onyx.binlog";
 const REPLICA_STATE_PATH: &str = "onyx.replica";
+const RUNTIME_LOCK_PATH: &str = "onyx.lock";
 const SNAPSHOT_MAGIC: &str = "ONYXSNAP";
 const SNAPSHOT_VERSION: u8 = 2;
 const REPLICA_STATE_MAGIC: &str = "ONYXREPL";
@@ -108,15 +110,15 @@ struct PersistencePaths {
     replica_state_temp: PathBuf,
 }
 
-impl Default for PersistencePaths {
-    fn default() -> Self {
+impl PersistencePaths {
+    fn in_directory(directory: &Path) -> Self {
         Self {
-            snapshot: PathBuf::from(SNAPSHOT_PATH),
-            snapshot_temp: PathBuf::from(format!("{}.tmp", SNAPSHOT_PATH)),
-            snapshot_backup: PathBuf::from(format!("{}.previous", SNAPSHOT_PATH)),
-            binlog: PathBuf::from(BINLOG_PATH),
-            replica_state: PathBuf::from(REPLICA_STATE_PATH),
-            replica_state_temp: PathBuf::from(format!("{}.tmp", REPLICA_STATE_PATH)),
+            snapshot: directory.join(SNAPSHOT_PATH),
+            snapshot_temp: directory.join(format!("{}.tmp", SNAPSHOT_PATH)),
+            snapshot_backup: directory.join(format!("{}.previous", SNAPSHOT_PATH)),
+            binlog: directory.join(BINLOG_PATH),
+            replica_state: directory.join(REPLICA_STATE_PATH),
+            replica_state_temp: directory.join(format!("{}.tmp", REPLICA_STATE_PATH)),
         }
     }
 }
@@ -158,6 +160,62 @@ impl std::error::Error for PersistenceError {}
 impl From<std::io::Error> for PersistenceError {
     fn from(error: std::io::Error) -> Self {
         Self::new(error.to_string())
+    }
+}
+
+struct RuntimeDirectoryLock {
+    file: File,
+    directory: PathBuf,
+}
+
+impl RuntimeDirectoryLock {
+    fn acquire(directory: &Path) -> Result<Self, PersistenceError> {
+        fs::create_dir_all(directory).map_err(|error| {
+            PersistenceError::new(format!(
+                "Unable to create data directory {}: {}",
+                directory.display(),
+                error
+            ))
+        })?;
+        let directory = fs::canonicalize(directory).map_err(|error| {
+            PersistenceError::new(format!(
+                "Unable to resolve data directory {}: {}",
+                directory.display(),
+                error
+            ))
+        })?;
+        let lock_path = directory.join(RUNTIME_LOCK_PATH);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                PersistenceError::new(format!(
+                    "Unable to open runtime lock {}: {}",
+                    lock_path.display(),
+                    error
+                ))
+            })?;
+        file.try_lock().map_err(|error| {
+            PersistenceError::new(format!(
+                "Data directory {} is already owned by another OnyxDB process: {}",
+                directory.display(),
+                error
+            ))
+        })?;
+        Ok(Self { file, directory })
+    }
+
+    fn directory(&self) -> &Path {
+        &self.directory
+    }
+}
+
+impl Drop for RuntimeDirectoryLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 /// Configured users keyed by username. Authentication grants full command
@@ -5273,18 +5331,15 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
     )
 }
 
-async fn run_metrics_server(store: Arc<ShardedStore>, persistence: Arc<Persistence>, port: u16) {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!("Unable to start metrics server on {}: {}", addr, e);
-            return;
-        }
-    };
+async fn run_metrics_server(
+    listener: TcpListener,
+    address: SocketAddr,
+    store: Arc<ShardedStore>,
+    persistence: Arc<Persistence>,
+) {
     info!(
         "Prometheus metrics server listening on http://{}/metrics",
-        addr
+        address
     );
 
     loop {
@@ -6171,6 +6226,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         maxmemory_policy: mm_policy,
         auto_failover,
         failover_timeout_secs,
+        bind_address,
+        data_directory,
         port,
         warnings,
     } = ServerConfig::from_process()?;
@@ -6190,6 +6247,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             maxmemory_val, mm_policy
         );
     }
+    if !bind_address.is_loopback() {
+        warn!(
+            "Non-loopback bind {} exposes RESP, OBP, and unauthenticated metrics without TLS; use trusted network controls",
+            bind_address
+        );
+    }
+    let runtime_directory = RuntimeDirectoryLock::acquire(&data_directory)?;
+    info!(
+        "Runtime data directory locked: {}",
+        runtime_directory.directory().display()
+    );
+    let bind_addr = SocketAddr::new(bind_address, port);
+    let listener = TcpListener::bind(&bind_addr).await?;
+    let obp_addr = SocketAddr::new(bind_address, port + 1);
+    let obp_listener = TcpListener::bind(&obp_addr).await?;
+    let metrics_addr = SocketAddr::new(bind_address, port + 1000);
+    let metrics_listener = TcpListener::bind(&metrics_addr).await?;
+    info!("Server listening on {}", bind_addr);
+    info!("OBP (binary) server listening on {}", obp_addr);
 
     tokio::spawn(async {
         time_updater_task().await;
@@ -6197,7 +6273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let store = Arc::new(ShardedStore::with_maxmemory(maxmemory_val, mm_policy));
-    let paths = PersistencePaths::default();
+    let paths = PersistencePaths::in_directory(runtime_directory.directory());
     let recovery = load_data_from_paths(&store, &paths)?;
     let recovered_replica_identity =
         prepare_replication_startup(&paths, recovery.snapshot_watermark, master_addr.is_some())?;
@@ -6300,14 +6376,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let bind_addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&bind_addr).await?;
-    info!("Server listening on {}", bind_addr);
-    let obp_port = port + 1;
-    let obp_addr = format!("127.0.0.1:{}", obp_port);
-    let obp_listener = TcpListener::bind(&obp_addr).await?;
-    info!("OBP (binary) server listening on {}", obp_addr);
-
     let store_obp = Arc::clone(&store);
     let persistence_obp = Arc::clone(&persistence);
     tokio::spawn(async move {
@@ -6323,11 +6391,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     });
-    let metrics_port = port + 1000;
     let store_metrics = Arc::clone(&store);
     let persistence_metrics = Arc::clone(&persistence);
     tokio::spawn(async move {
-        run_metrics_server(store_metrics, persistence_metrics, metrics_port).await;
+        run_metrics_server(
+            metrics_listener,
+            metrics_addr,
+            store_metrics,
+            persistence_metrics,
+        )
+        .await;
     });
 
     let store_shutdown = Arc::clone(&store);

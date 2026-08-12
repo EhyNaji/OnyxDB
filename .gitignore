@@ -7,6 +7,7 @@ onyx.snapshot.previous
 onyx.binlog
 onyx.replica
 onyx.log
+onyx.lock
 *.tmp
 
 # The application dependency lockfile is versioned for reproducible builds.
