@@ -47,6 +47,10 @@ impl Workload {
     fn is_redis_comparable(self) -> bool {
         matches!(self, Self::Get | Self::Set | Self::Mixed)
     }
+
+    fn requires_changing_string_value(self) -> bool {
+        matches!(self, Self::Set | Self::Mixed)
+    }
 }
 
 impl fmt::Display for Workload {
@@ -165,6 +169,9 @@ impl BenchmarkConfig {
         validate_range("pipeline", self.pipeline, 1, MAX_PIPELINE_COMMANDS)?;
         validate_range("keyspace", self.keyspace, 1, MAX_KEYSPACE)?;
         validate_range("payload-size", self.payload_size, 0, MAX_PAYLOAD_SIZE)?;
+        if self.payload_size == 0 && self.workload.requires_changing_string_value() {
+            return Err("payload-size must be at least 1 for set and mixed workloads".into());
+        }
         validate_range("repeats", self.repeats, 1, MAX_REPEATS)?;
         if self.server_label.trim().is_empty() {
             return Err("label must not be empty".into());
@@ -282,13 +289,34 @@ impl WorkloadData {
         )
     }
 
+    fn string_value(&self, operation: usize) -> String {
+        if self.config.payload_size == 0 {
+            return String::new();
+        }
+        let generation = operation / self.config.keyspace;
+        let marker = format!("{generation:016x}");
+        let marker_length = marker.len().min(self.config.payload_size);
+        let marker_start = marker.len() - marker_length;
+        let mut value = (*self.value).clone();
+        value.replace_range(..marker_length, &marker[marker_start..]);
+        value
+    }
+
+    fn json_value(&self, operation: usize) -> String {
+        json!({
+            "payload": self.value.as_str(),
+            "counter": operation,
+        })
+        .to_string()
+    }
+
     fn command(&self, operation: usize) -> Vec<String> {
         let key = self.key(operation);
         match self.config.workload {
             Workload::Get => vec!["GET".into(), key],
-            Workload::Set => vec!["SET".into(), key, (*self.value).clone()],
+            Workload::Set => vec!["SET".into(), key, self.string_value(operation)],
             Workload::Mixed if operation.is_multiple_of(2) => {
-                vec!["SET".into(), key, (*self.value).clone()]
+                vec!["SET".into(), key, self.string_value(operation)]
             }
             Workload::Mixed => vec!["GET".into(), key],
             Workload::JsonGet => vec!["JSON.GET".into(), key, "$.payload".into()],
@@ -296,7 +324,7 @@ impl WorkloadData {
                 "JSON.SET".into(),
                 key,
                 "$".into(),
-                (*self.json_value).clone(),
+                self.json_value(operation),
             ],
         }
     }
@@ -790,9 +818,10 @@ mod tests {
             ..BenchmarkConfig::default()
         });
         let data = WorkloadData::new(config);
-        assert_eq!(data.command(0), ["SET", "bench:0", "xxx"]);
+        assert_eq!(data.command(0), ["SET", "bench:0", "000"]);
         assert_eq!(data.command(1), ["GET", "bench:1"]);
-        assert_eq!(data.command(2), ["SET", "bench:0", "xxx"]);
+        assert_eq!(data.command(2), ["SET", "bench:0", "001"]);
+        assert_ne!(data.command(0), data.command(2));
         assert!(data.response_is_valid(0, &RESPResponse::SimpleString(Bytes::from_static(b"OK"))));
         assert!(data.response_is_valid(
             1,
@@ -808,5 +837,21 @@ mod tests {
         assert_eq!(percentile_nanoseconds(&samples, 95.0), 10);
         assert_eq!(percentile_nanoseconds(&samples, 99.9), 10);
         assert_eq!(percentile_nanoseconds(&[], 99.0), 0);
+    }
+
+    #[test]
+    fn string_write_workloads_reject_zero_sized_payloads() {
+        let error = BenchmarkConfig::parse(&arguments(&[
+            "onyx-bench",
+            "--workload",
+            "set",
+            "--payload-size",
+            "0",
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "payload-size must be at least 1 for set and mixed workloads"
+        );
     }
 }
