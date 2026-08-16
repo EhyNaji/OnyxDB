@@ -85,6 +85,125 @@ fn parse_decimal(bytes: &[u8], field: &'static str) -> io::Result<usize> {
     })
 }
 
+/// Decodes one complete command using only bytes already held by a connection
+/// buffer. Incomplete input is never consumed and never triggers an additional
+/// socket read, which allows pipelined work to be admitted without delaying an
+/// earlier complete command behind a slow or partial peer frame.
+pub fn decode_buffered_command(
+    input: &[u8],
+    limits: RESPReadLimits,
+) -> io::Result<Option<(Vec<String>, usize)>> {
+    let Some(first_byte) = input.first().copied() else {
+        return Ok(None);
+    };
+    let maximum_first_line_size = if first_byte == b'*' {
+        MAX_RESP_HEADER_LINE_SIZE.min(limits.max_frame_len)
+    } else {
+        limits.max_inline_len.min(limits.max_frame_len)
+    };
+    let Some(first_newline) = input.iter().position(|byte| *byte == b'\n') else {
+        if input.len() > maximum_first_line_size {
+            return Err(invalid_data("RESP line exceeds the protocol limit"));
+        }
+        return Ok(None);
+    };
+    let first_line_end = first_newline + 1;
+    if first_line_end > maximum_first_line_size {
+        return Err(invalid_data("RESP line exceeds the protocol limit"));
+    }
+    let first_line = line_content(&input[..first_line_end])?;
+
+    if first_byte != b'*' {
+        let inline = std::str::from_utf8(first_line)
+            .map_err(|_| invalid_data("RESP inline command is not valid UTF-8"))?;
+        let parts = inline
+            .split_ascii_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            return Err(invalid_data("RESP inline command is empty"));
+        }
+        if parts.len() > limits.max_array_len {
+            return Err(invalid_data("RESP command has too many arguments"));
+        }
+        return Ok(Some((parts, first_line_end)));
+    }
+
+    let argument_count = parse_decimal(
+        first_line
+            .strip_prefix(b"*")
+            .ok_or_else(|| invalid_data("RESP array header is malformed"))?,
+        "RESP array length is invalid",
+    )?;
+    if argument_count == 0 {
+        return Err(invalid_data("RESP command array must not be empty"));
+    }
+    if argument_count > limits.max_array_len {
+        return Err(invalid_data("RESP command has too many arguments"));
+    }
+
+    let mut cursor = first_line_end;
+    let mut ranges = Vec::with_capacity(argument_count);
+    for _ in 0..argument_count {
+        let remaining = &input[cursor..];
+        let Some(relative_newline) = remaining.iter().position(|byte| *byte == b'\n') else {
+            if remaining.len() > MAX_RESP_HEADER_LINE_SIZE {
+                return Err(invalid_data("RESP line exceeds the protocol limit"));
+            }
+            return Ok(None);
+        };
+        let header_length = relative_newline + 1;
+        if header_length > MAX_RESP_HEADER_LINE_SIZE {
+            return Err(invalid_data("RESP line exceeds the protocol limit"));
+        }
+        let bulk_header = line_content(&remaining[..header_length])?;
+        let bulk_length = parse_decimal(
+            bulk_header
+                .strip_prefix(b"$")
+                .ok_or_else(|| invalid_data("RESP command arguments must be bulk strings"))?,
+            "RESP bulk string length is invalid",
+        )?;
+        if bulk_length > limits.max_bulk_len {
+            return Err(invalid_data("RESP bulk string exceeds the protocol limit"));
+        }
+        let payload_start = cursor
+            .checked_add(header_length)
+            .ok_or_else(|| invalid_data("RESP frame length overflow"))?;
+        let payload_end = payload_start
+            .checked_add(bulk_length)
+            .ok_or_else(|| invalid_data("RESP bulk string length overflow"))?;
+        let frame_end = payload_end
+            .checked_add(2)
+            .ok_or_else(|| invalid_data("RESP bulk string length overflow"))?;
+        if frame_end > limits.max_frame_len {
+            return Err(invalid_data(
+                "RESP frame exceeds the aggregate protocol limit",
+            ));
+        }
+        if frame_end > input.len() {
+            return Ok(None);
+        }
+        if input[payload_end..frame_end] != *b"\r\n" {
+            return Err(invalid_data(
+                "RESP bulk string is missing its CRLF terminator",
+            ));
+        }
+        std::str::from_utf8(&input[payload_start..payload_end])
+            .map_err(|_| invalid_data("RESP command argument is not valid UTF-8"))?;
+        ranges.push((payload_start, payload_end));
+        cursor = frame_end;
+    }
+
+    let command = ranges
+        .into_iter()
+        .map(|(start, end)| {
+            String::from_utf8(input[start..end].to_vec())
+                .expect("buffered RESP arguments were validated as UTF-8")
+        })
+        .collect();
+    Ok(Some((command, cursor)))
+}
+
 /// Encodes one command as a RESP array without modifying `output` on failure.
 pub fn encode_command<T>(
     arguments: &[T],
@@ -422,6 +541,74 @@ mod tests {
 
         assert_eq!(first, ["PING"]);
         assert_eq!(second, ["GET", "key"]);
+    }
+
+    #[test]
+    fn buffered_decoder_preserves_pipeline_boundaries_without_socket_reads() {
+        let input = b"*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n";
+        let (first, consumed) = decode_buffered_command(input, CLIENT_RESP_LIMITS)
+            .unwrap()
+            .unwrap();
+        let (second, second_consumed) =
+            decode_buffered_command(&input[consumed..], CLIENT_RESP_LIMITS)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(first, ["PING"]);
+        assert_eq!(second, ["GET", "key"]);
+        assert_eq!(consumed + second_consumed, input.len());
+    }
+
+    #[test]
+    fn buffered_decoder_returns_incomplete_without_consuming_partial_input() {
+        for input in [
+            b"*2\r\n$3\r\nSET\r\n$5\r\nval".as_slice(),
+            b"*2\r\n$3\r\nSET\r\n$5\r\nvalue\r".as_slice(),
+            b"PARTIAL".as_slice(),
+        ] {
+            assert!(
+                decode_buffered_command(input, CLIENT_RESP_LIMITS)
+                    .unwrap()
+                    .is_none(),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn buffered_decoder_rejects_malformed_complete_frames_fail_closed() {
+        for input in [
+            b"*1\r\n$1\r\naXX".as_slice(),
+            b"*1\r\n+PING\r\n".as_slice(),
+            b"*0\r\n".as_slice(),
+            b"PING\n".as_slice(),
+        ] {
+            let error = decode_buffered_command(input, CLIENT_RESP_LIMITS).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{input:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_and_streaming_decoders_agree_on_complete_commands() {
+        for input in [
+            b"PING\r\n".as_slice(),
+            b"SET key value\r\n".as_slice(),
+            b"*1\r\n$4\r\nPING\r\n".as_slice(),
+            b"*3\r\n$3\r\nSET\r\n$5\r\nspace\r\n$0\r\n\r\n".as_slice(),
+        ] {
+            let (buffered, consumed) = decode_buffered_command(input, CLIENT_RESP_LIMITS)
+                .unwrap()
+                .unwrap();
+            let mut reader = BufReader::new(input);
+            let mut scratch = Vec::new();
+            let streamed = read_command_with_limits(&mut reader, &mut scratch, CLIENT_RESP_LIMITS)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(buffered, streamed, "{input:?}");
+            assert_eq!(consumed, input.len(), "{input:?}");
+        }
     }
 
     #[tokio::test]

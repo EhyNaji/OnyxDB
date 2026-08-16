@@ -166,6 +166,48 @@ impl CommitRuntime {
         Ok(self.record_persisted_write(compaction_threshold))
     }
 
+    /// Accepts a contiguous logical sequence group through one storage outcome.
+    /// The durable offset advances only after the complete physical append is
+    /// acknowledged; individual batches remain separate recovery records.
+    pub(crate) async fn accept_next_batches(
+        &self,
+        batches: &[(u64, CommittedBatch)],
+        compaction_threshold: usize,
+    ) -> Result<bool, PersistenceError> {
+        if batches.is_empty() {
+            return Err(PersistenceError::new(
+                "A persistence group must contain at least one committed batch",
+            ));
+        }
+
+        let mut expected = Some(self.next_sequence()?);
+        for (sequence, _) in batches {
+            let Some(expected_sequence) = expected else {
+                return Err(PersistenceError::new("Persistence sequence is exhausted"));
+            };
+            if *sequence != expected_sequence {
+                return Err(PersistenceError::new(format!(
+                    "Persistence sequence mismatch: expected {}, received {}",
+                    expected_sequence, sequence
+                )));
+            }
+            expected = expected_sequence.checked_add(1);
+        }
+
+        self.binlog.append_batches(batches).await?;
+        let last_sequence = batches
+            .last()
+            .expect("a non-empty persistence group has a last sequence")
+            .0;
+        self.repl_offset.store(last_sequence, Ordering::SeqCst);
+
+        let mut should_compact = false;
+        for _ in batches {
+            should_compact |= self.record_persisted_write(compaction_threshold);
+        }
+        Ok(should_compact)
+    }
+
     pub(crate) fn install_baseline(&self, sequence: u64) {
         self.repl_offset.store(sequence, Ordering::SeqCst);
         self.write_count.store(0, Ordering::SeqCst);
@@ -312,8 +354,7 @@ fn error_with_context(error: PersistenceError, context: &str) -> PersistenceErro
 
 pub(crate) enum LogMessage {
     Append {
-        sequence: u64,
-        record: Vec<u8>,
+        records: Vec<(u64, Vec<u8>)>,
         completion: oneshot::Sender<StorageResult>,
     },
     Flush {
@@ -341,8 +382,7 @@ impl BinlogHandle {
         let (completion_tx, completion_rx) = oneshot::channel();
         self.sender
             .send(LogMessage::Append {
-                sequence,
-                record,
+                records: vec![(sequence, record)],
                 completion: completion_tx,
             })
             .await
@@ -359,6 +399,33 @@ impl BinlogHandle {
         batch: &CommittedBatch,
     ) -> Result<(), PersistenceError> {
         self.append(sequence, encode_committed_batch(batch)?).await
+    }
+
+    pub(crate) async fn append_batches(
+        &self,
+        batches: &[(u64, CommittedBatch)],
+    ) -> Result<(), PersistenceError> {
+        if batches.is_empty() {
+            return Err(PersistenceError::new(
+                "A binlog append group must contain at least one committed batch",
+            ));
+        }
+        let records = batches
+            .iter()
+            .map(|(sequence, batch)| Ok((*sequence, encode_committed_batch(batch)?)))
+            .collect::<Result<Vec<_>, PersistenceError>>()?;
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.sender
+            .send(LogMessage::Append {
+                records,
+                completion: completion_tx,
+            })
+            .await
+            .map_err(|_| PersistenceError::new("Binlog worker is unavailable"))?;
+        completion_rx
+            .await
+            .map_err(|_| PersistenceError::indeterminate("Binlog append completion was dropped"))?
+            .map_err(StorageFailure::into_persistence_error)
     }
 
     pub(crate) async fn flush(&self) -> Result<(), PersistenceError> {
@@ -447,16 +514,34 @@ fn rollback_binlog_tail<T: BinlogIo>(
     }
 }
 
-fn append_binlog_record<T: BinlogIo>(
-    binlog: &mut T,
+fn encode_framed_binlog_record(
     sequence: u64,
     record: &[u8],
-    fsync_policy: FsyncPolicy,
-) -> StorageResult {
+    output: &mut Vec<u8>,
+) -> Result<(), StorageFailure> {
     let encoded = encode_versioned_binlog_record(sequence, record)
         .map_err(|error| StorageFailure::rejected(error.to_string()))?;
     let length = u32::try_from(encoded.len())
         .map_err(|_| StorageFailure::rejected("Binlog record exceeds the format limit"))?;
+    let additional = 4usize
+        .checked_add(encoded.len())
+        .and_then(|additional| output.len().checked_add(additional).map(|_| additional))
+        .ok_or_else(|| {
+            StorageFailure::rejected("Binlog append group exceeds addressable memory")
+        })?;
+    output.try_reserve(additional).map_err(|_| {
+        StorageFailure::rejected("Unable to allocate the encoded binlog append group")
+    })?;
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(&encoded);
+    Ok(())
+}
+
+fn append_binlog_tail<T: BinlogIo>(
+    binlog: &mut T,
+    encoded_tail: &[u8],
+    fsync_policy: FsyncPolicy,
+) -> StorageResult {
     let previous_length = binlog
         .seek(SeekFrom::End(0))
         .map_err(|error| StorageFailure::rejected(format!("Binlog seek failed: {}", error)))?;
@@ -487,8 +572,7 @@ fn append_binlog_record<T: BinlogIo>(
 
     let mut modified = false;
     let write_result = (|| -> std::io::Result<()> {
-        write_all_tracking_modification(binlog, &length.to_be_bytes(), &mut modified)?;
-        write_all_tracking_modification(binlog, &encoded, &mut modified)?;
+        write_all_tracking_modification(binlog, encoded_tail, &mut modified)?;
         binlog.flush()?;
         if fsync_policy == FsyncPolicy::Always {
             binlog.sync_data()?;
@@ -506,6 +590,23 @@ fn append_binlog_record<T: BinlogIo>(
     }
 }
 
+fn append_binlog_records<T: BinlogIo>(
+    binlog: &mut T,
+    records: &[(u64, Vec<u8>)],
+    fsync_policy: FsyncPolicy,
+) -> StorageResult {
+    if records.is_empty() {
+        return Err(StorageFailure::rejected(
+            "A binlog append group must contain at least one record",
+        ));
+    }
+    let mut encoded_tail = Vec::new();
+    for (sequence, record) in records {
+        encode_framed_binlog_record(*sequence, record, &mut encoded_tail)?;
+    }
+    append_binlog_tail(binlog, &encoded_tail, fsync_policy)
+}
+
 pub(crate) async fn run_binlog_worker<T: BinlogIo>(
     mut receiver: mpsc::Receiver<LogMessage>,
     binlog: Arc<std::sync::Mutex<T>>,
@@ -514,16 +615,13 @@ pub(crate) async fn run_binlog_worker<T: BinlogIo>(
     while let Some(message) = receiver.recv().await {
         match message {
             LogMessage::Append {
-                sequence,
-                record,
+                records,
                 completion,
             } => {
                 let result = binlog
                     .lock()
                     .map_err(|_| StorageFailure::indeterminate("Binlog file lock is poisoned"))
-                    .and_then(|mut file| {
-                        append_binlog_record(&mut *file, sequence, &record, fsync_policy)
-                    });
+                    .and_then(|mut file| append_binlog_records(&mut *file, &records, fsync_policy));
                 let _ = completion.send(result);
             }
             LogMessage::Flush { completion } => {
@@ -781,15 +879,19 @@ mod tests {
         }
     }
 
-    fn put_batch() -> CommittedBatch {
+    fn put_batch_for(key: &'static [u8], value: &'static [u8]) -> CommittedBatch {
         CommittedBatch::new(vec![CommittedEffect::Put {
-            key: Bytes::from_static(b"key"),
+            key: Bytes::from_static(key),
             entry: PersistentEntry {
-                value: OnyxValue::Blob(Bytes::from_static(b"accepted")),
+                value: OnyxValue::Blob(Bytes::from_static(value)),
                 expires_at: None,
             },
         }])
         .unwrap()
+    }
+
+    fn put_batch() -> CommittedBatch {
+        put_batch_for(b"key", b"accepted")
     }
 
     async fn append_with_fault(plan: FaultPlan) -> (PersistenceError, TestDirectory) {
@@ -1030,6 +1132,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grouped_append_preserves_logical_records_and_syncs_once() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let io = Arc::new(std::sync::Mutex::new(FaultInjectingFile::open(
+            &paths.binlog,
+            FaultPlan::default(),
+        )));
+        let (sender, receiver) = mpsc::channel(1);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::Always,
+        ));
+        let handle = BinlogHandle::new(sender);
+
+        handle
+            .append_batches(&[
+                (1, put_batch_for(b"first", b"one")),
+                (2, put_batch_for(b"second", b"two")),
+            ])
+            .await
+            .unwrap();
+
+        {
+            let io = io.lock().unwrap();
+            assert_eq!(io.write_calls, 1);
+            assert_eq!(io.flush_calls, 1);
+            assert_eq!(io.sync_data_calls, 1);
+        }
+        drop(handle);
+        worker.await.unwrap();
+        drop(io);
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &paths).unwrap();
+        assert_eq!(recovery.last_sequence, 2);
+        assert_eq!(recovered.get("first"), Ok(Some("one".to_string())));
+        assert_eq!(recovered.get("second"), Ok(Some("two".to_string())));
+    }
+
+    #[tokio::test]
+    async fn grouped_append_failure_rolls_back_the_entire_group_tail() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let first_batch = put_batch_for(b"first", b"one");
+        let first_payload = encode_committed_batch(&first_batch).unwrap();
+        let first_record_length = encode_versioned_binlog_record(1, &first_payload)
+            .unwrap()
+            .len()
+            + 4;
+        let io = Arc::new(std::sync::Mutex::new(FaultInjectingFile::open(
+            &paths.binlog,
+            FaultPlan {
+                short_write_on_call: Some((1, first_record_length + 7)),
+                write_error_on_call: Some(2),
+                ..FaultPlan::default()
+            },
+        )));
+        let (sender, receiver) = mpsc::channel(1);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::Always,
+        ));
+        let handle = BinlogHandle::new(sender);
+
+        let error = handle
+            .append_batches(&[(1, first_batch), (2, put_batch_for(b"second", b"two"))])
+            .await
+            .unwrap_err();
+
+        assert!(!error.is_indeterminate());
+        assert_eq!(std::fs::metadata(&paths.binlog).unwrap().len(), 0);
+        drop(handle);
+        worker.await.unwrap();
+        drop(io);
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &paths).unwrap();
+        assert_eq!(recovery.last_sequence, 0);
+        assert_eq!(recovered.get("first"), Ok(None));
+        assert_eq!(recovered.get("second"), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn grouped_append_rejection_preserves_the_preexisting_durable_prefix() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let first_batch = put_batch_for(b"first", b"one");
+        let first_payload = encode_committed_batch(&first_batch).unwrap();
+        let first_record_length = encode_versioned_binlog_record(2, &first_payload)
+            .unwrap()
+            .len()
+            + 4;
+        let io = Arc::new(std::sync::Mutex::new(FaultInjectingFile::open(
+            &paths.binlog,
+            FaultPlan {
+                short_write_on_call: Some((2, first_record_length + 7)),
+                write_error_on_call: Some(3),
+                ..FaultPlan::default()
+            },
+        )));
+        let (sender, receiver) = mpsc::channel(2);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::Always,
+        ));
+        let handle = BinlogHandle::new(sender);
+        handle
+            .append_batch(1, &put_batch_for(b"durable", b"before"))
+            .await
+            .unwrap();
+
+        let error = handle
+            .append_batches(&[(2, first_batch), (3, put_batch_for(b"second", b"two"))])
+            .await
+            .unwrap_err();
+
+        assert!(!error.is_indeterminate());
+        drop(handle);
+        worker.await.unwrap();
+        drop(io);
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &paths).unwrap();
+        assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(recovered.get("durable"), Ok(Some("before".to_string())));
+        assert_eq!(recovered.get("first"), Ok(None));
+        assert_eq!(recovered.get("second"), Ok(None));
+    }
+
+    #[test]
+    fn crash_torn_group_recovers_the_complete_logical_prefix_only() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let first = encode_committed_batch(&put_batch_for(b"first", b"one")).unwrap();
+        let second = encode_committed_batch(&put_batch_for(b"second", b"two")).unwrap();
+        let mut encoded_tail = Vec::new();
+        encode_framed_binlog_record(1, &first, &mut encoded_tail).unwrap();
+        let first_record_length = encoded_tail.len();
+        encode_framed_binlog_record(2, &second, &mut encoded_tail).unwrap();
+        let torn_length = first_record_length + 7;
+        let mut file = File::create(&paths.binlog).unwrap();
+        file.write_all(&encoded_tail[..torn_length]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &paths).unwrap();
+
+        assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(recovered.get("first"), Ok(Some("one".to_string())));
+        assert_eq!(recovered.get("second"), Ok(None));
+        assert_eq!(
+            std::fs::metadata(&paths.binlog).unwrap().len(),
+            first_record_length as u64
+        );
+    }
+
+    #[tokio::test]
     async fn dropped_completion_after_worker_ownership_is_indeterminate() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
@@ -1041,15 +1304,13 @@ mod tests {
         let worker_file = Arc::clone(&file);
         let worker = tokio::spawn(async move {
             if let Some(LogMessage::Append {
-                sequence,
-                record,
+                records,
                 completion,
             }) = receiver.recv().await
             {
-                append_binlog_record(
+                append_binlog_records(
                     &mut *worker_file.lock().unwrap(),
-                    sequence,
-                    &record,
+                    &records,
                     FsyncPolicy::Always,
                 )
                 .unwrap();

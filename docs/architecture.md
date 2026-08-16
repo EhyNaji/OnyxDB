@@ -30,10 +30,11 @@ the authoritative boundary for state changes.
 | `src/store.rs` | Typed data operations plus tentative mutation capture, admission, and rollback | Does not assign sequences or decide durability |
 | `src/store/json_path.rs` | Pure parsing and execution for the supported JSON field/index path subset | No persistence, protocol, or server dependencies |
 | `src/execution.rs` | RESP data-command semantics, affected-key planning, and typed mutation outcomes | Tentative outcomes do not decide admission or durability |
+| `src/commit_coordinator.rs` | Bounded FIFO ownership of master mutation execution, grouping, rollback, sequence assignment, and cancellation-safe completion | Holds the authoritative commit boundary; it does not own replica application or compaction |
 | `src/persistence/` | Committed-effect model, ONX4 and snapshot codecs, bounded recovery, binlog worker, authoritative sequence state, compaction, durable replica state, and cancellation-safe commit guards | Replication fan-out and lifecycle task supervision are still server-owned |
 | `src/resp.rs` | Bounded RESP command framing and response encoding | RESP command subset, not complete Redis compatibility |
 | `src/protocol.rs` | Bounded OBP framing and encoding | Internal/experimental protocol with a small command subset |
-| `src/main.rs` | Runtime commands, tentative-to-durable commit coordination, replication publication and task lifecycle, networking, metrics, shutdown | Still broad; publication remains adjacent to durable acceptance |
+| `src/main.rs` | Runtime commands, replication publication and task lifecycle, networking, metrics, shutdown, and coordinator bootstrap | Still broad; publication remains adjacent to durable acceptance |
 | `src/onyx-cli.rs` | Minimal interactive RESP client | Not a complete shell parser or `redis-cli` replacement |
 | `src/onyx-bench.rs` | Bounded RESP benchmark runner with repeatable workloads, percentiles, and error accounting | No OBP workload or coordinated-omission correction yet |
 
@@ -56,42 +57,53 @@ partial listener set is not an accepted runtime state.
 All client mutation paths, including RESP, OBP, and transactions, must converge
 on one committed-effect model.
 
-For a single mutation, the server:
+Decoded master mutations enter one bounded FIFO coordinator. The queue has both
+count and memory budgets, and execution groups have smaller request, logical
+mutation, and input-byte limits. For each group, the coordinator:
 
-1. Acquires the global write gate and the exclusive visibility gate.
-2. Captures the affected state.
-3. Applies the engine mutation tentatively.
-4. Enforces key-count and projected-memory admission, including deterministic
-   capture of eviction victims.
-5. Derives a canonical batch of `Put` and `Delete` effects from the actual
-   before/after state.
-6. Computes the next monotonic sequence and appends that exact batch to the
-   binlog without publishing the sequence early.
-7. Only after append success, advances the authoritative sequence, adds the
-   batch to the partial-sync backlog, and publishes it to connected replicas.
-8. On append failure, restores the previous state and any eviction victims,
-   then makes persistence fail closed for later writes.
+1. Acquires the global write gate and exclusive visibility gate once.
+2. Executes requests in queue order and applies every engine mutation
+   tentatively.
+3. Enforces key-count and projected-memory admission for each command,
+   including deterministic capture of eviction victims.
+4. Derives one canonical `Put`/`Delete` batch for each logical mutation from
+   its exact before/after state. No-op and rejected commands receive no batch.
+5. Assigns contiguous monotonic sequences to those logical batches.
+6. Encodes the batches as separate ONX4 recovery records but appends the
+   complete encoded tail through one physical write/flush outcome. Under
+   `appendfsync always`, the complete group receives one data synchronization.
+7. Only after group acceptance, advances the authoritative sequence, adds each
+   logical batch to the partial-sync backlog, and publishes each sequence to
+   connected replicas in the same order.
+8. On definitive append rejection, restores every tentative mutation and
+   eviction victim in reverse execution order. An indeterminate outcome keeps
+   tentative state fenced behind the visibility gate and enters fail-stop.
 
 The visibility gate prevents clients from observing a tentative mutation or a
 partial transaction. Code that needs both gates acquires the write gate before
 the visibility gate.
 
-Once an append request is handed to the binlog worker, an owned commit finalizer
-retains both gates, the tentative state, and its rollback journal independently
-of the client task. Disconnecting or cancelling that client cannot roll back a
-record that the worker may already have written. Shutdown, compaction, replica
-reconnect, and promotion all wait for the same boundary before proceeding.
+Once a request enters the coordinator queue, its operation, completion channel,
+and memory permit are owned independently of the client task. Disconnecting or
+cancelling that client cannot remove queued work or roll back a group the worker
+may have written. A supervised worker failure enters fail-stop. Replica effects
+continue to use owned commit finalizers because their upstream sequence is
+already assigned. Shutdown, compaction, replica reconnect, and promotion all
+wait for the same write boundary before proceeding.
 
 ### Mutation invariant
 
 For every acknowledged state-changing batch, the in-memory state, binlog,
 replication backlog, and live replication stream refer to the same canonical
-effects at the same sequence. A failed or no-op command produces no committed
-batch.
+effects at the same sequence. Grouping changes physical I/O ownership, not the
+logical sequence or recovery format. A failed or no-op command produces no
+committed batch.
 
-Transactions containing writes hold the same ordering boundary for the whole
-execution. Successful effects are persisted and replicated as one batch. If
-batch persistence fails, every effect is rolled back.
+Transactions containing writes are one coordinator request and one logical
+batch even when physically grouped with requests from other clients. Successful
+transaction effects are persisted and replicated atomically. If group
+persistence is rejected, every transaction and neighboring tentative mutation
+in that physical group is rolled back.
 
 A disconnected client may not know whether its command committed, which is the
 normal ambiguity of a lost acknowledgement. The server nevertheless completes
@@ -111,8 +123,8 @@ decide when a tentative mutation is durable. Those responsibilities remain on
 the server side of the boundary. Exact entry installation and full replacement
 APIs exist for validated recovery and synchronization paths; normal RESP command
 semantics use typed store operations. A mutation attempt can transfer its exact
-rollback journal to the commit finalizer when the durability decision must
-outlive the command task.
+rollback journal to the coordinator or replica commit finalizer when the
+durability decision must outlive the command task.
 
 ### Command execution boundary
 
@@ -195,7 +207,8 @@ validated.
 An append acknowledgement always follows a successful userspace write and
 flush. Physical synchronization depends on `appendfsync`:
 
-- `always`: synchronize each committed batch before acknowledging it;
+- `always`: synchronize each accepted physical group before acknowledging any
+  logical batch in that group;
 - `everysec`: synchronize in a background task, with an expected system-crash
   loss window of approximately one second;
 - `no`: rely on operating-system writeback after userspace flush.
@@ -261,6 +274,13 @@ happens before large payload allocation where possible. Malformed, ambiguous,
 or timed-out frames close the connection after a protocol error; the parser does
 not attempt lossy resynchronization.
 
+After one RESP command is assembled normally, the server may decode complete
+write frames already present in the connection buffer without performing
+another socket read. Up to 64 contiguous writes become one coordinator request.
+A read, authentication, transaction, replication, Pub/Sub, or other control
+command is a barrier. Partial following input is never consumed and never delays
+the complete write response.
+
 Internal replication framing has separate bounded readers and transfer
 deadlines. Client parser limits are not used as a substitute for replication
 protocol validation.
@@ -294,9 +314,10 @@ must follow the actual dependency graph rather than target file size alone.
 - `main.rs` remains large during the transition.
 - Each extraction must preserve the invariants in this document and include
   focused tests for its new public/internal boundary.
-- Durable sequence, binlog, compaction, and write-gate ownership now have an
-  explicit persistence runtime. Replication publication remains adjacent until
-  its post-acceptance handoff can be extracted without creating a second order.
+- Durable sequence and binlog/compaction ownership have an explicit persistence
+  runtime. Master mutation execution and write-gate ownership have an explicit
+  bounded coordinator. Replication publication remains adjacent until its
+  post-acceptance handoff can be extracted without creating a second order.
 - Temporary duplication is acceptable only inside one reviewable transition;
   permanent parallel implementations of command classification, framing, or
   committed-effect semantics are not.

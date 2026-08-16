@@ -1,6 +1,8 @@
+mod commit_coordinator;
 mod config;
 mod persistence;
 use bytes::Bytes;
+use commit_coordinator::{MasterCommitCoordinator, ObpMutationResult};
 use config::{FsyncPolicy, ServerConfig, UpstreamCredentials};
 #[cfg(test)]
 use flate2::Compression;
@@ -16,7 +18,10 @@ use onyxdb::execution::{
     execute_command as execute_data_command,
 };
 use onyxdb::protocol::{MAX_OBP_FRAME_SIZE, OBPFrame};
-use onyxdb::resp::{CLIENT_RESP_LIMITS, RESPReadLimits, RESPValue, read_command_with_timeouts};
+use onyxdb::resp::{
+    CLIENT_RESP_LIMITS, RESPReadLimits, RESPValue, decode_buffered_command,
+    read_command_with_timeouts,
+};
 #[cfg(test)]
 use onyxdb::store::StoreError;
 use onyxdb::store::{MAX_KEYS, MutationRollback, ShardedStore};
@@ -33,7 +38,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{
-    AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter as TokioBufWriter,
+    AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader,
+    BufWriter as TokioBufWriter,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -61,6 +67,7 @@ const REPLICATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const REPLICA_ACK_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TRANSACTION_COMMANDS: usize = 1024;
 const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PIPELINED_COMMIT_COMMANDS: usize = 64;
 
 #[derive(Default)]
 struct TransactionQueue {
@@ -344,6 +351,7 @@ impl<T> Drop for AbortTaskOnDrop<T> {
 
 struct Persistence {
     commit_runtime: CommitRuntime,
+    master_commit: std::sync::OnceLock<MasterCommitCoordinator>,
     // Broadcasts each committed batch to connected replicas with its sequence.
     replica_tx: tokio::sync::broadcast::Sender<(u64, CommittedBatch)>,
     // Marks a replica that has crossed the authoritative promotion boundary.
@@ -830,8 +838,17 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
     let mut resp_buf = String::with_capacity(256);
     let mut authenticated = !auth_required();
     let mut transaction: Option<TransactionQueue> = None;
+    let mut buffered_protocol_error = None;
 
     loop {
+        if let Some(error) = buffered_protocol_error.take() {
+            warn!("Closing RESP connection from {}: {}", peer_addr, error);
+            resp_buf.clear();
+            RESPValue::Error(format!("ERR Protocol error: {}", error)).encode_into(&mut resp_buf);
+            let _ = buf_writer.write_all(resp_buf.as_bytes()).await;
+            let _ = buf_writer.flush().await;
+            break;
+        }
         let mut args = match read_command_with_timeouts(
             &mut buf_reader,
             &mut scratch,
@@ -1508,6 +1525,46 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
         }
 
         // Normal client command.
+        if !IS_REPLICA.load(Ordering::SeqCst) && is_write_command(cmd) {
+            let mut commands = Vec::with_capacity(MAX_PIPELINED_COMMIT_COMMANDS);
+            let mut buffered_complete_barrier = false;
+            commands.push(args);
+            while commands.len() < MAX_PIPELINED_COMMIT_COMMANDS {
+                match decode_buffered_command(buf_reader.buffer(), CLIENT_RESP_LIMITS) {
+                    Ok(Some((mut next, consumed))) if !next.is_empty() => {
+                        next[0].make_ascii_uppercase();
+                        if !is_write_command(&next[0]) {
+                            buffered_complete_barrier = true;
+                            break;
+                        }
+                        buf_reader.consume(consumed);
+                        commands.push(next);
+                    }
+                    Ok(Some(_)) => break,
+                    Ok(None) => break,
+                    Err(error) => {
+                        buffered_protocol_error = Some(error.to_string());
+                        buffered_complete_barrier = true;
+                        break;
+                    }
+                }
+            }
+
+            TOTAL_COMMANDS.fetch_add(commands.len(), Ordering::Relaxed);
+            let responses = execute_ordered_commands(&store, &persistence, commands).await;
+            for response in responses {
+                resp_buf.clear();
+                response.into_response().encode_into(&mut resp_buf);
+                if buf_writer.write_all(resp_buf.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            if !buffered_complete_barrier && buf_writer.flush().await.is_err() {
+                return;
+            }
+            continue;
+        }
+
         let response = if cmd == "SAVE" {
             match compact_store(&store, &persistence).await {
                 Ok(_) => RESPValue::SimpleString("OK".to_string()),
@@ -1888,6 +1945,33 @@ async fn persist_and_publish_master_batch(
     }
     let _ = persistence.replica_tx.send((sequence, batch.clone()));
 
+    Ok(should_compact)
+}
+
+/// Persists one contiguous group of logical master mutations and publishes
+/// every accepted sequence in the same canonical order.
+async fn persist_and_publish_master_batches(
+    persistence: &Persistence,
+    batches: &[(u64, CommittedBatch)],
+) -> Result<bool, PersistenceError> {
+    let should_compact = persistence
+        .accept_next_batches(batches, COMPACTION_THRESHOLD)
+        .await?;
+    {
+        let mut backlog = persistence
+            .backlog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (sequence, batch) in batches {
+            backlog.push_back((*sequence, batch.clone()));
+            while backlog.len() > BACKLOG_CAPACITY {
+                backlog.pop_front();
+            }
+        }
+    }
+    for (sequence, batch) in batches {
+        let _ = persistence.replica_tx.send((*sequence, batch.clone()));
+    }
     Ok(should_compact)
 }
 
@@ -2286,6 +2370,20 @@ async fn execute_transaction(
         );
     }
 
+    if let Some(coordinator) = persistence.master_commit.get() {
+        return match coordinator.execute_transaction(commands).await {
+            Ok(response) => response,
+            Err(error) => {
+                let message = error.to_string();
+                if message.starts_with("MISCONF ") {
+                    RESPValue::Error(message)
+                } else {
+                    RESPValue::Error(format!("MISCONF transaction persistence failed: {}", error))
+                }
+            }
+        };
+    }
+
     let boundary = persistence.acquire_commit_boundary().await;
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
         return RESPValue::Error(persistence_unavailable_message(persistence));
@@ -2379,6 +2477,23 @@ async fn execute_ordered_command(
         return execute_command(store, args);
     }
 
+    if let Some(coordinator) = persistence.master_commit.get() {
+        return match coordinator.execute_command(args.to_vec()).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let message = error.to_string();
+                CommandOutcome {
+                    response: RESPValue::Error(if message.starts_with("MISCONF ") {
+                        message
+                    } else {
+                        format!("MISCONF mutation persistence failed: {}", error)
+                    }),
+                    mutation: MutationState::NoChange,
+                }
+            }
+        };
+    }
+
     let boundary = persistence.acquire_commit_boundary().await;
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
         return CommandOutcome {
@@ -2462,6 +2577,39 @@ async fn execute_ordered_command(
     outcome
 }
 
+async fn execute_ordered_commands(
+    store: &Arc<ShardedStore>,
+    persistence: &Arc<Persistence>,
+    commands: Vec<Vec<String>>,
+) -> Vec<CommandOutcome> {
+    let command_count = commands.len();
+    if let Some(coordinator) = persistence.master_commit.get() {
+        return match coordinator.execute_commands(commands).await {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                let message = error.to_string();
+                let message = if message.starts_with("MISCONF ") {
+                    message
+                } else {
+                    format!("MISCONF mutation persistence failed: {}", error)
+                };
+                (0..command_count)
+                    .map(|_| CommandOutcome {
+                        response: RESPValue::Error(message.clone()),
+                        mutation: MutationState::NoChange,
+                    })
+                    .collect()
+            }
+        };
+    }
+
+    let mut outcomes = Vec::with_capacity(command_count);
+    for command in commands {
+        outcomes.push(execute_ordered_command(store, persistence, &command).await);
+    }
+    outcomes
+}
+
 async fn execute_obp_command(
     store: &Arc<ShardedStore>,
     persistence: &Arc<Persistence>,
@@ -2535,114 +2683,99 @@ async fn execute_obp_command(
         }
         0x02 => {
             if args.len() >= 2 {
-                let boundary = persistence.acquire_commit_boundary().await;
-                if !persistence.accepting_writes.load(Ordering::SeqCst) {
-                    return OBPFrame {
-                        cmd: 0x00,
-                        flags: 0,
-                        correlation_id: frame.correlation_id,
-                        args: Vec::new(),
-                        payload: Some(Bytes::from("MISCONF persistence is unavailable")),
-                    };
-                }
-                let current_sequence = persistence.sequence();
-                if current_sequence == u64::MAX {
-                    mark_persistence_failed(persistence, "Persistence sequence is exhausted");
-                    return OBPFrame {
-                        cmd: 0x00,
-                        flags: 0,
-                        correlation_id: frame.correlation_id,
-                        args: Vec::new(),
-                        payload: Some(Bytes::from("MISCONF persistence sequence is exhausted")),
-                    };
-                }
-                let key = args[0].clone();
-                let affected_keys = [key.clone()];
-                let mut attempt = store.begin_mutation(&affected_keys);
-                let value = OnyxValue::Blob(args[1].clone());
-                store.set_value(key.clone(), value, None);
-                match attempt.admit(&affected_keys) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        attempt.rollback();
+                if let Some(coordinator) = persistence.master_commit.get() {
+                    match coordinator
+                        .execute_obp_set(args[0].clone(), args[1].clone())
+                        .await
+                    {
+                        Ok(ObpMutationResult::Value(value)) => (value, true),
+                        Ok(ObpMutationResult::Error(message)) => {
+                            return OBPFrame {
+                                cmd: 0x00,
+                                flags: 0,
+                                correlation_id: frame.correlation_id,
+                                args: Vec::new(),
+                                payload: Some(Bytes::from(message)),
+                            };
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            let message = if message.starts_with("MISCONF ") {
+                                message
+                            } else {
+                                format!("MISCONF mutation persistence failed: {}", error)
+                            };
+                            return OBPFrame {
+                                cmd: 0x00,
+                                flags: 0,
+                                correlation_id: frame.correlation_id,
+                                args: Vec::new(),
+                                payload: Some(Bytes::from(message)),
+                            };
+                        }
+                    }
+                } else {
+                    let boundary = persistence.acquire_commit_boundary().await;
+                    if !persistence.accepting_writes.load(Ordering::SeqCst) {
                         return OBPFrame {
                             cmd: 0x00,
                             flags: 0,
                             correlation_id: frame.correlation_id,
                             args: Vec::new(),
-                            payload: Some(Bytes::from(error.message())),
+                            payload: Some(Bytes::from("MISCONF persistence is unavailable")),
                         };
                     }
-                }
-                let batch = derive_committed_batch(
-                    store,
-                    &affected_keys,
-                    attempt.before_entries(),
-                    attempt.evicted_entries(),
-                )
-                .expect("OBP SET must produce a committed effect");
-                let sequence = current_sequence + 1;
-                let rollback = attempt.into_rollback();
-                let finalizer = tokio::spawn(finalize_master_commit(
-                    Arc::clone(store),
-                    Arc::clone(persistence),
-                    boundary,
-                    sequence,
-                    batch,
-                    rollback,
-                    "OBP mutation persistence failed",
-                ));
-                match await_commit_finalizer(persistence, finalizer).await {
-                    Ok(()) => {}
-                    Err(error) => {
+                    let current_sequence = persistence.sequence();
+                    if current_sequence == u64::MAX {
+                        mark_persistence_failed(persistence, "Persistence sequence is exhausted");
+                        return OBPFrame {
+                            cmd: 0x00,
+                            flags: 0,
+                            correlation_id: frame.correlation_id,
+                            args: Vec::new(),
+                            payload: Some(Bytes::from("MISCONF persistence sequence is exhausted")),
+                        };
+                    }
+                    let key = args[0].clone();
+                    let affected_keys = [key.clone()];
+                    let mut attempt = store.begin_mutation(&affected_keys);
+                    let value = OnyxValue::Blob(args[1].clone());
+                    store.set_value(key.clone(), value, None);
+                    if derive_committed_batch(store, &affected_keys, attempt.before_entries(), &[])
+                        .is_none()
+                    {
+                        attempt.commit();
                         return OBPFrame {
                             cmd: 0x00,
                             flags: 0,
                             correlation_id: frame.correlation_id,
                             args: Vec::new(),
                             payload: Some(Bytes::from(format!(
-                                "MISCONF mutation persistence failed: {}",
-                                error
+                                "{:?}",
+                                OnyxValue::Blob(Bytes::from_static(b"OK"))
                             ))),
                         };
                     }
-                }
-
-                (OnyxValue::Blob(Bytes::from("OK")), true)
-            } else {
-                (OnyxValue::Blob(Bytes::from("ERR")), false)
-            }
-        }
-        0x03 => {
-            if let Some(key) = args.first() {
-                let boundary = persistence.acquire_commit_boundary().await;
-                if !persistence.accepting_writes.load(Ordering::SeqCst) {
-                    return OBPFrame {
-                        cmd: 0x00,
-                        flags: 0,
-                        correlation_id: frame.correlation_id,
-                        args: Vec::new(),
-                        payload: Some(Bytes::from("MISCONF persistence is unavailable")),
-                    };
-                }
-                let current_sequence = persistence.sequence();
-                if current_sequence == u64::MAX {
-                    mark_persistence_failed(persistence, "Persistence sequence is exhausted");
-                    return OBPFrame {
-                        cmd: 0x00,
-                        flags: 0,
-                        correlation_id: frame.correlation_id,
-                        args: Vec::new(),
-                        payload: Some(Bytes::from("MISCONF persistence sequence is exhausted")),
-                    };
-                }
-                let affected_keys = [key.clone()];
-                let attempt = store.begin_mutation(&affected_keys);
-                let deleted = store.delete_bytes(key);
-                if deleted {
-                    let batch = CommittedBatch {
-                        effects: vec![CommittedEffect::Delete { key: key.clone() }],
-                    };
+                    match attempt.admit(&affected_keys) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            attempt.rollback();
+                            return OBPFrame {
+                                cmd: 0x00,
+                                flags: 0,
+                                correlation_id: frame.correlation_id,
+                                args: Vec::new(),
+                                payload: Some(Bytes::from(error.message())),
+                            };
+                        }
+                    }
+                    let batch = derive_committed_batch(
+                        store,
+                        &affected_keys,
+                        attempt.before_entries(),
+                        attempt.evicted_entries(),
+                    )
+                    .expect("OBP SET must produce a committed effect");
                     let sequence = current_sequence + 1;
                     let rollback = attempt.into_rollback();
                     let finalizer = tokio::spawn(finalize_master_commit(
@@ -2669,8 +2802,101 @@ async fn execute_obp_command(
                             };
                         }
                     }
+
+                    (OnyxValue::Blob(Bytes::from("OK")), true)
                 }
-                (OnyxValue::Int(if deleted { 1 } else { 0 }), true)
+            } else {
+                (OnyxValue::Blob(Bytes::from("ERR")), false)
+            }
+        }
+        0x03 => {
+            if let Some(key) = args.first() {
+                if let Some(coordinator) = persistence.master_commit.get() {
+                    match coordinator.execute_obp_delete(key.clone()).await {
+                        Ok(ObpMutationResult::Value(value)) => (value, true),
+                        Ok(ObpMutationResult::Error(message)) => {
+                            return OBPFrame {
+                                cmd: 0x00,
+                                flags: 0,
+                                correlation_id: frame.correlation_id,
+                                args: Vec::new(),
+                                payload: Some(Bytes::from(message)),
+                            };
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            let message = if message.starts_with("MISCONF ") {
+                                message
+                            } else {
+                                format!("MISCONF mutation persistence failed: {}", error)
+                            };
+                            return OBPFrame {
+                                cmd: 0x00,
+                                flags: 0,
+                                correlation_id: frame.correlation_id,
+                                args: Vec::new(),
+                                payload: Some(Bytes::from(message)),
+                            };
+                        }
+                    }
+                } else {
+                    let boundary = persistence.acquire_commit_boundary().await;
+                    if !persistence.accepting_writes.load(Ordering::SeqCst) {
+                        return OBPFrame {
+                            cmd: 0x00,
+                            flags: 0,
+                            correlation_id: frame.correlation_id,
+                            args: Vec::new(),
+                            payload: Some(Bytes::from("MISCONF persistence is unavailable")),
+                        };
+                    }
+                    let current_sequence = persistence.sequence();
+                    if current_sequence == u64::MAX {
+                        mark_persistence_failed(persistence, "Persistence sequence is exhausted");
+                        return OBPFrame {
+                            cmd: 0x00,
+                            flags: 0,
+                            correlation_id: frame.correlation_id,
+                            args: Vec::new(),
+                            payload: Some(Bytes::from("MISCONF persistence sequence is exhausted")),
+                        };
+                    }
+                    let affected_keys = [key.clone()];
+                    let attempt = store.begin_mutation(&affected_keys);
+                    let deleted = store.delete_bytes(key);
+                    if deleted {
+                        let batch = CommittedBatch {
+                            effects: vec![CommittedEffect::Delete { key: key.clone() }],
+                        };
+                        let sequence = current_sequence + 1;
+                        let rollback = attempt.into_rollback();
+                        let finalizer = tokio::spawn(finalize_master_commit(
+                            Arc::clone(store),
+                            Arc::clone(persistence),
+                            boundary,
+                            sequence,
+                            batch,
+                            rollback,
+                            "OBP mutation persistence failed",
+                        ));
+                        match await_commit_finalizer(persistence, finalizer).await {
+                            Ok(()) => {}
+                            Err(error) => {
+                                return OBPFrame {
+                                    cmd: 0x00,
+                                    flags: 0,
+                                    correlation_id: frame.correlation_id,
+                                    args: Vec::new(),
+                                    payload: Some(Bytes::from(format!(
+                                        "MISCONF mutation persistence failed: {}",
+                                        error
+                                    ))),
+                                };
+                            }
+                        }
+                    }
+                    (OnyxValue::Int(if deleted { 1 } else { 0 }), true)
+                }
             } else {
                 (OnyxValue::Int(0), false)
             }
@@ -2785,6 +3011,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             recovery.last_sequence,
             paths.clone(),
         ),
+        master_commit: std::sync::OnceLock::new(),
         replica_tx,
         promote_to_master: Arc::clone(&promote_flag),
         backlog: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(BACKLOG_CAPACITY)),
@@ -2801,6 +3028,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replication_ready: AtomicBool::new(recovered_replica_identity.is_some()),
         replica_lifecycle,
     });
+
+    persistence
+        .master_commit
+        .set(MasterCommitCoordinator::start(
+            Arc::clone(&store),
+            &persistence,
+        ))
+        .unwrap_or_else(|_| panic!("master commit coordinator initialized more than once"));
 
     let binlog_shared: Arc<std::sync::Mutex<File>> =
         Arc::new(std::sync::Mutex::new(open_binlog_file(&paths.binlog)));
@@ -3871,6 +4106,7 @@ mod tests {
         let (pubsub_tx, _) = tokio::sync::broadcast::channel(16);
         Arc::new(Persistence {
             commit_runtime: CommitRuntime::new(BinlogHandle::new(log_tx), initial_sequence, paths),
+            master_commit: std::sync::OnceLock::new(),
             replica_tx,
             promote_to_master: Arc::new(AtomicBool::new(false)),
             backlog: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -3883,6 +4119,54 @@ mod tests {
             replication_ready: AtomicBool::new(false),
             replica_lifecycle: Arc::new(ReplicaLifecycle::new(true)),
         })
+    }
+
+    fn enable_master_commit_coordinator(store: &Arc<ShardedStore>, persistence: &Arc<Persistence>) {
+        assert!(
+            persistence
+                .master_commit
+                .set(MasterCommitCoordinator::start(
+                    Arc::clone(store),
+                    persistence,
+                ))
+                .is_ok()
+        );
+    }
+
+    async fn wait_for_coordinator_queue(persistence: &Persistence, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let queued = persistence
+                    .master_commit
+                    .get()
+                    .expect("coordinator must be installed")
+                    .pending_requests();
+                if queued >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("commit requests did not enter the bounded coordinator queue");
+    }
+
+    async fn receive_append_group(
+        receiver: &mut mpsc::Receiver<LogMessage>,
+    ) -> (Vec<(u64, Vec<u8>)>, oneshot::Sender<StorageResult>) {
+        loop {
+            match receiver.recv().await.expect("binlog channel closed") {
+                LogMessage::Append {
+                    records,
+                    completion,
+                } => return (records, completion),
+                LogMessage::Flush { completion }
+                | LogMessage::SyncData { completion }
+                | LogMessage::Truncate { completion } => {
+                    let _ = completion.send(Ok(()));
+                }
+            }
+        }
     }
 
     fn append_test_binlog_record(paths: &PersistencePaths, sequence: u64, args: &[&str]) {
@@ -3960,19 +4244,21 @@ mod tests {
             while let Some(message) = receiver.recv().await {
                 match message {
                     LogMessage::Append {
-                        sequence,
-                        record,
+                        records,
                         completion,
                     } => {
-                        let encoded = encode_versioned_binlog_record(sequence, &record).unwrap();
                         let mut file = OpenOptions::new()
                             .create(true)
                             .append(true)
                             .open(&binlog_path)
                             .unwrap();
-                        file.write_all(&(encoded.len() as u32).to_be_bytes())
-                            .unwrap();
-                        file.write_all(&encoded).unwrap();
+                        for (sequence, record) in records {
+                            let encoded =
+                                encode_versioned_binlog_record(sequence, &record).unwrap();
+                            file.write_all(&(encoded.len() as u32).to_be_bytes())
+                                .unwrap();
+                            file.write_all(&encoded).unwrap();
+                        }
                         file.sync_all().unwrap();
                         persisted_tx.take().unwrap().send(()).unwrap();
                         release_rx.take().unwrap().await.unwrap();
@@ -5977,6 +6263,656 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_groups_queued_mutations_in_authoritative_sequence_order() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+        let mut replication = persistence.replica_tx.subscribe();
+
+        let first_store = Arc::clone(&store);
+        let first_persistence = Arc::clone(&persistence);
+        let first = tokio::spawn(async move {
+            execute_ordered_command(
+                &first_store,
+                &first_persistence,
+                &["SET".to_string(), "gate".to_string(), "open".to_string()],
+            )
+            .await
+        });
+        let (first_records, first_completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(first_records.len(), 1);
+        assert_eq!(first_records[0].0, 1);
+
+        let mut queued = Vec::new();
+        for index in 0..3 {
+            let command_store = Arc::clone(&store);
+            let command_persistence = Arc::clone(&persistence);
+            queued.push(tokio::spawn(async move {
+                execute_ordered_command(
+                    &command_store,
+                    &command_persistence,
+                    &[
+                        "SET".to_string(),
+                        format!("key-{index}"),
+                        format!("value-{index}"),
+                    ],
+                )
+                .await
+            }));
+        }
+        wait_for_coordinator_queue(&persistence, 3).await;
+        first_completion.send(Ok(())).unwrap();
+        assert_eq!(first.await.unwrap().mutation, MutationState::Committed);
+
+        let (grouped_records, grouped_completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(
+            grouped_records
+                .iter()
+                .map(|(sequence, _)| *sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        grouped_completion.send(Ok(())).unwrap();
+        for command in queued {
+            assert_eq!(command.await.unwrap().mutation, MutationState::Committed);
+        }
+
+        for expected in 1..=4 {
+            let (sequence, _) = replication.recv().await.unwrap();
+            assert_eq!(sequence, expected);
+        }
+        assert_eq!(persistence.sequence(), 4);
+        assert_eq!(persistence.backlog.lock().unwrap().len(), 4);
+        for index in 0..3 {
+            assert_eq!(
+                store.get(&format!("key-{index}")),
+                Ok(Some(format!("value-{index}")))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_persists_one_pipelined_request_as_distinct_logical_commits() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let command_store = Arc::clone(&store);
+        let command_persistence = Arc::clone(&persistence);
+        let commands = tokio::spawn(async move {
+            execute_ordered_commands(
+                &command_store,
+                &command_persistence,
+                vec![
+                    vec!["SET".to_string(), "value".to_string(), "1".to_string()],
+                    vec!["INCR".to_string(), "value".to_string()],
+                    vec!["APPEND".to_string(), "value".to_string(), "0".to_string()],
+                ],
+            )
+            .await
+        });
+
+        let (records, completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(
+            records
+                .iter()
+                .map(|(sequence, _)| *sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        completion.send(Ok(())).unwrap();
+
+        let outcomes = commands.await.unwrap();
+        assert_eq!(outcomes.len(), 3);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.mutation == MutationState::Committed)
+        );
+        assert_eq!(store.get("value"), Ok(Some("20".to_string())));
+        assert_eq!(persistence.sequence(), 3);
+        assert_eq!(persistence.backlog.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn resp_handler_admits_buffered_write_pipeline_as_one_physical_append() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        client
+            .write_all(
+                b"*3\r\n$3\r\nSET\r\n$3\r\none\r\n$1\r\n1\r\n\
+                  *3\r\n$3\r\nSET\r\n$3\r\ntwo\r\n$1\r\n2\r\n\
+                  *3\r\n$3\r\nSET\r\n$5\r\nthree\r\n$1\r\n3\r\n",
+            )
+            .await
+            .unwrap();
+        let server_store = Arc::clone(&store);
+        let server_persistence = Arc::clone(&persistence);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_client(stream, server_store, server_persistence).await;
+        });
+
+        let (records, completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(records.len(), 3);
+        completion.send(Ok(())).unwrap();
+
+        let mut responses = [0u8; 15];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut responses))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&responses, b"+OK\r\n+OK\r\n+OK\r\n");
+        assert_eq!(store.get("one"), Ok(Some("1".to_string())));
+        assert_eq!(store.get("two"), Ok(Some("2".to_string())));
+        assert_eq!(store.get("three"), Ok(Some("3".to_string())));
+        assert_eq!(persistence.sequence(), 3);
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_following_resp_frame_does_not_delay_a_complete_write_response() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n*")
+            .await
+            .unwrap();
+        let server_store = Arc::clone(&store);
+        let server_persistence = Arc::clone(&persistence);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_client(stream, server_store, server_persistence).await;
+        });
+
+        let (records, completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(records.len(), 1);
+        completion.send(Ok(())).unwrap();
+
+        let mut response = [0u8; 5];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut response))
+            .await
+            .expect("the complete write response waited for the partial next frame")
+            .unwrap();
+        assert_eq!(&response, b"+OK\r\n");
+        assert_eq!(store.get("key"), Ok(Some("value".to_string())));
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn grouped_resp_effects_recover_with_ttl_collections_and_json_intact() {
+        let directory = TestPersistenceDirectory::new();
+        let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let outcomes = execute_ordered_commands(
+            &store,
+            &persistence,
+            vec![
+                vec![
+                    "SET".to_string(),
+                    "expiring".to_string(),
+                    "value".to_string(),
+                ],
+                vec![
+                    "EXPIRE".to_string(),
+                    "expiring".to_string(),
+                    "120".to_string(),
+                ],
+                vec!["RPUSH".to_string(), "list".to_string(), "first".to_string()],
+                vec![
+                    "RPUSH".to_string(),
+                    "list".to_string(),
+                    "second".to_string(),
+                ],
+                vec![
+                    "JSON.SET".to_string(),
+                    "document".to_string(),
+                    "$".to_string(),
+                    "{\"number\":1}".to_string(),
+                ],
+                vec![
+                    "JSON.NUMINCRBY".to_string(),
+                    "document".to_string(),
+                    "$.number".to_string(),
+                    "2".to_string(),
+                ],
+            ],
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 6);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.mutation == MutationState::Committed)
+        );
+        assert_eq!(persistence.sequence(), 6);
+        persistence.binlog.flush().await.unwrap();
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovery.last_sequence, 6);
+        assert_eq!(recovered.get("expiring"), Ok(Some("value".to_string())));
+        assert!(recovered.ttl("expiring") > 0);
+        assert_eq!(
+            recovered.lrange("list", 0, -1),
+            Ok(vec!["first".to_string(), "second".to_string()])
+        );
+        assert_eq!(
+            recovered.json_get("document", "$.number"),
+            Ok(Some("3".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_client_does_not_remove_its_commit_request() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let gate_store = Arc::clone(&store);
+        let gate_persistence = Arc::clone(&persistence);
+        let gate = tokio::spawn(async move {
+            execute_ordered_command(
+                &gate_store,
+                &gate_persistence,
+                &["SET".to_string(), "gate".to_string(), "open".to_string()],
+            )
+            .await
+        });
+        let (_, gate_completion) = receive_append_group(&mut receiver).await;
+
+        let queued_store = Arc::clone(&store);
+        let queued_persistence = Arc::clone(&persistence);
+        let queued = tokio::spawn(async move {
+            execute_ordered_command(
+                &queued_store,
+                &queued_persistence,
+                &[
+                    "SET".to_string(),
+                    "queued".to_string(),
+                    "accepted".to_string(),
+                ],
+            )
+            .await
+        });
+        wait_for_coordinator_queue(&persistence, 1).await;
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+
+        gate_completion.send(Ok(())).unwrap();
+        assert_eq!(gate.await.unwrap().mutation, MutationState::Committed);
+        let (_, queued_completion) = receive_append_group(&mut receiver).await;
+        queued_completion.send(Ok(())).unwrap();
+        wait_for_commit_boundary(&persistence).await;
+
+        assert_eq!(store.get("queued"), Ok(Some("accepted".to_string())));
+        assert_eq!(persistence.sequence(), 2);
+        assert_eq!(persistence.backlog.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dropped_group_storage_outcome_enters_fail_stop_without_rollback() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let command_store = Arc::clone(&store);
+        let command_persistence = Arc::clone(&persistence);
+        let command = tokio::spawn(async move {
+            execute_ordered_commands(
+                &command_store,
+                &command_persistence,
+                vec![
+                    vec!["SET".to_string(), "first".to_string(), "one".to_string()],
+                    vec!["SET".to_string(), "second".to_string(), "two".to_string()],
+                ],
+            )
+            .await
+        });
+        let (records, completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(records.len(), 2);
+        drop(completion);
+
+        let outcomes = command.await.unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|outcome| {
+            matches!(&outcome.response, RESPValue::Error(message) if message.starts_with("MISCONF"))
+        }));
+        assert!(persistence.is_fail_stopped());
+        assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
+        assert_eq!(store.get("first"), Ok(Some("one".to_string())));
+        assert_eq!(store.get("second"), Ok(Some("two".to_string())));
+        assert_eq!(persistence.sequence(), 0);
+        assert!(persistence.backlog.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinator_client_cancellation_does_not_cancel_an_owned_commit() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let command_store = Arc::clone(&store);
+        let command_persistence = Arc::clone(&persistence);
+        let command = tokio::spawn(async move {
+            execute_ordered_command(
+                &command_store,
+                &command_persistence,
+                &[
+                    "SET".to_string(),
+                    "cancelled-client".to_string(),
+                    "accepted".to_string(),
+                ],
+            )
+            .await
+        });
+        let (records, completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(records.len(), 1);
+
+        command.abort();
+        assert!(command.await.unwrap_err().is_cancelled());
+        completion.send(Ok(())).unwrap();
+        wait_for_commit_boundary(&persistence).await;
+
+        assert_eq!(
+            store.get("cancelled-client"),
+            Ok(Some("accepted".to_string()))
+        );
+        assert_eq!(persistence.sequence(), 1);
+        assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn coordinator_rejection_rolls_back_dependent_mutations_in_reverse_order() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let gate_store = Arc::clone(&store);
+        let gate_persistence = Arc::clone(&persistence);
+        let gate = tokio::spawn(async move {
+            execute_ordered_command(
+                &gate_store,
+                &gate_persistence,
+                &["SET".to_string(), "gate".to_string(), "open".to_string()],
+            )
+            .await
+        });
+        let (_, gate_completion) = receive_append_group(&mut receiver).await;
+
+        let mut increments = Vec::new();
+        for _ in 0..2 {
+            let increment_store = Arc::clone(&store);
+            let increment_persistence = Arc::clone(&persistence);
+            increments.push(tokio::spawn(async move {
+                execute_ordered_command(
+                    &increment_store,
+                    &increment_persistence,
+                    &["INCR".to_string(), "counter".to_string()],
+                )
+                .await
+            }));
+        }
+        wait_for_coordinator_queue(&persistence, 2).await;
+        gate_completion.send(Ok(())).unwrap();
+        assert_eq!(gate.await.unwrap().mutation, MutationState::Committed);
+
+        let (records, completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(records.len(), 2);
+        completion
+            .send(Err(StorageFailure::rejected(
+                "injected grouped append rejection",
+            )))
+            .unwrap();
+        for increment in increments {
+            let outcome = increment.await.unwrap();
+            assert_eq!(outcome.mutation, MutationState::NoChange);
+            assert!(
+                matches!(outcome.response, RESPValue::Error(message) if message.starts_with("MISCONF"))
+            );
+        }
+
+        assert_eq!(store.get("counter"), Ok(None));
+        assert_eq!(persistence.sequence(), 1);
+        assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
+        assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn coordinator_group_rejection_restores_eviction_victims() {
+        let candidate = ShardedStore::new();
+        candidate.set("created".to_string(), "x".repeat(90));
+        let limit = candidate.used_memory_bytes();
+        let store = Arc::new(ShardedStore::with_maxmemory(
+            limit,
+            EvictionPolicy::AllKeysLru,
+        ));
+        store.set("victim".to_string(), "original".to_string());
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let mutation_store = Arc::clone(&store);
+        let mutation_persistence = Arc::clone(&persistence);
+        let mutation = tokio::spawn(async move {
+            execute_ordered_commands(
+                &mutation_store,
+                &mutation_persistence,
+                vec![vec![
+                    "SET".to_string(),
+                    "created".to_string(),
+                    "x".repeat(90),
+                ]],
+            )
+            .await
+        });
+        let (records, completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(records.len(), 1);
+        completion
+            .send(Err(StorageFailure::rejected(
+                "injected grouped eviction rejection",
+            )))
+            .unwrap();
+
+        let outcomes = mutation.await.unwrap();
+        assert!(matches!(
+            &outcomes[0].response,
+            RESPValue::Error(message) if message.starts_with("MISCONF")
+        ));
+        assert_eq!(store.get("victim"), Ok(Some("original".to_string())));
+        assert_eq!(store.get("created"), Ok(None));
+        assert!(store.used_memory_bytes() <= limit);
+        assert_eq!(persistence.sequence(), 0);
+    }
+
+    #[tokio::test]
+    async fn coordinator_groups_resp_transactions_and_obp_mutations() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let gate_store = Arc::clone(&store);
+        let gate_persistence = Arc::clone(&persistence);
+        let gate = tokio::spawn(async move {
+            execute_ordered_command(
+                &gate_store,
+                &gate_persistence,
+                &["SET".to_string(), "gate".to_string(), "open".to_string()],
+            )
+            .await
+        });
+        let (_, gate_completion) = receive_append_group(&mut receiver).await;
+
+        let transaction_store = Arc::clone(&store);
+        let transaction_persistence = Arc::clone(&persistence);
+        let transaction = tokio::spawn(async move {
+            execute_transaction(
+                &transaction_store,
+                &transaction_persistence,
+                vec![
+                    vec![
+                        "SET".to_string(),
+                        "transaction".to_string(),
+                        "one".to_string(),
+                    ],
+                    vec!["INCR".to_string(), "number".to_string()],
+                ],
+                false,
+            )
+            .await
+        });
+        let obp_store = Arc::clone(&store);
+        let obp_persistence = Arc::clone(&persistence);
+        let obp = tokio::spawn(async move {
+            let mut authenticated = true;
+            execute_obp_command(
+                &obp_store,
+                &obp_persistence,
+                OBPFrame {
+                    cmd: 0x02,
+                    flags: 0,
+                    correlation_id: 11,
+                    args: vec![Bytes::from_static(b"binary"), Bytes::from_static(b"two")],
+                    payload: None,
+                },
+                &mut authenticated,
+                false,
+            )
+            .await
+        });
+        wait_for_coordinator_queue(&persistence, 2).await;
+        gate_completion.send(Ok(())).unwrap();
+        assert_eq!(gate.await.unwrap().mutation, MutationState::Committed);
+
+        let (records, completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, 2);
+        assert_eq!(records[1].0, 3);
+        completion.send(Ok(())).unwrap();
+
+        assert!(
+            matches!(transaction.await.unwrap(), RESPValue::Array(values) if values.len() == 2)
+        );
+        assert!(obp.await.unwrap().payload.is_some());
+        assert_eq!(store.get("transaction"), Ok(Some("one".to_string())));
+        assert_eq!(store.get("number"), Ok(Some("1".to_string())));
+        assert_eq!(store.get("binary"), Ok(Some("two".to_string())));
+        assert_eq!(persistence.sequence(), 3);
+    }
+
+    #[tokio::test]
+    async fn coordinator_splits_sustained_load_at_the_logical_group_bound() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let gate_store = Arc::clone(&store);
+        let gate_persistence = Arc::clone(&persistence);
+        let gate = tokio::spawn(async move {
+            execute_ordered_command(
+                &gate_store,
+                &gate_persistence,
+                &["SET".to_string(), "gate".to_string(), "open".to_string()],
+            )
+            .await
+        });
+        let (_, gate_completion) = receive_append_group(&mut receiver).await;
+
+        let mut groups = Vec::new();
+        for group in 0..5 {
+            let group_store = Arc::clone(&store);
+            let group_persistence = Arc::clone(&persistence);
+            groups.push(tokio::spawn(async move {
+                let commands = (0..MAX_PIPELINED_COMMIT_COMMANDS)
+                    .map(|command| {
+                        vec![
+                            "SET".to_string(),
+                            format!("bounded-{group}-{command}"),
+                            "value".to_string(),
+                        ]
+                    })
+                    .collect();
+                execute_ordered_commands(&group_store, &group_persistence, commands).await
+            }));
+        }
+        wait_for_coordinator_queue(&persistence, 5).await;
+        gate_completion.send(Ok(())).unwrap();
+        assert_eq!(gate.await.unwrap().mutation, MutationState::Committed);
+
+        let (first_records, first_completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(first_records.len(), 256);
+        assert_eq!(first_records.first().unwrap().0, 2);
+        assert_eq!(first_records.last().unwrap().0, 257);
+        first_completion.send(Ok(())).unwrap();
+
+        let (second_records, second_completion) = receive_append_group(&mut receiver).await;
+        assert_eq!(second_records.len(), 64);
+        assert_eq!(second_records.first().unwrap().0, 258);
+        assert_eq!(second_records.last().unwrap().0, 321);
+        second_completion.send(Ok(())).unwrap();
+
+        for group in groups {
+            let outcomes = group.await.unwrap();
+            assert_eq!(outcomes.len(), MAX_PIPELINED_COMMIT_COMMANDS);
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| outcome.mutation == MutationState::Committed)
+            );
+        }
+        assert_eq!(persistence.sequence(), 321);
+        assert_eq!(store.stats().total_keys, 321);
+    }
+
+    #[tokio::test]
     async fn wrong_type_transaction_error_preserves_state_and_emits_no_commit() {
         let directory = TestPersistenceDirectory::new();
         let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
@@ -7501,6 +8437,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_obp_set_does_not_require_a_persistence_record() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(1);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        let key = Bytes::from_static(b"key");
+        let value = Bytes::from_static(b"value");
+        store.set_value(key.clone(), OnyxValue::Blob(value.clone()), None);
+        let mut authenticated = true;
+
+        let response = execute_obp_command(
+            &store,
+            &persistence,
+            OBPFrame {
+                cmd: 0x02,
+                flags: 0,
+                correlation_id: 1,
+                args: vec![key, value],
+                payload: None,
+            },
+            &mut authenticated,
+            false,
+        )
+        .await;
+
+        assert!(response.payload.is_some());
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(persistence.sequence(), 0);
+    }
+
+    #[tokio::test]
     async fn actual_eviction_victims_are_ordered_and_do_not_resurrect() {
         let directory = TestPersistenceDirectory::new();
         let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
@@ -7678,19 +8645,21 @@ mod tests {
             while let Some(message) = receiver.recv().await {
                 match message {
                     LogMessage::Append {
-                        sequence,
-                        record,
+                        records,
                         completion,
                     } => {
-                        let encoded = encode_versioned_binlog_record(sequence, &record).unwrap();
                         let mut file = OpenOptions::new()
                             .create(true)
                             .append(true)
                             .open(&binlog_path)
                             .unwrap();
-                        file.write_all(&(encoded.len() as u32).to_be_bytes())
-                            .unwrap();
-                        file.write_all(&encoded).unwrap();
+                        for (sequence, record) in records {
+                            let encoded =
+                                encode_versioned_binlog_record(sequence, &record).unwrap();
+                            file.write_all(&(encoded.len() as u32).to_be_bytes())
+                                .unwrap();
+                            file.write_all(&encoded).unwrap();
+                        }
                         file.flush().unwrap();
                         file.sync_all().unwrap();
                         let _ = completion.send(Err(StorageFailure::indeterminate(
