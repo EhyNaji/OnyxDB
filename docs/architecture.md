@@ -30,7 +30,7 @@ the authoritative boundary for state changes.
 | `src/store.rs` | Typed data operations plus tentative mutation capture, admission, and rollback | Does not assign sequences or decide durability |
 | `src/store/json_path.rs` | Pure parsing and execution for the supported JSON field/index path subset | No persistence, protocol, or server dependencies |
 | `src/execution.rs` | RESP data-command semantics, affected-key planning, and typed mutation outcomes | Tentative outcomes do not decide admission or durability |
-| `src/persistence/` | Committed-effect model, ONX4 and snapshot codecs, bounded recovery, and atomic snapshot installation | Runtime sequence assignment and replication publication are still server-owned |
+| `src/persistence/` | Committed-effect model, ONX4 and snapshot codecs, bounded recovery, atomic snapshot installation, and cancellation-safe commit guards | Runtime sequence publication and replication fan-out are still server-owned |
 | `src/resp.rs` | Bounded RESP command framing and response encoding | RESP command subset, not complete Redis compatibility |
 | `src/protocol.rs` | Bounded OBP framing and encoding | Internal/experimental protocol with a small command subset |
 | `src/main.rs` | Runtime commands, authoritative mutation ordering, committed effects, persistence, replication, networking, metrics, lifecycle | Still broad; durable ordering remains intentionally co-located |
@@ -65,17 +65,22 @@ For a single mutation, the server:
    capture of eviction victims.
 5. Derives a canonical batch of `Put` and `Delete` effects from the actual
    before/after state.
-6. Assigns the next monotonic sequence and appends that exact batch to the
-   binlog.
-7. Only after append success, adds the batch to the partial-sync backlog and
-   publishes it to connected replicas.
-8. On append failure, restores the previous state, restores any eviction
-   victims, restores the sequence, and makes persistence fail closed for later
-   writes.
+6. Computes the next monotonic sequence and appends that exact batch to the
+   binlog without publishing the sequence early.
+7. Only after append success, advances the authoritative sequence, adds the
+   batch to the partial-sync backlog, and publishes it to connected replicas.
+8. On append failure, restores the previous state and any eviction victims,
+   then makes persistence fail closed for later writes.
 
 The visibility gate prevents clients from observing a tentative mutation or a
 partial transaction. Code that needs both gates acquires the write gate before
 the visibility gate.
+
+Once an append request is handed to the binlog worker, an owned commit finalizer
+retains both gates, the tentative state, and its rollback journal independently
+of the client task. Disconnecting or cancelling that client cannot roll back a
+record that the worker may already have written. Shutdown, compaction, replica
+reconnect, and promotion all wait for the same boundary before proceeding.
 
 ### Mutation invariant
 
@@ -87,6 +92,11 @@ batch.
 Transactions containing writes hold the same ordering boundary for the whole
 execution. Successful effects are persisted and replicated as one batch. If
 batch persistence fails, every effect is rolled back.
+
+A disconnected client may not know whether its command committed, which is the
+normal ambiguity of a lost acknowledgement. The server nevertheless completes
+one side of the durable boundary exactly once: append rejection rolls back,
+while append acceptance preserves and publishes the tentative state.
 
 ### Store mutation boundary
 
@@ -100,7 +110,9 @@ The store does not assign sequences, append the binlog, publish replication, or
 decide when a tentative mutation is durable. Those responsibilities remain on
 the server side of the boundary. Exact entry installation and full replacement
 APIs exist for validated recovery and synchronization paths; normal RESP command
-semantics use typed store operations.
+semantics use typed store operations. A mutation attempt can transfer its exact
+rollback journal to the commit finalizer when the durability decision must
+outlive the command task.
 
 ### Command execution boundary
 

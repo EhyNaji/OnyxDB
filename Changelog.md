@@ -29,6 +29,9 @@ All notable changes to OnyxDB are documented in this file.
   server mutation paths, including atomic deletion of empty collections.
 - Made write-containing transactions atomic in visibility, persistence, and
   replication order, with rollback on batch persistence failure.
+- Made durable commit finalization independent of client-task cancellation, so
+  RESP, transaction, OBP, and replicated mutations cannot diverge after a
+  binlog write whose acknowledgement is interrupted.
 
 ### Architecture and maintainability
 

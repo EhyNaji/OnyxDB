@@ -57,6 +57,25 @@ pub struct MutationAttempt<'a> {
     active: bool,
 }
 
+/// Owned state required to undo a tentative mutation after command execution.
+pub struct MutationRollback {
+    before_entries: HashMap<Bytes, Option<DataEntry>>,
+    evicted_entries: Vec<(Bytes, DataEntry)>,
+}
+
+impl MutationRollback {
+    pub fn from_baseline(before_entries: HashMap<Bytes, Option<DataEntry>>) -> Self {
+        Self {
+            before_entries,
+            evicted_entries: Vec::new(),
+        }
+    }
+
+    pub fn restore(&self, store: &ShardedStore) {
+        store.restore_entries(&self.before_entries, &self.evicted_entries);
+    }
+}
+
 impl MutationAttempt<'_> {
     pub fn before_entries(&self) -> &HashMap<Bytes, Option<DataEntry>> {
         &self.before_entries
@@ -106,6 +125,19 @@ impl MutationAttempt<'_> {
 
     pub fn commit(mut self) {
         self.active = false;
+    }
+
+    /// Transfers the rollback state to a longer-lived commit coordinator.
+    ///
+    /// The caller becomes responsible for restoring these entries if the
+    /// durable commit fails. This is used when persistence must outlive the
+    /// client task that initiated the mutation.
+    pub fn into_rollback(mut self) -> MutationRollback {
+        self.active = false;
+        MutationRollback {
+            before_entries: std::mem::take(&mut self.before_entries),
+            evicted_entries: std::mem::take(&mut self.evicted_entries),
+        }
     }
 
     fn restore(&self) {

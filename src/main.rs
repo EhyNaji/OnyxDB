@@ -19,7 +19,7 @@ use onyxdb::protocol::{MAX_OBP_FRAME_SIZE, OBPFrame};
 use onyxdb::resp::{CLIENT_RESP_LIMITS, RESPReadLimits, RESPValue, read_command_with_timeouts};
 #[cfg(test)]
 use onyxdb::store::StoreError;
-use onyxdb::store::{MAX_KEYS, ShardedStore};
+use onyxdb::store::{MAX_KEYS, MutationRollback, ShardedStore};
 #[cfg(test)]
 use onyxdb::{protocol, resp};
 use persistence::*;
@@ -379,8 +379,8 @@ struct Persistence {
     /// replicated batches, and full-sync installation take an exclusive guard
     /// so no client can observe a partially committed state transition. Code
     /// that needs both gates must acquire write_gate before visibility_gate.
-    visibility_gate: tokio::sync::RwLock<()>,
-    write_gate: tokio::sync::Mutex<()>,
+    visibility_gate: Arc<tokio::sync::RwLock<()>>,
+    write_gate: Arc<tokio::sync::Mutex<()>>,
     paths: PersistencePaths,
     // Broadcasts each committed batch to connected replicas with its sequence.
     replica_tx: tokio::sync::broadcast::Sender<(u64, CommittedBatch)>,
@@ -2190,18 +2190,22 @@ fn record_persisted_write(persistence: &Persistence) -> bool {
             .is_ok()
 }
 
-/// Persists and publishes one already-applied mutation at its assigned
-/// sequence. The caller must hold the authoritative write gate.
-async fn persist_ordered_mutation(
+/// Persists and publishes one already-applied master mutation at its assigned
+/// sequence. The caller must own the authoritative commit boundary.
+async fn persist_and_publish_master_batch(
     persistence: &Persistence,
     sequence: u64,
     batch: &CommittedBatch,
 ) -> Result<bool, PersistenceError> {
     append_committed_batch(persistence, sequence, batch).await?;
+    persistence.repl_offset.store(sequence, Ordering::SeqCst);
     // The exact same committed batch is published to the backlog and live
     // replication only after its binlog append has been acknowledged.
     {
-        let mut backlog = persistence.backlog.lock().unwrap();
+        let mut backlog = persistence
+            .backlog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         backlog.push_back((sequence, batch.clone()));
         while backlog.len() > BACKLOG_CAPACITY {
             backlog.pop_front();
@@ -2210,6 +2214,47 @@ async fn persist_ordered_mutation(
     let _ = persistence.replica_tx.send((sequence, batch.clone()));
 
     Ok(record_persisted_write(persistence))
+}
+
+async fn finalize_master_commit(
+    store: Arc<ShardedStore>,
+    persistence: Arc<Persistence>,
+    boundary: CommitBoundary,
+    sequence: u64,
+    batch: CommittedBatch,
+    rollback: MutationRollback,
+    failure_context: &'static str,
+) -> Result<(), PersistenceError> {
+    let persistence_result = persist_and_publish_master_batch(&persistence, sequence, &batch).await;
+    let should_compact = match persistence_result {
+        Ok(should_compact) => should_compact,
+        Err(error) => {
+            rollback.restore(&store);
+            mark_persistence_failed(
+                &persistence,
+                format!("{} at sequence {}: {}", failure_context, sequence, error),
+            );
+            return Err(error);
+        }
+    };
+
+    drop(boundary);
+    schedule_compaction(&store, &persistence, should_compact);
+    Ok(())
+}
+
+async fn await_commit_finalizer(
+    persistence: &Persistence,
+    finalizer: tokio::task::JoinHandle<Result<(), PersistenceError>>,
+) -> Result<(), PersistenceError> {
+    match finalizer.await {
+        Ok(result) => result,
+        Err(error) => {
+            let error = PersistenceError::new(format!("Commit finalizer failed: {}", error));
+            mark_persistence_failed(persistence, error.to_string());
+            Err(error)
+        }
+    }
 }
 
 fn schedule_compaction(
@@ -2242,8 +2287,8 @@ async fn persist_and_apply_replica_effect(
     sequence: u64,
     batch: &CommittedBatch,
 ) -> Result<(), PersistenceError> {
-    let write_guard = persistence.write_gate.lock().await;
-    let _visibility_guard = persistence.visibility_gate.write().await;
+    let boundary =
+        CommitBoundary::acquire(&persistence.write_gate, &persistence.visibility_gate).await;
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
         return Err(PersistenceError::new(persistence_unavailable_message(
             persistence,
@@ -2264,22 +2309,32 @@ async fn persist_and_apply_replica_effect(
             expected, sequence
         )));
     }
-    if let Err(error) = append_committed_batch(persistence, sequence, batch).await {
-        mark_persistence_failed(
-            persistence,
-            format!(
-                "Unable to persist replicated effect at sequence {}: {}",
-                sequence, error
-            ),
-        );
-        return Err(error);
-    }
-    apply_committed_batch(store, batch);
-    persistence.repl_offset.store(sequence, Ordering::SeqCst);
-    let should_compact = record_persisted_write(persistence);
-    drop(write_guard);
-    schedule_compaction(store, persistence, should_compact);
-    Ok(())
+    let store = Arc::clone(store);
+    let persistence_for_finalizer = Arc::clone(persistence);
+    let batch = batch.clone();
+    let finalizer = tokio::spawn(async move {
+        if let Err(error) =
+            append_committed_batch(&persistence_for_finalizer, sequence, &batch).await
+        {
+            mark_persistence_failed(
+                &persistence_for_finalizer,
+                format!(
+                    "Unable to persist replicated effect at sequence {}: {}",
+                    sequence, error
+                ),
+            );
+            return Err(error);
+        }
+        apply_committed_batch(&store, &batch);
+        persistence_for_finalizer
+            .repl_offset
+            .store(sequence, Ordering::SeqCst);
+        let should_compact = record_persisted_write(&persistence_for_finalizer);
+        drop(boundary);
+        schedule_compaction(&store, &persistence_for_finalizer, should_compact);
+        Ok(())
+    });
+    await_commit_finalizer(persistence, finalizer).await
 }
 
 async fn begin_full_sync_reception(persistence: &Arc<Persistence>) -> Result<(), PersistenceError> {
@@ -2440,8 +2495,8 @@ async fn execute_transaction(
         );
     }
 
-    let write_guard = persistence.write_gate.lock().await;
-    let _visibility_guard = persistence.visibility_gate.write().await;
+    let boundary =
+        CommitBoundary::acquire(&persistence.write_gate, &persistence.visibility_gate).await;
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
         return RESPValue::Error(persistence_unavailable_message(persistence));
     }
@@ -2503,31 +2558,22 @@ async fn execute_transaction(
 
     changed_keys.sort();
     let Some(batch) = derive_committed_batch(store, &changed_keys, &baseline, &[]) else {
-        drop(write_guard);
         return RESPValue::Array(results);
     };
 
     let sequence = current_sequence + 1;
-    persistence.repl_offset.store(sequence, Ordering::SeqCst);
-    match persist_ordered_mutation(persistence, sequence, &batch).await {
-        Ok(should_compact) => {
-            drop(write_guard);
-            schedule_compaction(store, persistence, should_compact);
-            RESPValue::Array(results)
-        }
+    let finalizer = tokio::spawn(finalize_master_commit(
+        Arc::clone(store),
+        Arc::clone(persistence),
+        boundary,
+        sequence,
+        batch,
+        MutationRollback::from_baseline(baseline),
+        "Transaction persistence failed",
+    ));
+    match await_commit_finalizer(persistence, finalizer).await {
+        Ok(()) => RESPValue::Array(results),
         Err(error) => {
-            store.restore_entries(&baseline, &[]);
-            persistence
-                .repl_offset
-                .store(current_sequence, Ordering::SeqCst);
-            mark_persistence_failed(
-                persistence,
-                format!(
-                    "Transaction persistence failed at sequence {}: {}",
-                    sequence, error
-                ),
-            );
-            drop(write_guard);
             RESPValue::Error(format!("MISCONF transaction persistence failed: {}", error))
         }
     }
@@ -2544,8 +2590,8 @@ async fn execute_ordered_command(
         return execute_command(store, args);
     }
 
-    let write_guard = persistence.write_gate.lock().await;
-    let _visibility_guard = persistence.visibility_gate.write().await;
+    let boundary =
+        CommitBoundary::acquire(&persistence.write_gate, &persistence.visibility_gate).await;
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
         return CommandOutcome {
             response: RESPValue::Error(persistence_unavailable_message(persistence)),
@@ -2566,7 +2612,6 @@ async fn execute_ordered_command(
     let mut outcome = execute_command(store, args);
     if derive_committed_batch(store, &affected_keys, attempt.before_entries(), &[]).is_none() {
         attempt.commit();
-        drop(write_guard);
         outcome.mutation = MutationState::NoChange;
         return outcome;
     }
@@ -2576,7 +2621,6 @@ async fn execute_ordered_command(
         Ok(()) => {}
         Err(error) => {
             attempt.rollback();
-            drop(write_guard);
             return CommandOutcome {
                 response: RESPValue::Error(error.message().to_string()),
                 mutation: MutationState::NoChange,
@@ -2595,7 +2639,6 @@ async fn execute_ordered_command(
             persistence,
             "Committed effect derivation became empty after admission",
         );
-        drop(write_guard);
         return CommandOutcome {
             response: RESPValue::Error(
                 "MISCONF committed effect derivation failed after admission".to_string(),
@@ -2605,26 +2648,21 @@ async fn execute_ordered_command(
     };
 
     let sequence = current_sequence + 1;
-    persistence.repl_offset.store(sequence, Ordering::SeqCst);
-    let should_compact = match persist_ordered_mutation(persistence, sequence, &batch).await {
-        Ok(value) => {
-            attempt.commit();
+    let rollback = attempt.into_rollback();
+    let finalizer = tokio::spawn(finalize_master_commit(
+        Arc::clone(store),
+        Arc::clone(persistence),
+        boundary,
+        sequence,
+        batch,
+        rollback,
+        "Mutation persistence failed",
+    ));
+    match await_commit_finalizer(persistence, finalizer).await {
+        Ok(()) => {
             outcome.mutation = MutationState::Committed;
-            value
         }
         Err(error) => {
-            attempt.rollback();
-            persistence
-                .repl_offset
-                .store(current_sequence, Ordering::SeqCst);
-            mark_persistence_failed(
-                persistence,
-                format!(
-                    "Mutation persistence failed at sequence {}: {}",
-                    sequence, error
-                ),
-            );
-            drop(write_guard);
             return CommandOutcome {
                 response: RESPValue::Error(format!(
                     "MISCONF mutation persistence failed: {}",
@@ -2633,9 +2671,7 @@ async fn execute_ordered_command(
                 mutation: MutationState::NoChange,
             };
         }
-    };
-    drop(write_guard);
-    schedule_compaction(store, persistence, should_compact);
+    }
     outcome
 }
 
@@ -2712,8 +2748,9 @@ async fn execute_obp_command(
         }
         0x02 => {
             if args.len() >= 2 {
-                let write_guard = persistence.write_gate.lock().await;
-                let _visibility_guard = persistence.visibility_gate.write().await;
+                let boundary =
+                    CommitBoundary::acquire(&persistence.write_gate, &persistence.visibility_gate)
+                        .await;
                 if !persistence.accepting_writes.load(Ordering::SeqCst) {
                     return OBPFrame {
                         cmd: 0x00,
@@ -2761,27 +2798,19 @@ async fn execute_obp_command(
                 )
                 .expect("OBP SET must produce a committed effect");
                 let sequence = current_sequence + 1;
-                persistence.repl_offset.store(sequence, Ordering::SeqCst);
-                let persistence_result =
-                    persist_ordered_mutation(persistence, sequence, &batch).await;
-                drop(write_guard);
-                match persistence_result {
-                    Ok(should_compact) => {
-                        attempt.commit();
-                        schedule_compaction(store, persistence, should_compact);
-                    }
+                let rollback = attempt.into_rollback();
+                let finalizer = tokio::spawn(finalize_master_commit(
+                    Arc::clone(store),
+                    Arc::clone(persistence),
+                    boundary,
+                    sequence,
+                    batch,
+                    rollback,
+                    "OBP mutation persistence failed",
+                ));
+                match await_commit_finalizer(persistence, finalizer).await {
+                    Ok(()) => {}
                     Err(error) => {
-                        attempt.rollback();
-                        persistence
-                            .repl_offset
-                            .store(current_sequence, Ordering::SeqCst);
-                        mark_persistence_failed(
-                            persistence,
-                            format!(
-                                "OBP mutation persistence failed at sequence {}: {}",
-                                sequence, error
-                            ),
-                        );
                         return OBPFrame {
                             cmd: 0x00,
                             flags: 0,
@@ -2802,8 +2831,9 @@ async fn execute_obp_command(
         }
         0x03 => {
             if let Some(key) = args.first() {
-                let write_guard = persistence.write_gate.lock().await;
-                let _visibility_guard = persistence.visibility_gate.write().await;
+                let boundary =
+                    CommitBoundary::acquire(&persistence.write_gate, &persistence.visibility_gate)
+                        .await;
                 if !persistence.accepting_writes.load(Ordering::SeqCst) {
                     return OBPFrame {
                         cmd: 0x00,
@@ -2832,27 +2862,19 @@ async fn execute_obp_command(
                         effects: vec![CommittedEffect::Delete { key: key.clone() }],
                     };
                     let sequence = current_sequence + 1;
-                    persistence.repl_offset.store(sequence, Ordering::SeqCst);
-                    let persistence_result =
-                        persist_ordered_mutation(persistence, sequence, &batch).await;
-                    drop(write_guard);
-                    match persistence_result {
-                        Ok(should_compact) => {
-                            attempt.commit();
-                            schedule_compaction(store, persistence, should_compact);
-                        }
+                    let rollback = attempt.into_rollback();
+                    let finalizer = tokio::spawn(finalize_master_commit(
+                        Arc::clone(store),
+                        Arc::clone(persistence),
+                        boundary,
+                        sequence,
+                        batch,
+                        rollback,
+                        "OBP mutation persistence failed",
+                    ));
+                    match await_commit_finalizer(persistence, finalizer).await {
+                        Ok(()) => {}
                         Err(error) => {
-                            attempt.rollback();
-                            persistence
-                                .repl_offset
-                                .store(current_sequence, Ordering::SeqCst);
-                            mark_persistence_failed(
-                                persistence,
-                                format!(
-                                    "OBP mutation persistence failed at sequence {}: {}",
-                                    sequence, error
-                                ),
-                            );
                             return OBPFrame {
                                 cmd: 0x00,
                                 flags: 0,
@@ -2865,8 +2887,6 @@ async fn execute_obp_command(
                             };
                         }
                     }
-                } else {
-                    drop(write_guard);
                 }
                 (OnyxValue::Int(if deleted { 1 } else { 0 }), true)
             } else {
@@ -3000,8 +3020,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replication_ready: AtomicBool::new(recovered_replica_identity.is_some()),
         replica_lifecycle,
         accepting_writes: AtomicBool::new(true),
-        visibility_gate: tokio::sync::RwLock::new(()),
-        write_gate: tokio::sync::Mutex::new(()),
+        visibility_gate: Arc::new(tokio::sync::RwLock::new(())),
+        write_gate: Arc::new(tokio::sync::Mutex::new(())),
         paths: paths.clone(),
     });
 
@@ -4081,8 +4101,8 @@ mod tests {
             replication_ready: AtomicBool::new(false),
             replica_lifecycle: Arc::new(ReplicaLifecycle::new(true)),
             accepting_writes: AtomicBool::new(true),
-            visibility_gate: tokio::sync::RwLock::new(()),
-            write_gate: tokio::sync::Mutex::new(()),
+            visibility_gate: Arc::new(tokio::sync::RwLock::new(())),
+            write_gate: Arc::new(tokio::sync::Mutex::new(())),
             paths,
         })
     }
@@ -4139,6 +4159,67 @@ mod tests {
             Arc::new(std::sync::Mutex::new(file)),
         ));
         (persistence, worker)
+    }
+
+    struct PausedAppendWorker {
+        log_tx: mpsc::Sender<LogMessage>,
+        persisted: oneshot::Receiver<()>,
+        release: oneshot::Sender<()>,
+        completed: oneshot::Receiver<()>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    fn start_paused_append_worker(binlog_path: PathBuf) -> PausedAppendWorker {
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let (persisted_tx, persisted) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let (completed_tx, completed) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let mut persisted_tx = Some(persisted_tx);
+            let mut release_rx = Some(release_rx);
+            let mut completed_tx = Some(completed_tx);
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    LogMessage::Append {
+                        sequence,
+                        record,
+                        completion,
+                    } => {
+                        let encoded = encode_versioned_binlog_record(sequence, &record).unwrap();
+                        let mut file = OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&binlog_path)
+                            .unwrap();
+                        file.write_all(&(encoded.len() as u32).to_be_bytes())
+                            .unwrap();
+                        file.write_all(&encoded).unwrap();
+                        file.sync_all().unwrap();
+                        persisted_tx.take().unwrap().send(()).unwrap();
+                        release_rx.take().unwrap().await.unwrap();
+                        let _ = completion.send(Ok(()));
+                        completed_tx.take().unwrap().send(()).unwrap();
+                    }
+                    LogMessage::Flush { completion }
+                    | LogMessage::SyncData { completion }
+                    | LogMessage::Truncate { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            }
+        });
+        PausedAppendWorker {
+            log_tx,
+            persisted,
+            release,
+            completed,
+            handle,
+        }
+    }
+
+    async fn wait_for_commit_boundary(persistence: &Persistence) {
+        let guard = persistence.write_gate.lock().await;
+        drop(guard);
     }
 
     async fn apply_test_command(
@@ -6309,6 +6390,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aborting_client_after_binlog_write_preserves_live_and_recovered_state() {
+        let directory = TestPersistenceDirectory::new();
+        let paused = start_paused_append_worker(directory.paths.binlog.clone());
+        let persistence = test_persistence(directory.paths.clone(), paused.log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        let command_store = Arc::clone(&store);
+        let command_persistence = Arc::clone(&persistence);
+        let command = tokio::spawn(async move {
+            execute_ordered_command(
+                &command_store,
+                &command_persistence,
+                &["SET".to_string(), "key".to_string(), "value".to_string()],
+            )
+            .await
+        });
+
+        paused.persisted.await.unwrap();
+        command.abort();
+        assert!(command.await.unwrap_err().is_cancelled());
+        paused.release.send(()).unwrap();
+        paused.completed.await.unwrap();
+        wait_for_commit_boundary(&persistence).await;
+
+        assert_eq!(store.get("key"), Ok(Some("value".to_string())));
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
+
+        drop(persistence);
+        paused.handle.await.unwrap();
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(recovered.get("key"), Ok(Some("value".to_string())));
+    }
+
+    #[tokio::test]
+    async fn aborting_transaction_after_binlog_write_completes_the_durable_batch() {
+        let directory = TestPersistenceDirectory::new();
+        let paused = start_paused_append_worker(directory.paths.binlog.clone());
+        let persistence = test_persistence(directory.paths.clone(), paused.log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        let transaction_store = Arc::clone(&store);
+        let transaction_persistence = Arc::clone(&persistence);
+        let transaction = tokio::spawn(async move {
+            execute_transaction(
+                &transaction_store,
+                &transaction_persistence,
+                vec![
+                    vec!["SET".to_string(), "first".to_string(), "one".to_string()],
+                    vec!["SET".to_string(), "second".to_string(), "two".to_string()],
+                ],
+                false,
+            )
+            .await
+        });
+
+        paused.persisted.await.unwrap();
+        transaction.abort();
+        assert!(transaction.await.unwrap_err().is_cancelled());
+        paused.release.send(()).unwrap();
+        paused.completed.await.unwrap();
+        wait_for_commit_boundary(&persistence).await;
+
+        assert_eq!(store.get("first"), Ok(Some("one".to_string())));
+        assert_eq!(store.get("second"), Ok(Some("two".to_string())));
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
+
+        drop(persistence);
+        paused.handle.await.unwrap();
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(recovered.get("first"), Ok(Some("one".to_string())));
+        assert_eq!(recovered.get("second"), Ok(Some("two".to_string())));
+    }
+
+    #[tokio::test]
+    async fn aborting_obp_client_after_binlog_write_completes_the_commit() {
+        let directory = TestPersistenceDirectory::new();
+        let paused = start_paused_append_worker(directory.paths.binlog.clone());
+        let persistence = test_persistence(directory.paths.clone(), paused.log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        let obp_store = Arc::clone(&store);
+        let obp_persistence = Arc::clone(&persistence);
+        let command = tokio::spawn(async move {
+            let mut authenticated = true;
+            execute_obp_command(
+                &obp_store,
+                &obp_persistence,
+                OBPFrame {
+                    cmd: 0x02,
+                    flags: 0,
+                    correlation_id: 7,
+                    args: vec![Bytes::from_static(b"key"), Bytes::from_static(b"value")],
+                    payload: None,
+                },
+                &mut authenticated,
+                false,
+            )
+            .await
+        });
+
+        paused.persisted.await.unwrap();
+        command.abort();
+        assert!(command.await.unwrap_err().is_cancelled());
+        paused.release.send(()).unwrap();
+        paused.completed.await.unwrap();
+        wait_for_commit_boundary(&persistence).await;
+
+        assert_eq!(store.get("key"), Ok(Some("value".to_string())));
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
+
+        drop(persistence);
+        paused.handle.await.unwrap();
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(recovered.get("key"), Ok(Some("value".to_string())));
+    }
+
+    #[tokio::test]
+    async fn aborting_replica_read_after_binlog_write_completes_effect_application() {
+        let directory = TestPersistenceDirectory::new();
+        let paused = start_paused_append_worker(directory.paths.binlog.clone());
+        let persistence = test_persistence(directory.paths.clone(), paused.log_tx, 0);
+        persistence.replication_ready.store(true, Ordering::SeqCst);
+        let store = Arc::new(ShardedStore::new());
+        let replica_store = Arc::clone(&store);
+        let replica_persistence = Arc::clone(&persistence);
+        let batch = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"replicated"),
+            entry: PersistentEntry {
+                value: OnyxValue::Blob(Bytes::from_static(b"value")),
+                expires_at: None,
+            },
+        }])
+        .unwrap();
+        let apply = tokio::spawn(async move {
+            persist_and_apply_replica_effect(&replica_store, &replica_persistence, 1, &batch).await
+        });
+
+        paused.persisted.await.unwrap();
+        assert_eq!(store.get("replicated"), Ok(None));
+        apply.abort();
+        assert!(apply.await.unwrap_err().is_cancelled());
+        paused.release.send(()).unwrap();
+        paused.completed.await.unwrap();
+        wait_for_commit_boundary(&persistence).await;
+
+        assert_eq!(store.get("replicated"), Ok(Some("value".to_string())));
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+
+        drop(persistence);
+        paused.handle.await.unwrap();
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(recovered.get("replicated"), Ok(Some("value".to_string())));
+    }
+
+    #[tokio::test]
+    async fn promotion_waits_for_a_detached_replica_commit_finalizer() {
+        let directory = TestPersistenceDirectory::new();
+        let paused = start_paused_append_worker(directory.paths.binlog.clone());
+        let persistence = test_persistence(directory.paths.clone(), paused.log_tx, 0);
+        persistence.replication_ready.store(true, Ordering::SeqCst);
+        let store = Arc::new(ShardedStore::new());
+        let replica_store = Arc::clone(&store);
+        let replica_persistence = Arc::clone(&persistence);
+        let batch = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"before-promotion"),
+            entry: PersistentEntry {
+                value: OnyxValue::Blob(Bytes::from_static(b"accepted")),
+                expires_at: None,
+            },
+        }])
+        .unwrap();
+        let apply = tokio::spawn(async move {
+            persist_and_apply_replica_effect(&replica_store, &replica_persistence, 1, &batch).await
+        });
+
+        paused.persisted.await.unwrap();
+        apply.abort();
+        assert!(apply.await.unwrap_err().is_cancelled());
+        assert!(persistence.write_gate.try_lock().is_err());
+
+        let promotion_persistence = Arc::clone(&persistence);
+        let promotion =
+            tokio::spawn(async move { prepare_replica_promotion(&promotion_persistence).await });
+        tokio::task::yield_now().await;
+        assert!(!promotion.is_finished());
+
+        paused.release.send(()).unwrap();
+        paused.completed.await.unwrap();
+        promotion.await.unwrap().unwrap();
+
+        assert_eq!(
+            store.get("before-promotion"),
+            Ok(Some("accepted".to_string()))
+        );
+        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert!(persistence.promote_to_master.load(Ordering::SeqCst));
+        assert!(!persistence.replication_ready.load(Ordering::SeqCst));
+
+        drop(persistence);
+        paused.handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn binlog_append_failure_is_not_acknowledged_or_replicated() {
         let directory = TestPersistenceDirectory::new();
         let (log_tx, mut receiver) = mpsc::channel(8);
@@ -7416,7 +7708,7 @@ mod tests {
         ));
         let sequence = persistence.repl_offset.load(Ordering::SeqCst) + 1;
         persistence.repl_offset.store(sequence, Ordering::SeqCst);
-        persist_ordered_mutation(&persistence, sequence, &batch)
+        persist_and_publish_master_batch(&persistence, sequence, &batch)
             .await
             .unwrap();
         let expected = persistent_state(&store);
