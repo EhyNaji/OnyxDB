@@ -1211,7 +1211,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     let _write_guard = persistence.write_gate.lock().await;
                     let backlog = persistence.backlog.lock().unwrap();
                     let backlog_oldest = backlog.front().map(|(off, _)| *off);
-                    let current_offset = persistence.repl_offset.load(Ordering::SeqCst);
+                    let current_offset = persistence.sequence();
                     if partial_resync_possible(requested_offset, backlog_oldest, current_offset) {
                         Some(
                             backlog
@@ -1334,10 +1334,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             } else {
                 let (full_sync_offset, snapshot_entries) = {
                     let _write_guard = persistence.write_gate.lock().await;
-                    (
-                        persistence.repl_offset.load(Ordering::SeqCst),
-                        store.raw_entries(),
-                    )
+                    (persistence.sequence(), store.raw_entries())
                 };
                 let marker = format!(
                     "+FULLRESYNC3 {} {} {}\r\n",
@@ -1531,7 +1528,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             if cmd.eq_ignore_ascii_case("INFO")
                 && let RESPValue::BulkString(Some(ref mut text)) = resp
             {
-                let repl_offset = persistence.repl_offset.load(Ordering::SeqCst);
+                let repl_offset = persistence.sequence();
                 let statuses = persistence.replica_status.lock().unwrap();
                 let connected_replicas = statuses.len();
                 let max_lag = statuses
@@ -1622,7 +1619,7 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
         1
     };
 
-    let repl_offset = persistence.repl_offset.load(Ordering::SeqCst);
+    let repl_offset = persistence.sequence();
     let statuses = persistence.replica_status.lock().unwrap();
     let connected_replicas = statuses.len();
     let max_lag = statuses
@@ -1840,8 +1837,9 @@ async fn persist_and_publish_master_batch(
     sequence: u64,
     batch: &CommittedBatch,
 ) -> Result<bool, PersistenceError> {
-    persistence.binlog.append_batch(sequence, batch).await?;
-    persistence.repl_offset.store(sequence, Ordering::SeqCst);
+    let should_compact = persistence
+        .accept_next_batch(sequence, batch, COMPACTION_THRESHOLD)
+        .await?;
     // The exact same committed batch is published to the backlog and live
     // replication only after its binlog append has been acknowledged.
     {
@@ -1856,7 +1854,7 @@ async fn persist_and_publish_master_batch(
     }
     let _ = persistence.replica_tx.send((sequence, batch.clone()));
 
-    Ok(persistence.record_persisted_write(COMPACTION_THRESHOLD))
+    Ok(should_compact)
 }
 
 async fn finalize_master_commit(
@@ -1941,7 +1939,7 @@ async fn persist_and_apply_replica_effect(
             "Replica has no installed durable synchronization baseline",
         ));
     }
-    let current = persistence.repl_offset.load(Ordering::SeqCst);
+    let current = persistence.sequence();
     let expected = current
         .checked_add(1)
         .ok_or_else(|| PersistenceError::new("Replica sequence is exhausted"))?;
@@ -1955,25 +1953,23 @@ async fn persist_and_apply_replica_effect(
     let persistence_for_finalizer = Arc::clone(persistence);
     let batch = batch.clone();
     let finalizer = tokio::spawn(async move {
-        if let Err(error) = persistence_for_finalizer
-            .binlog
-            .append_batch(sequence, &batch)
+        let should_compact = match persistence_for_finalizer
+            .accept_next_batch(sequence, &batch, COMPACTION_THRESHOLD)
             .await
         {
-            mark_persistence_failed(
-                &persistence_for_finalizer,
-                format!(
-                    "Unable to persist replicated effect at sequence {}: {}",
-                    sequence, error
-                ),
-            );
-            return Err(error);
-        }
+            Ok(should_compact) => should_compact,
+            Err(error) => {
+                mark_persistence_failed(
+                    &persistence_for_finalizer,
+                    format!(
+                        "Unable to persist replicated effect at sequence {}: {}",
+                        sequence, error
+                    ),
+                );
+                return Err(error);
+            }
+        };
         apply_committed_batch(&store, &batch);
-        persistence_for_finalizer
-            .repl_offset
-            .store(sequence, Ordering::SeqCst);
-        let should_compact = persistence_for_finalizer.record_persisted_write(COMPACTION_THRESHOLD);
         drop(boundary);
         schedule_compaction(&store, &persistence_for_finalizer, should_compact);
         Ok(())
@@ -2061,10 +2057,9 @@ async fn install_full_sync(
     )?;
 
     store.replace_all(entries);
-    persistence.repl_offset.store(sequence, Ordering::SeqCst);
+    persistence.install_baseline(sequence);
     persistence.upstream_replid.store(replid, Ordering::SeqCst);
     persistence.replication_ready.store(true, Ordering::SeqCst);
-    persistence.write_count.store(0, Ordering::SeqCst);
     persistence.backlog.lock().unwrap().clear();
     Ok(())
 }
@@ -2143,7 +2138,7 @@ async fn execute_transaction(
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
         return RESPValue::Error(persistence_unavailable_message(persistence));
     }
-    let current_sequence = persistence.repl_offset.load(Ordering::SeqCst);
+    let current_sequence = persistence.sequence();
     if current_sequence == u64::MAX {
         mark_persistence_failed(persistence, "Persistence sequence is exhausted");
         return RESPValue::Error("MISCONF persistence sequence is exhausted".to_string());
@@ -2240,7 +2235,7 @@ async fn execute_ordered_command(
             mutation: MutationState::NoChange,
         };
     }
-    let current_sequence = persistence.repl_offset.load(Ordering::SeqCst);
+    let current_sequence = persistence.sequence();
     if current_sequence == u64::MAX {
         mark_persistence_failed(persistence, "Persistence sequence is exhausted");
         return CommandOutcome {
@@ -2400,7 +2395,7 @@ async fn execute_obp_command(
                         payload: Some(Bytes::from("MISCONF persistence is unavailable")),
                     };
                 }
-                let current_sequence = persistence.repl_offset.load(Ordering::SeqCst);
+                let current_sequence = persistence.sequence();
                 if current_sequence == u64::MAX {
                     mark_persistence_failed(persistence, "Persistence sequence is exhausted");
                     return OBPFrame {
@@ -2481,7 +2476,7 @@ async fn execute_obp_command(
                         payload: Some(Bytes::from("MISCONF persistence is unavailable")),
                     };
                 }
-                let current_sequence = persistence.repl_offset.load(Ordering::SeqCst);
+                let current_sequence = persistence.sequence();
                 if current_sequence == u64::MAX {
                     mark_persistence_failed(persistence, "Persistence sequence is exhausted");
                     return OBPFrame {
@@ -4923,7 +4918,7 @@ mod tests {
             binary.value,
             OnyxValue::Blob(value) if value == Bytes::from_static(b"value\r\n\0\xff")
         ));
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 40);
+        assert_eq!(persistence.sequence(), 40);
         assert!(persistence.replication_ready.load(Ordering::SeqCst));
         assert_eq!(
             load_durable_replica_state(&directory.paths, 40).unwrap(),
@@ -4955,7 +4950,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(duplicate.to_string().contains("expected 42, received 41"));
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 41);
+        assert_eq!(persistence.sequence(), 41);
         assert!(matches!(
             store
                 .get_entry(&Bytes::from_static(b"counter"))
@@ -5524,7 +5519,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 5);
+        assert_eq!(persistence.sequence(), 5);
         assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
         assert!(!persistence.replication_ready.load(Ordering::SeqCst));
         assert!(matches!(
@@ -5754,7 +5749,7 @@ mod tests {
         .await;
 
         assert!(matches!(response, RESPValue::Array(results) if results.len() == 2));
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert_eq!(persistence.sequence(), 1);
         {
             let backlog = persistence.backlog.lock().unwrap();
             assert_eq!(backlog.len(), 1);
@@ -5801,7 +5796,7 @@ mod tests {
             store.lrange("list", 0, -1),
             Ok(vec!["original".to_string()])
         );
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 0);
+        assert_eq!(persistence.sequence(), 0);
         assert!(persistence.backlog.lock().unwrap().is_empty());
 
         drop(persistence);
@@ -5958,7 +5953,7 @@ mod tests {
         assert!(matches!(response, RESPValue::Error(message) if message.starts_with("MISCONF")));
         assert_eq!(store.get("existing"), Ok(Some("before".to_string())));
         assert_eq!(store.get("created"), Ok(None));
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 0);
+        assert_eq!(persistence.sequence(), 0);
         assert!(persistence.backlog.lock().unwrap().is_empty());
         assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
 
@@ -6040,7 +6035,7 @@ mod tests {
         wait_for_commit_boundary(&persistence).await;
 
         assert_eq!(store.get("key"), Ok(Some("value".to_string())));
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert_eq!(persistence.sequence(), 1);
         assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
 
         drop(persistence);
@@ -6081,7 +6076,7 @@ mod tests {
 
         assert_eq!(store.get("first"), Ok(Some("one".to_string())));
         assert_eq!(store.get("second"), Ok(Some("two".to_string())));
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert_eq!(persistence.sequence(), 1);
         assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
 
         drop(persistence);
@@ -6127,7 +6122,7 @@ mod tests {
         wait_for_commit_boundary(&persistence).await;
 
         assert_eq!(store.get("key"), Ok(Some("value".to_string())));
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert_eq!(persistence.sequence(), 1);
         assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
 
         drop(persistence);
@@ -6168,7 +6163,7 @@ mod tests {
         wait_for_commit_boundary(&persistence).await;
 
         assert_eq!(store.get("replicated"), Ok(Some("value".to_string())));
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert_eq!(persistence.sequence(), 1);
 
         drop(persistence);
         paused.handle.await.unwrap();
@@ -6218,7 +6213,7 @@ mod tests {
             store.get("before-promotion"),
             Ok(Some("accepted".to_string()))
         );
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert_eq!(persistence.sequence(), 1);
         assert!(persistence.promote_to_master.load(Ordering::SeqCst));
         assert!(!persistence.replication_ready.load(Ordering::SeqCst));
 
@@ -6258,7 +6253,7 @@ mod tests {
         assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
         assert!(persistence.backlog.lock().unwrap().is_empty());
         assert!(live_receiver.try_recv().is_err());
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 0);
+        assert_eq!(persistence.sequence(), 0);
         assert_eq!(store.get("key"), Ok(None));
 
         let second_command = vec![
@@ -6307,10 +6302,7 @@ mod tests {
             live_sequences.push(sequence);
         }
         assert_eq!(live_sequences, backlog_sequences);
-        assert_eq!(
-            persistence.repl_offset.load(Ordering::SeqCst),
-            MUTATION_COUNT
-        );
+        assert_eq!(persistence.sequence(), MUTATION_COUNT);
 
         persistence.binlog.flush().await.unwrap();
         let mut binlog_sequences = Vec::new();
@@ -6898,7 +6890,7 @@ mod tests {
         let outcome = execute_ordered_command(&store, &persistence, &command).await;
         assert!(matches!(outcome.response, RESPValue::Integer(0)));
         assert_eq!(outcome.mutation, MutationState::NoChange);
-        assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
+        assert_eq!(persistence.sequence(), 1);
         assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
 
         persistence.binlog.flush().await.unwrap();
@@ -6928,7 +6920,7 @@ mod tests {
             &["SET", "maximum", "9223372036854775807"],
         )
         .await;
-        let offset_before_overflow = persistence.repl_offset.load(Ordering::SeqCst);
+        let offset_before_overflow = persistence.sequence();
         let overflow = vec!["INCR".to_string(), "maximum".to_string()];
         let outcome = execute_ordered_command(&store, &persistence, &overflow).await;
         assert!(matches!(
@@ -6936,10 +6928,7 @@ mod tests {
             RESPValue::Error(message) if message.contains("overflow")
         ));
         assert_eq!(outcome.mutation, MutationState::NoChange);
-        assert_eq!(
-            persistence.repl_offset.load(Ordering::SeqCst),
-            offset_before_overflow
-        );
+        assert_eq!(persistence.sequence(), offset_before_overflow);
 
         persistence.binlog.flush().await.unwrap();
         drop(persistence);
@@ -7332,8 +7321,7 @@ mod tests {
             batch.effects.last(),
             Some(CommittedEffect::Put { .. })
         ));
-        let sequence = persistence.repl_offset.load(Ordering::SeqCst) + 1;
-        persistence.repl_offset.store(sequence, Ordering::SeqCst);
+        let sequence = persistence.next_sequence().unwrap();
         persist_and_publish_master_batch(&persistence, sequence, &batch)
             .await
             .unwrap();

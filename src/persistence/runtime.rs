@@ -27,7 +27,7 @@ pub(crate) struct CommitRuntime {
     pub(crate) write_gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) paths: super::PersistencePaths,
     /// Last sequence durably accepted and made authoritative in live state.
-    pub(crate) repl_offset: AtomicU64,
+    repl_offset: AtomicU64,
     pub(crate) failure: std::sync::Mutex<Option<String>>,
 }
 
@@ -50,12 +50,45 @@ impl CommitRuntime {
         }
     }
 
-    pub(crate) fn record_persisted_write(&self, compaction_threshold: usize) -> bool {
+    fn record_persisted_write(&self, compaction_threshold: usize) -> bool {
         self.write_count.fetch_add(1, Ordering::SeqCst) + 1 >= compaction_threshold
             && self
                 .compaction_pending
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
+    }
+
+    pub(crate) fn sequence(&self) -> u64 {
+        self.repl_offset.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn next_sequence(&self) -> Result<u64, PersistenceError> {
+        self.sequence()
+            .checked_add(1)
+            .ok_or_else(|| PersistenceError::new("Persistence sequence is exhausted"))
+    }
+
+    pub(crate) async fn accept_next_batch(
+        &self,
+        sequence: u64,
+        batch: &CommittedBatch,
+        compaction_threshold: usize,
+    ) -> Result<bool, PersistenceError> {
+        let expected = self.next_sequence()?;
+        if sequence != expected {
+            return Err(PersistenceError::new(format!(
+                "Persistence sequence mismatch: expected {}, received {}",
+                expected, sequence
+            )));
+        }
+        self.binlog.append_batch(sequence, batch).await?;
+        self.repl_offset.store(sequence, Ordering::SeqCst);
+        Ok(self.record_persisted_write(compaction_threshold))
+    }
+
+    pub(crate) fn install_baseline(&self, sequence: u64) {
+        self.repl_offset.store(sequence, Ordering::SeqCst);
+        self.write_count.store(0, Ordering::SeqCst);
     }
 
     pub(crate) async fn acquire_commit_boundary(&self) -> CommitBoundary {
@@ -73,7 +106,7 @@ impl CommitRuntime {
             .await
             .map_err(|error| PersistenceError::new(format!("Binlog flush failed: {}", error)))?;
 
-        let watermark = self.repl_offset.load(Ordering::SeqCst);
+        let watermark = self.sequence();
         let entries = store.raw_entries();
         let paths = self.paths.clone();
         tokio::task::spawn_blocking(move || write_snapshot_file(entries, watermark, &paths))
