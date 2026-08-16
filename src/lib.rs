@@ -5,7 +5,9 @@
 //! `onyxdb` binary until their invariants have dedicated module boundaries.
 
 pub mod client;
+pub mod clock;
 pub mod command;
 pub mod engine;
 pub mod protocol;
 pub mod resp;
+pub mod store;

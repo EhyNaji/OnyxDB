@@ -4,12 +4,16 @@ use config::{FsyncPolicy, ServerConfig, UpstreamCredentials};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use onyxdb::clock::unix_seconds as now;
 use onyxdb::command::is_write_command;
-use onyxdb::engine::{
-    DataEntry, EngineStats, EntryMutation, EvictionPolicy, OnyxEngine, OnyxValue,
-};
+#[cfg(test)]
+use onyxdb::engine::EvictionPolicy;
+use onyxdb::engine::{DataEntry, OnyxValue};
 use onyxdb::protocol::{MAX_OBP_FRAME_SIZE, OBPFrame};
 use onyxdb::resp::{CLIENT_RESP_LIMITS, RESPReadLimits, RESPValue, read_command_with_timeouts};
+#[cfg(test)]
+use onyxdb::store::StoreError;
+use onyxdb::store::{MAX_KEYS, ShardedStore, is_expired};
 #[cfg(test)]
 use onyxdb::{protocol, resp};
 use std::collections::HashSet;
@@ -51,7 +55,6 @@ const MAX_SNAPSHOT_RECORD_SIZE: usize = 512 * 1024 * 1024 + 1024;
 const REPLICATION_CHUNK_SIZE: usize = 256 * 1024;
 const MAX_REPLICATION_FRAME_BULK_SIZE: i64 = (REPLICATION_CHUNK_SIZE * 2 + 64) as i64;
 const COMPACTION_THRESHOLD: usize = 100000;
-const MAX_KEYS: usize = 1_000_000;
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const CLIENT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 const OBP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -277,8 +280,6 @@ fn open_binlog_file(path: &Path) -> File {
 // Admission evaluates the authoritative post-mutation state. A value of zero
 // disables the limit; otherwise the configured policy decides whether the
 // command can evict unrelated keys or must fail without changing state.
-// Cached wall-clock time for inexpensive expiration checks.
-static CURRENT_TIME: AtomicU64 = AtomicU64::new(0);
 static START_TIME: AtomicU64 = AtomicU64::new(0);
 static IS_REPLICA: AtomicBool = AtomicBool::new(false);
 // A master gets a new replication ID on every process start. The ID binds an
@@ -293,980 +294,6 @@ static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_COMMANDS: AtomicUsize = AtomicUsize::new(0);
 static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 static CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
-fn now() -> u64 {
-    CURRENT_TIME.load(Ordering::Relaxed)
-}
-
-pub struct ShardedStore {
-    engine: OnyxEngine,
-    maxmemory_bytes: usize,
-    maxmemory_policy: EvictionPolicy,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StoreError {
-    WrongType,
-}
-
-impl StoreError {
-    fn message(self) -> &'static str {
-        match self {
-            Self::WrongType => "WRONGTYPE Operation against a key holding the wrong kind of value",
-        }
-    }
-}
-
-impl Default for ShardedStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ShardedStore {
-    pub fn new() -> Self {
-        Self::with_maxmemory(0, EvictionPolicy::NoEviction)
-    }
-
-    pub fn with_maxmemory(maxmemory_bytes: usize, maxmemory_policy: EvictionPolicy) -> Self {
-        Self {
-            engine: OnyxEngine::new(),
-            maxmemory_bytes,
-            maxmemory_policy,
-        }
-    }
-
-    // --- String operations ---
-    pub fn set(&self, key: String, value: String) {
-        self.engine
-            .set(Bytes::from(key), OnyxValue::Blob(Bytes::from(value)), None);
-    }
-
-    pub fn set_raw(&self, key: String, entry: DataEntry) {
-        self.engine
-            .set(Bytes::from(key), entry.value, entry.expires_at);
-    }
-
-    pub fn get(&self, key: &str) -> Result<Option<String>, StoreError> {
-        let result = self
-            .engine
-            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
-                OnyxValue::Blob(b) => Ok(String::from_utf8_lossy(b).to_string()),
-                OnyxValue::Int(n) => Ok(n.to_string()),
-                _ => Err(StoreError::WrongType),
-            });
-        result.transpose()
-    }
-
-    pub fn get_raw(&self, key: &str) -> Option<DataEntry> {
-        self.engine.get(&Bytes::from(key.to_string()))
-    }
-
-    pub fn delete(&self, key: &str) -> bool {
-        self.engine.delete(&Bytes::from(key.to_string()))
-    }
-
-    pub fn exists(&self, key: &str) -> bool {
-        self.engine.peek(&Bytes::from(key.to_string())).is_some()
-    }
-
-    pub fn expire_at(&self, key: &str, timestamp: u64) -> bool {
-        // Update expiration under one engine lock without cloning the value.
-        self.engine
-            .set_expiry(&Bytes::from(key.to_string()), timestamp)
-    }
-
-    pub fn expire(&self, key: &str, seconds: u64) -> bool {
-        self.expire_at(key, now().saturating_add(seconds))
-    }
-
-    pub fn ttl(&self, key: &str) -> i64 {
-        self.engine
-            .read(&Bytes::from(key.to_string()), |entry| {
-                if let Some(exp) = entry.expires_at {
-                    let remaining = exp.saturating_sub(now());
-                    if remaining == 0 {
-                        -2
-                    } else {
-                        i64::try_from(remaining).unwrap_or(i64::MAX)
-                    }
-                } else {
-                    -1
-                }
-            })
-            .unwrap_or(-2)
-    }
-
-    pub fn incr(&self, key: &str) -> Result<i64, &'static str> {
-        self.incrby(key, 1)
-    }
-
-    pub fn incrby(&self, key: &str, delta: i64) -> Result<i64, &'static str> {
-        // Read, overflow validation, and mutation occur under one engine lock,
-        // so concurrent increments cannot overwrite each other.
-        self.engine.update_or_insert(
-            Bytes::from(key.to_string()),
-            || OnyxValue::Int(0),
-            move |v| {
-                let current = match v {
-                    OnyxValue::Int(n) => *n,
-                    OnyxValue::Blob(b) => std::str::from_utf8(b)
-                        .ok()
-                        .and_then(|value| value.parse::<i64>().ok())
-                        .ok_or("ERR value is not an integer")?,
-                    _ => return Err("ERR value is not an integer"),
-                };
-                let new_val = current
-                    .checked_add(delta)
-                    .ok_or("ERR increment or decrement would overflow")?;
-                *v = OnyxValue::Int(new_val);
-                Ok(new_val)
-            },
-        )
-    }
-
-    pub fn append(&self, key: &str, suffix: &str) -> Result<usize, StoreError> {
-        let suffix_owned = suffix.to_string();
-        // Append under one engine lock so concurrent suffixes are not lost.
-        self.engine.update_or_insert(
-            Bytes::from(key.to_string()),
-            || OnyxValue::Blob(Bytes::new()),
-            move |v| {
-                let mut s = match v {
-                    OnyxValue::Blob(b) => String::from_utf8_lossy(b).to_string(),
-                    OnyxValue::Int(value) => value.to_string(),
-                    _ => return Err(StoreError::WrongType),
-                };
-                s.push_str(&suffix_owned);
-                let len = s.len();
-                *v = OnyxValue::Blob(Bytes::from(s));
-                Ok(len)
-            },
-        )
-    }
-
-    pub fn strlen(&self, key: &str) -> Result<usize, StoreError> {
-        self.get(key)
-            .map(|value| value.map_or(0, |value| value.len()))
-    }
-
-    pub fn getset(&self, key: &str, new_value: &str) -> Result<Option<String>, StoreError> {
-        let new_value_owned = new_value.to_string();
-        self.engine.update_entry_or_insert_with_presence(
-            Bytes::from(key.to_string()),
-            || OnyxValue::Blob(Bytes::new()),
-            move |entry, existed| {
-                let old = match &entry.value {
-                    OnyxValue::Blob(b) => String::from_utf8_lossy(b).to_string(),
-                    OnyxValue::Int(n) => n.to_string(),
-                    _ => return Err(StoreError::WrongType),
-                };
-                entry.value = OnyxValue::Blob(Bytes::from(new_value_owned));
-                entry.expires_at = None;
-                Ok(existed.then_some(old))
-            },
-        )
-    }
-
-    pub fn setnx(&self, key: &str, value: &str) -> bool {
-        // The engine performs the presence check and insertion atomically.
-        self.engine.set_if_absent(
-            Bytes::from(key.to_string()),
-            OnyxValue::Blob(Bytes::from(value.to_string())),
-        )
-    }
-
-    // --- List operations ---
-    pub fn lpush(&self, key: &str, item: String) -> Result<usize, StoreError> {
-        let item_b = Bytes::from(item);
-        self.engine.update_or_insert(
-            Bytes::from(key.to_string()),
-            || OnyxValue::List(Vec::new()),
-            move |v| match v {
-                OnyxValue::List(l) => {
-                    l.insert(0, item_b);
-                    Ok(l.len())
-                }
-                _ => Err(StoreError::WrongType),
-            },
-        )
-    }
-
-    pub fn rpush(&self, key: &str, item: String) -> Result<usize, StoreError> {
-        let item_b = Bytes::from(item);
-        self.engine.update_or_insert(
-            Bytes::from(key.to_string()),
-            || OnyxValue::List(Vec::new()),
-            move |v| match v {
-                OnyxValue::List(l) => {
-                    l.push(item_b);
-                    Ok(l.len())
-                }
-                _ => Err(StoreError::WrongType),
-            },
-        )
-    }
-
-    pub fn lpop(&self, key: &str) -> Result<Option<String>, StoreError> {
-        let key_b = Bytes::from(key.to_string());
-        let result = self
-            .engine
-            .update_if_exists_with_action(&key_b, |v| match v {
-                OnyxValue::List(l) if !l.is_empty() => {
-                    let item = l.remove(0);
-                    let result = Ok(Some(String::from_utf8_lossy(&item).to_string()));
-                    if l.is_empty() {
-                        EntryMutation::Delete(result)
-                    } else {
-                        EntryMutation::Keep(result)
-                    }
-                }
-                OnyxValue::List(_) => EntryMutation::Keep(Ok(None)),
-                _ => EntryMutation::Keep(Err(StoreError::WrongType)),
-            });
-        result.unwrap_or(Ok(None))
-    }
-
-    pub fn rpop(&self, key: &str) -> Result<Option<String>, StoreError> {
-        let key_b = Bytes::from(key.to_string());
-        let result = self
-            .engine
-            .update_if_exists_with_action(&key_b, |v| match v {
-                OnyxValue::List(l) if !l.is_empty() => {
-                    let item = l.pop().unwrap();
-                    let result = Ok(Some(String::from_utf8_lossy(&item).to_string()));
-                    if l.is_empty() {
-                        EntryMutation::Delete(result)
-                    } else {
-                        EntryMutation::Keep(result)
-                    }
-                }
-                OnyxValue::List(_) => EntryMutation::Keep(Ok(None)),
-                _ => EntryMutation::Keep(Err(StoreError::WrongType)),
-            });
-        result.unwrap_or(Ok(None))
-    }
-
-    /// Implements inclusive Redis-style LRANGE bounds. Negative indices count
-    /// from the end and out-of-range values are clamped.
-    pub fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, StoreError> {
-        let result = self
-            .engine
-            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
-                OnyxValue::List(l) => {
-                    let len = l.len() as i64;
-                    if len == 0 {
-                        return Ok(Vec::new());
-                    }
-                    let norm = |idx: i64| -> i64 { if idx < 0 { (len + idx).max(0) } else { idx } };
-                    let s = norm(start);
-                    let mut e = norm(stop);
-                    if s > len - 1 || s > e {
-                        return Ok(Vec::new());
-                    }
-                    if e > len - 1 {
-                        e = len - 1;
-                    }
-                    Ok(l[s as usize..=e as usize]
-                        .iter()
-                        .map(|b| String::from_utf8_lossy(b).to_string())
-                        .collect())
-                }
-                _ => Err(StoreError::WrongType),
-            });
-        result.unwrap_or(Ok(Vec::new()))
-    }
-
-    pub fn llen(&self, key: &str) -> Result<usize, StoreError> {
-        let result = self
-            .engine
-            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
-                OnyxValue::List(l) => Ok(l.len()),
-                _ => Err(StoreError::WrongType),
-            });
-        result.unwrap_or(Ok(0))
-    }
-
-    // --- Hash operations ---
-    pub fn hset(&self, key: &str, field: &str, value: &str) -> Result<bool, StoreError> {
-        let field_b = Bytes::from(field.to_string());
-        let value_b = Bytes::from(value.to_string());
-        self.engine.update_or_insert(
-            Bytes::from(key.to_string()),
-            || OnyxValue::Hash(std::collections::HashMap::new()),
-            move |v| match v {
-                OnyxValue::Hash(h) => Ok(h.insert(field_b, value_b).is_none()),
-                _ => Err(StoreError::WrongType),
-            },
-        )
-    }
-
-    pub fn hget(&self, key: &str, field: &str) -> Result<Option<String>, StoreError> {
-        let field_b = Bytes::from(field.to_string());
-        self.engine
-            .read(&Bytes::from(key.to_string()), move |entry| {
-                match &entry.value {
-                    OnyxValue::Hash(h) => Ok(h
-                        .get(&field_b)
-                        .map(|b| String::from_utf8_lossy(b).to_string())),
-                    _ => Err(StoreError::WrongType),
-                }
-            })
-            .unwrap_or(Ok(None))
-    }
-
-    pub fn hgetall(&self, key: &str) -> Result<Vec<(String, String)>, StoreError> {
-        self.engine
-            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
-                OnyxValue::Hash(h) => Ok(h
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            String::from_utf8_lossy(k).to_string(),
-                            String::from_utf8_lossy(v).to_string(),
-                        )
-                    })
-                    .collect()),
-                _ => Err(StoreError::WrongType),
-            })
-            .unwrap_or(Ok(Vec::new()))
-    }
-
-    pub fn hdel(&self, key: &str, field: &str) -> Result<bool, StoreError> {
-        let field_b = Bytes::from(field.to_string());
-        let key_b = Bytes::from(key.to_string());
-        let result = self
-            .engine
-            .update_if_exists_with_action(&key_b, move |v| match v {
-                OnyxValue::Hash(h) => {
-                    let removed = h.remove(&field_b).is_some();
-                    let result = Ok(removed);
-                    if removed && h.is_empty() {
-                        EntryMutation::Delete(result)
-                    } else {
-                        EntryMutation::Keep(result)
-                    }
-                }
-                _ => EntryMutation::Keep(Err(StoreError::WrongType)),
-            });
-        result.unwrap_or(Ok(false))
-    }
-
-    pub fn hkeys(&self, key: &str) -> Result<Vec<String>, StoreError> {
-        self.hgetall(key)
-            .map(|hash| hash.into_iter().map(|(field, _)| field).collect())
-    }
-
-    pub fn hvals(&self, key: &str) -> Result<Vec<String>, StoreError> {
-        self.hgetall(key)
-            .map(|hash| hash.into_iter().map(|(_, value)| value).collect())
-    }
-
-    // --- Set operations ---
-    pub fn sadd(&self, key: &str, member: &str) -> Result<bool, StoreError> {
-        let member_b = Bytes::from(member.to_string());
-        self.engine.update_or_insert(
-            Bytes::from(key.to_string()),
-            || OnyxValue::Set(std::collections::HashSet::new()),
-            move |v| match v {
-                OnyxValue::Set(s) => Ok(s.insert(member_b)),
-                _ => Err(StoreError::WrongType),
-            },
-        )
-    }
-
-    pub fn smembers(&self, key: &str) -> Result<Vec<String>, StoreError> {
-        self.engine
-            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
-                OnyxValue::Set(s) => Ok(s
-                    .iter()
-                    .map(|b| String::from_utf8_lossy(b).to_string())
-                    .collect()),
-                _ => Err(StoreError::WrongType),
-            })
-            .unwrap_or(Ok(Vec::new()))
-    }
-
-    pub fn srem(&self, key: &str, member: &str) -> Result<bool, StoreError> {
-        let member_b = Bytes::from(member.to_string());
-        let key_b = Bytes::from(key.to_string());
-        let result = self
-            .engine
-            .update_if_exists_with_action(&key_b, move |v| match v {
-                OnyxValue::Set(s) => {
-                    let removed = s.remove(&member_b);
-                    let result = Ok(removed);
-                    if removed && s.is_empty() {
-                        EntryMutation::Delete(result)
-                    } else {
-                        EntryMutation::Keep(result)
-                    }
-                }
-                _ => EntryMutation::Keep(Err(StoreError::WrongType)),
-            });
-        result.unwrap_or(Ok(false))
-    }
-
-    pub fn sismember(&self, key: &str, member: &str) -> Result<bool, StoreError> {
-        let member_b = Bytes::from(member.to_string());
-        self.engine
-            .read(&Bytes::from(key.to_string()), move |entry| {
-                match &entry.value {
-                    OnyxValue::Set(s) => Ok(s.contains(&member_b)),
-                    _ => Err(StoreError::WrongType),
-                }
-            })
-            .unwrap_or(Ok(false))
-    }
-    // --- JSON operations ---
-
-    /// Replaces the complete document at `$`, or updates an existing JSON
-    /// document at a partial path.
-    pub fn json_set(
-        &self,
-        key: &str,
-        path: &str,
-        new_value: serde_json::Value,
-    ) -> Result<(), &'static str> {
-        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
-        let key_b = Bytes::from(key.to_string());
-
-        if segments.is_empty() {
-            return self.engine.update_or_insert_with_presence(
-                key_b,
-                || OnyxValue::Json(serde_json::Value::Null),
-                move |value, _| match value {
-                    OnyxValue::Json(root) => {
-                        *root = new_value;
-                        Ok(())
-                    }
-                    _ => Err(StoreError::WrongType.message()),
-                },
-            );
-        }
-
-        // A partial path requires an existing JSON document.
-        let result = self.engine.update_if_exists(&key_b, move |v| match v {
-            OnyxValue::Json(root) => Some(set_json_path(root, &segments, new_value)),
-            _ => None, // Existing non-JSON value: wrong type.
-        });
-        match result {
-            Some(Some(true)) => Ok(()),
-            Some(Some(false)) => {
-                Err("ERR path not reachable (intermediate element missing or index out of bounds)")
-            }
-            Some(None) => Err(StoreError::WrongType.message()),
-            None => Err("ERR key does not exist: use JSON.SET key $ {...} to create it"),
-        }
-    }
-
-    pub fn json_get(&self, key: &str, path: &str) -> Result<Option<String>, &'static str> {
-        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
-        let result = self
-            .engine
-            .read(&Bytes::from(key.to_string()), move |entry| {
-                match &entry.value {
-                    OnyxValue::Json(root) => Ok(if segments.is_empty() {
-                        Some(root.to_string())
-                    } else {
-                        get_json_path(root, &segments).map(|v| v.to_string())
-                    }),
-                    _ => Err(StoreError::WrongType.message()),
-                }
-            });
-        match result {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Ok(None),
-        }
-    }
-
-    pub fn json_del(&self, key: &str, path: &str) -> Result<bool, &'static str> {
-        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
-        if segments.is_empty() {
-            let result =
-                self.engine
-                    .update_if_exists_with_action(
-                        &Bytes::from(key.to_string()),
-                        |value| match value {
-                            OnyxValue::Json(_) => EntryMutation::Delete(Ok(true)),
-                            _ => EntryMutation::Keep(Err(StoreError::WrongType.message())),
-                        },
-                    );
-            return result.unwrap_or(Ok(false));
-        }
-        let key_b = Bytes::from(key.to_string());
-        let result = self.engine.update_if_exists(&key_b, move |v| match v {
-            OnyxValue::Json(root) => Some(delete_json_path(root, &segments)),
-            _ => None,
-        });
-        match result {
-            Some(Some(deleted)) => Ok(deleted),
-            Some(None) => Err(StoreError::WrongType.message()),
-            None => Ok(false), // Missing key: nothing to delete.
-        }
-    }
-
-    pub fn json_type(&self, key: &str, path: &str) -> Result<Option<&'static str>, &'static str> {
-        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
-        let result = self
-            .engine
-            .read(&Bytes::from(key.to_string()), move |entry| {
-                match &entry.value {
-                    OnyxValue::Json(root) => {
-                        let node = if segments.is_empty() {
-                            Some(root)
-                        } else {
-                            get_json_path(root, &segments)
-                        };
-                        Ok(node.map(|v| match v {
-                            serde_json::Value::Null => "null",
-                            serde_json::Value::Bool(_) => "boolean",
-                            serde_json::Value::Number(_) => "number",
-                            serde_json::Value::String(_) => "string",
-                            serde_json::Value::Array(_) => "array",
-                            serde_json::Value::Object(_) => "object",
-                        }))
-                    }
-                    _ => Err(StoreError::WrongType.message()),
-                }
-            });
-        match result {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Ok(None),
-        }
-    }
-    pub fn json_numincrby(&self, key: &str, path: &str, delta: f64) -> Result<f64, String> {
-        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
-        let key_b = Bytes::from(key.to_string());
-        let result = self.engine.update_if_exists(&key_b, move |v| match v {
-            OnyxValue::Json(root) => Some(numincrby_json_path(root, &segments, delta)),
-            _ => None,
-        });
-        match result {
-            Some(Some(Ok(new_val))) => Ok(new_val),
-            Some(Some(Err(e))) => Err(e.to_string()),
-            Some(None) => Err(StoreError::WrongType.message().to_string()),
-            None => {
-                Err("ERR key does not exist: use JSON.SET key $ {...} to create it".to_string())
-            }
-        }
-    }
-
-    pub fn json_arrappend(
-        &self,
-        key: &str,
-        path: &str,
-        new_value: serde_json::Value,
-    ) -> Result<usize, String> {
-        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
-        let key_b = Bytes::from(key.to_string());
-        let result = self.engine.update_if_exists(&key_b, move |v| match v {
-            OnyxValue::Json(root) => Some(arrappend_json_path(root, &segments, new_value)),
-            _ => None,
-        });
-        match result {
-            Some(Some(Ok(new_len))) => Ok(new_len),
-            Some(Some(Err(e))) => Err(e.to_string()),
-            Some(None) => Err(StoreError::WrongType.message().to_string()),
-            None => {
-                Err("ERR key does not exist: use JSON.SET key $ {...} to create it".to_string())
-            }
-        }
-    }
-    pub fn json_arrlen(&self, key: &str, path: &str) -> Result<Option<usize>, String> {
-        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
-        let result = self
-            .engine
-            .read(&Bytes::from(key.to_string()), move |entry| {
-                match &entry.value {
-                    OnyxValue::Json(root) => {
-                        let node = if segments.is_empty() {
-                            Some(root)
-                        } else {
-                            get_json_path(root, &segments)
-                        };
-                        Ok(node.and_then(|v| v.as_array().map(|a| a.len())))
-                    }
-                    _ => Err(StoreError::WrongType.message().to_string()),
-                }
-            });
-        match result {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Ok(None),
-        }
-    }
-
-    pub fn json_objkeys(&self, key: &str, path: &str) -> Result<Option<Vec<String>>, String> {
-        let segments = parse_json_path(path).ok_or("ERR invalid JSON path")?;
-        let result = self
-            .engine
-            .read(&Bytes::from(key.to_string()), move |entry| {
-                match &entry.value {
-                    OnyxValue::Json(root) => {
-                        let node = if segments.is_empty() {
-                            Some(root)
-                        } else {
-                            get_json_path(root, &segments)
-                        };
-                        Ok(node.and_then(|v| v.as_object().map(|o| o.keys().cloned().collect())))
-                    }
-                    _ => Err(StoreError::WrongType.message().to_string()),
-                }
-            });
-        match result {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Ok(None),
-        }
-    }
-    // --- Key operations ---
-    pub fn rename(&self, old_key: &str, new_key: &str) -> bool {
-        self.engine.rename(
-            &Bytes::from(old_key.to_string()),
-            Bytes::from(new_key.to_string()),
-        )
-    }
-
-    pub fn copy(&self, src: &str, dst: &str) -> bool {
-        self.engine
-            .copy(&Bytes::from(src.to_string()), Bytes::from(dst.to_string()))
-    }
-
-    pub fn value_type(&self, key: &str) -> Option<&'static str> {
-        self.engine
-            .read(&Bytes::from(key.to_string()), |entry| match &entry.value {
-                OnyxValue::Blob(_) => "string",
-                OnyxValue::Int(_) => "int",
-                OnyxValue::Float(_) => "float",
-                OnyxValue::List(_) => "list",
-                OnyxValue::Hash(_) => "hash",
-                OnyxValue::Set(_) => "set",
-                OnyxValue::Json(_) => "json",
-                OnyxValue::Vector(_) => "vector",
-            })
-    }
-
-    pub fn all_keys(&self) -> Vec<String> {
-        self.engine
-            .all_keys()
-            .into_iter()
-            .map(|k| String::from_utf8_lossy(&k).to_string())
-            .collect()
-    }
-
-    pub fn keys_matching(&self, pattern: &str) -> Vec<String> {
-        if pattern == "*" || pattern.is_empty() {
-            return self.all_keys();
-        }
-        self.all_keys()
-            .into_iter()
-            .filter(|k| glob_match(pattern, k))
-            .collect()
-    }
-
-    pub fn snapshot_entries(&self) -> Vec<(String, DataEntry)> {
-        self.engine
-            .snapshot_all()
-            .into_iter()
-            .map(|(k, entry)| (String::from_utf8_lossy(&k).to_string(), entry))
-            .collect()
-    }
-
-    pub fn used_memory_bytes(&self) -> usize {
-        self.engine.total_memory_bytes()
-    }
-
-    pub fn maxmemory_bytes(&self) -> usize {
-        self.maxmemory_bytes
-    }
-
-    pub fn maxmemory_policy(&self) -> EvictionPolicy {
-        self.maxmemory_policy
-    }
-
-    pub fn expire_conditional(&self, key: &str, seconds: u64, condition: &str) -> bool {
-        let require_expiry = match condition {
-            "NX" => Some(false),
-            "XX" => Some(true),
-            _ => return false,
-        };
-        self.engine.set_expiry_conditional(
-            &Bytes::from(key.to_string()),
-            now().saturating_add(seconds),
-            require_expiry,
-        )
-    }
-
-    pub fn get_expiry(&self, key: &str) -> Option<u64> {
-        self.engine
-            .read(&Bytes::from(key.to_string()), |e| e.expires_at)
-            .flatten()
-    }
-
-    pub fn stats(&self) -> EngineStats {
-        self.engine.stats()
-    }
-
-    pub fn gc_expired(&self) -> usize {
-        self.engine.gc_expired()
-    }
-    pub fn engine(&self) -> &OnyxEngine {
-        &self.engine
-    }
-}
-fn is_expired(entry: &DataEntry) -> bool {
-    if let Some(exp) = entry.expires_at {
-        now() >= exp
-    } else {
-        false
-    }
-}
-
-// ============================================================
-// JSON PATH — field access and array indices only; no wildcards or filters.
-// ============================================================
-
-#[derive(Debug, Clone, PartialEq)]
-enum JsonPathSegment {
-    Field(String),
-    Index(usize),
-}
-/// Parses a path such as `$.a.b[2].c` into navigation segments. `$` denotes
-/// the document root and produces an empty segment list. Syntactically invalid
-/// paths return `None`; data presence is evaluated during navigation.
-fn parse_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
-    let path = path.trim();
-    if path != "$" && !path.starts_with('$') {
-        return None; // Every valid path begins with '$'.
-    }
-    let rest = &path[1..]; // Skip the leading '$'.
-    if rest.is_empty() {
-        return Some(Vec::new()); // `$` addresses the complete document.
-    }
-    if !rest.starts_with('.') && !rest.starts_with('[') {
-        return None; // `$` must be followed by `.` or `[`.
-    }
-
-    let mut segments = Vec::new();
-    let chars: Vec<char> = rest.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        match chars[i] {
-            '.' => {
-                i += 1;
-                let start = i;
-                while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
-                    i += 1;
-                }
-                if start == i {
-                    return None; // Reject empty or trailing field segments.
-                }
-                let field: String = chars[start..i].iter().collect();
-                segments.push(JsonPathSegment::Field(field));
-            }
-            '[' => {
-                i += 1;
-                let start = i;
-                while i < chars.len() && chars[i] != ']' {
-                    i += 1;
-                }
-                if i >= chars.len() {
-                    return None; // Reject an unclosed array index.
-                }
-                let idx_str: String = chars[start..i].iter().collect();
-                let idx: usize = idx_str.parse().ok()?; // Only non-negative indices.
-                segments.push(JsonPathSegment::Index(idx));
-                i += 1; // Skip the closing ']'.
-            }
-            _ => return None, // Reject characters outside field or array segments.
-        }
-    }
-
-    Some(segments)
-}
-/// Returns the node addressed by `segments`, or `None` on absence/type mismatch.
-fn get_json_path<'a>(
-    root: &'a serde_json::Value,
-    segments: &[JsonPathSegment],
-) -> Option<&'a serde_json::Value> {
-    let mut current = root;
-    for seg in segments {
-        current = match (seg, current) {
-            (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => map.get(f)?,
-            (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => arr.get(*idx)?,
-            _ => return None,
-        };
-    }
-    Some(current)
-}
-
-/// Sets the addressed value and may create only the final segment. Missing or
-/// incompatible intermediate segments cause the operation to fail.
-fn set_json_path(
-    root: &mut serde_json::Value,
-    segments: &[JsonPathSegment],
-    new_value: serde_json::Value,
-) -> bool {
-    if segments.is_empty() {
-        *root = new_value;
-        return true;
-    }
-    let mut current = root;
-    for seg in &segments[..segments.len() - 1] {
-        current = match (seg, current) {
-            (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => {
-                match map.get_mut(f) {
-                    Some(v) => v,
-                    None => return false, // Intermediate objects are not created.
-                }
-            }
-            (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => {
-                match arr.get_mut(*idx) {
-                    Some(v) => v,
-                    None => return false,
-                }
-            }
-            _ => return false,
-        };
-    }
-    match (&segments[segments.len() - 1], current) {
-        (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => {
-            map.insert(f.clone(), new_value);
-            true
-        }
-        (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => {
-            if *idx < arr.len() {
-                arr[*idx] = new_value;
-                true
-            } else if *idx == arr.len() {
-                arr.push(new_value); // An index at the array length appends.
-                true
-            } else {
-                false // Do not create sparse arrays.
-            }
-        }
-        _ => false,
-    }
-}
-
-/// Removes the addressed node and reports whether a value was removed.
-fn delete_json_path(root: &mut serde_json::Value, segments: &[JsonPathSegment]) -> bool {
-    if segments.is_empty() {
-        return false; // Root deletion is handled by normal key deletion.
-    }
-    let mut current = root;
-    for seg in &segments[..segments.len() - 1] {
-        current = match (seg, current) {
-            (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => match map.get_mut(f) {
-                Some(v) => v,
-                None => return false,
-            },
-            (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => {
-                match arr.get_mut(*idx) {
-                    Some(v) => v,
-                    None => return false,
-                }
-            }
-            _ => return false,
-        };
-    }
-    match (&segments[segments.len() - 1], current) {
-        (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => map.remove(f).is_some(),
-        (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) if *idx < arr.len() => {
-            arr.remove(*idx);
-            true
-        }
-        _ => false,
-    }
-}
-/// Returns a mutable reference to the addressed node for in-place operations.
-fn get_json_path_mut<'a>(
-    root: &'a mut serde_json::Value,
-    segments: &[JsonPathSegment],
-) -> Option<&'a mut serde_json::Value> {
-    let mut current = root;
-    for seg in segments {
-        current = match (seg, current) {
-            (JsonPathSegment::Field(f), serde_json::Value::Object(map)) => map.get_mut(f)?,
-            (JsonPathSegment::Index(idx), serde_json::Value::Array(arr)) => arr.get_mut(*idx)?,
-            _ => return None,
-        };
-    }
-    Some(current)
-}
-
-/// Increments an existing JSON number. Missing paths are not created as zero.
-fn numincrby_json_path(
-    root: &mut serde_json::Value,
-    segments: &[JsonPathSegment],
-    delta: f64,
-) -> Result<f64, &'static str> {
-    let node = get_json_path_mut(root, segments).ok_or("ERR path JSON not found")?;
-    let current = node
-        .as_f64()
-        .ok_or("WRONGTYPE the value at the path is not a number")?;
-    let new_val = current + delta;
-    let new_number = if new_val.fract() == 0.0 && new_val.abs() < i64::MAX as f64 {
-        serde_json::Number::from(new_val as i64)
-    } else {
-        serde_json::Number::from_f64(new_val)
-            .ok_or("ERR invalid numeric result (NaN or infinity)")?
-    };
-    *node = serde_json::Value::Number(new_number);
-    Ok(new_val)
-}
-
-/// Appends to an existing JSON array and rejects missing or incompatible paths.
-fn arrappend_json_path(
-    root: &mut serde_json::Value,
-    segments: &[JsonPathSegment],
-    new_value: serde_json::Value,
-) -> Result<usize, &'static str> {
-    let node = get_json_path_mut(root, segments).ok_or("ERR path JSON not found")?;
-    match node {
-        serde_json::Value::Array(arr) => {
-            arr.push(new_value);
-            Ok(arr.len())
-        }
-        _ => Err("WRONGTYPE the value at the path is not an array"),
-    }
-}
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let mut p_idx = 0;
-    let mut t_idx = 0;
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    let mut star_idx = None;
-    let mut match_idx = 0;
-
-    while t_idx < t.len() {
-        if p_idx < p.len() && p[p_idx] == t[t_idx] {
-            // Literal match: advance both inputs.
-            p_idx += 1;
-            t_idx += 1;
-        } else if p_idx < p.len() && p[p_idx] == '*' {
-            // `*` is a backtracking point. First match zero characters, then
-            // expand it one character at a time if later input requires it.
-            star_idx = Some(p_idx);
-            match_idx = t_idx;
-            p_idx += 1;
-        } else if let Some(star) = star_idx {
-            p_idx = star + 1;
-            match_idx += 1;
-            t_idx = match_idx;
-        } else {
-            return false;
-        }
-    }
-
-    while p_idx < p.len() && p[p_idx] == '*' {
-        p_idx += 1;
-    }
-    p_idx == p.len()
-}
 
 /// Maximum number of committed batches retained for partial synchronization.
 const BACKLOG_CAPACITY: usize = 10_000;
@@ -2397,12 +1424,13 @@ fn persistent_keys_for_command(args: &[String]) -> Vec<Bytes> {
     keys
 }
 
+#[cfg(test)]
 fn capture_entries(
     store: &ShardedStore,
     keys: &[Bytes],
 ) -> std::collections::HashMap<Bytes, Option<DataEntry>> {
     keys.iter()
-        .map(|key| (key.clone(), store.engine.peek(key)))
+        .map(|key| (key.clone(), store.peek_entry(key)))
         .collect()
 }
 
@@ -2426,7 +1454,7 @@ fn derive_committed_batch(
             .cloned()
             .flatten()
             .map(PersistentEntry::from);
-        let current = store.engine.peek(key).map(PersistentEntry::from);
+        let current = store.peek_entry(key).map(PersistentEntry::from);
         let was_evicted = deleted.contains(key);
         if previous == current && !was_evicted {
             continue;
@@ -2446,27 +1474,6 @@ fn derive_committed_batch(
     (!effects.is_empty()).then_some(CommittedBatch { effects })
 }
 
-fn rollback_attempted_mutation(
-    store: &ShardedStore,
-    before: &std::collections::HashMap<Bytes, Option<DataEntry>>,
-    evicted_entries: &[(Bytes, DataEntry)],
-) {
-    for (key, previous) in before {
-        match previous {
-            Some(entry) => {
-                store.engine.apply_entry(key.clone(), entry.clone());
-            }
-            None => {
-                store.engine.delete(key);
-            }
-        }
-    }
-    for (key, entry) in evicted_entries {
-        if !before.contains_key(key) {
-            store.engine.apply_entry(key.clone(), entry.clone());
-        }
-    }
-}
 /// Allows partial synchronization only when the replica names the current
 /// master's non-zero replication identity.
 fn replid_allows_partial(requested_replid: u64, current_replid: u64) -> bool {
@@ -2490,60 +1497,6 @@ fn partial_resync_possible(
             .is_some_and(|next_offset| oldest <= next_offset),
         None => false,
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WriteAdmissionError {
-    KeyLimit,
-    Maxmemory,
-}
-
-impl WriteAdmissionError {
-    fn message(self) -> &'static str {
-        match self {
-            Self::KeyLimit => "ERR database key limit reached",
-            Self::Maxmemory => {
-                "OOM command not allowed because the projected memory usage exceeds maxmemory"
-            }
-        }
-    }
-}
-
-/// Validates the authoritative post-mutation state while the write gate is held.
-/// A pre-existing over-limit state may only move sideways or downward. Growing
-/// mutations must fit after policy-driven eviction without evicting keys involved
-/// in the command itself.
-fn enforce_write_admission(
-    store: &ShardedStore,
-    memory_before: usize,
-    key_count_before: usize,
-    protected_keys: &HashSet<Bytes>,
-) -> Result<Vec<(Bytes, DataEntry)>, WriteAdmissionError> {
-    let key_count_after = store.engine.stats().total_keys;
-    if key_count_after > MAX_KEYS && key_count_after > key_count_before {
-        return Err(WriteAdmissionError::KeyLimit);
-    }
-
-    let limit = store.maxmemory_bytes();
-    let memory_after = store.used_memory_bytes();
-    if limit == 0 || memory_after <= limit || memory_after <= memory_before {
-        return Ok(Vec::new());
-    }
-    if store.maxmemory_policy() == EvictionPolicy::NoEviction {
-        return Err(WriteAdmissionError::Maxmemory);
-    }
-
-    let evicted = store
-        .engine
-        .evict_to_fit(limit, store.maxmemory_policy(), protected_keys);
-    if store.used_memory_bytes() <= limit {
-        return Ok(evicted);
-    }
-
-    for (key, entry) in &evicted {
-        store.engine.apply_entry(key.clone(), entry.clone());
-    }
-    Err(WriteAdmissionError::Maxmemory)
 }
 
 fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
@@ -2613,7 +1566,7 @@ fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue
             if !valid {
                 (RESPValue::Error("ERR syntax error".to_string()), false)
             } else {
-                let ok = store.engine.set_conditional(
+                let ok = store.set_conditional_value(
                     Bytes::from(key.to_string()),
                     OnyxValue::Blob(Bytes::from(arg.to_string())),
                     expires_at,
@@ -3887,12 +2840,10 @@ fn apply_committed_batch(store: &ShardedStore, batch: &CommittedBatch) {
     for effect in &batch.effects {
         match effect {
             CommittedEffect::Put { key, entry } => {
-                store
-                    .engine
-                    .apply_entry(key.clone(), entry.clone().into_data_entry());
+                store.apply_entry(key.clone(), entry.clone().into_data_entry());
             }
             CommittedEffect::Delete { key } => {
-                store.engine.delete(key);
+                store.delete_bytes(key);
             }
         }
     }
@@ -3931,7 +2882,7 @@ fn load_snapshot_entries(
             reader.read_exact(&mut record)?;
             let (key, entry) = decode_snapshot_entry(&record)?;
             if !is_expired(&entry) {
-                store.engine.set(key, entry.value, entry.expires_at);
+                store.set_value(key, entry.value, entry.expires_at);
                 count += 1;
             }
         }
@@ -3963,14 +2914,6 @@ fn load_data_from_paths(
     store: &ShardedStore,
     paths: &PersistencePaths,
 ) -> Result<RecoveryState, PersistenceError> {
-    CURRENT_TIME.store(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| PersistenceError::new(error.to_string()))?
-            .as_secs(),
-        Ordering::SeqCst,
-    );
-
     let snapshot_path = if paths.snapshot.exists() {
         &paths.snapshot
     } else if paths.snapshot_backup.exists() {
@@ -4034,7 +2977,7 @@ fn load_data_from_paths(
         file.set_len(binlog.valid_len)?;
         file.sync_all()?;
     }
-    store.engine.replace_all(staging.engine.snapshot_all());
+    store.replace_all(staging.raw_entries());
     info!("Binlog replayed: {} commands", replayed);
 
     Ok(RecoveryState {
@@ -4586,7 +3529,7 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
                     let _write_guard = persistence.write_gate.lock().await;
                     (
                         persistence.repl_offset.load(Ordering::SeqCst),
-                        store.engine.snapshot_all(),
+                        store.raw_entries(),
                     )
                 };
                 let marker = format!(
@@ -4835,17 +3778,6 @@ async fn active_expiration_task(store: Arc<ShardedStore>) {
         }
     }
 }
-async fn time_updater_task() {
-    loop {
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        CURRENT_TIME.store(now_sec, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
     let parent = path
@@ -5231,7 +4163,7 @@ async fn compact_store(
         .map_err(|error| PersistenceError::new(format!("Binlog flush failed: {}", error)))?;
 
     let watermark = persistence.repl_offset.load(Ordering::SeqCst);
-    let entries = store.engine.snapshot_all();
+    let entries = store.raw_entries();
     let paths = persistence.paths.clone();
     tokio::task::spawn_blocking(move || write_snapshot_file(entries, watermark, &paths))
         .await
@@ -5671,7 +4603,7 @@ async fn install_full_sync(
     // snapshot whose post-boundary log may already be gone.
     write_replica_installing(&persistence.paths)?;
     request_log_truncate(persistence).await?;
-    let entries = staging.engine.snapshot_all();
+    let entries = staging.raw_entries();
     let snapshot_entries = entries.clone();
     let paths = persistence.paths.clone();
     tokio::task::spawn_blocking(move || write_snapshot_file(snapshot_entries, sequence, &paths))
@@ -5687,7 +4619,7 @@ async fn install_full_sync(
         },
     )?;
 
-    store.engine.replace_all(entries);
+    store.replace_all(entries);
     persistence.repl_offset.store(sequence, Ordering::SeqCst);
     persistence.upstream_replid.store(replid, Ordering::SeqCst);
     persistence.replication_ready.store(true, Ordering::SeqCst);
@@ -5790,34 +4722,37 @@ async fn execute_transaction(
         }
 
         let affected_keys = persistent_keys_for_command(args);
-        let before = capture_entries(store, &affected_keys);
+        let mut attempt = store.begin_mutation(&affected_keys);
         for key in &affected_keys {
             if changed_key_set.insert(key.clone()) {
                 changed_keys.push(key.clone());
-                baseline.insert(key.clone(), before.get(key).cloned().flatten());
+                baseline.insert(
+                    key.clone(),
+                    attempt.before_entries().get(key).cloned().flatten(),
+                );
             }
         }
-        let memory_before = store.used_memory_bytes();
-        let key_count_before = store.engine.stats().total_keys;
         let (response, _) = execute_command(store, args);
-        if derive_committed_batch(store, &affected_keys, &before, &[]).is_none() {
+        if derive_committed_batch(store, &affected_keys, attempt.before_entries(), &[]).is_none() {
+            attempt.commit();
             results.push(response);
             continue;
         }
 
         let protected_keys = affected_keys.iter().cloned().collect::<HashSet<_>>();
-        match enforce_write_admission(store, memory_before, key_count_before, &protected_keys) {
-            Ok(evicted_entries) => {
-                for (key, entry) in evicted_entries {
+        match attempt.admit(&protected_keys) {
+            Ok(()) => {
+                for (key, entry) in attempt.evicted_entries() {
                     if changed_key_set.insert(key.clone()) {
                         changed_keys.push(key.clone());
-                        baseline.insert(key, Some(entry));
+                        baseline.insert(key.clone(), Some(entry.clone()));
                     }
                 }
                 results.push(response);
+                attempt.commit();
             }
             Err(error) => {
-                rollback_attempted_mutation(store, &before, &[]);
+                attempt.rollback();
                 results.push(RESPValue::Error(error.message().to_string()));
             }
         }
@@ -5838,7 +4773,7 @@ async fn execute_transaction(
             RESPValue::Array(results)
         }
         Err(error) => {
-            rollback_attempted_mutation(store, &baseline, &[]);
+            store.restore_entries(&baseline, &[]);
             persistence
                 .repl_offset
                 .store(current_sequence, Ordering::SeqCst);
@@ -5884,35 +4819,41 @@ async fn execute_ordered_command(
     }
 
     let affected_keys = persistent_keys_for_command(args);
-    let before = capture_entries(store, &affected_keys);
-    let memory_before = store.used_memory_bytes();
-    let key_count_before = store.engine.stats().total_keys;
+    let mut attempt = store.begin_mutation(&affected_keys);
     let (response, _) = execute_command(store, args);
-    if derive_committed_batch(store, &affected_keys, &before, &[]).is_none() {
+    if derive_committed_batch(store, &affected_keys, attempt.before_entries(), &[]).is_none() {
+        attempt.commit();
         drop(write_guard);
         return (response, false);
     }
 
     let protected_keys = affected_keys.iter().cloned().collect::<HashSet<_>>();
-    let evicted_entries =
-        match enforce_write_admission(store, memory_before, key_count_before, &protected_keys) {
-            Ok(entries) => entries,
-            Err(error) => {
-                rollback_attempted_mutation(store, &before, &[]);
-                drop(write_guard);
-                return (RESPValue::Error(error.message().to_string()), false);
-            }
-        };
-    let committed_batch = derive_committed_batch(store, &affected_keys, &before, &evicted_entries);
+    match attempt.admit(&protected_keys) {
+        Ok(()) => {}
+        Err(error) => {
+            attempt.rollback();
+            drop(write_guard);
+            return (RESPValue::Error(error.message().to_string()), false);
+        }
+    }
+    let committed_batch = derive_committed_batch(
+        store,
+        &affected_keys,
+        attempt.before_entries(),
+        attempt.evicted_entries(),
+    );
     let is_write = committed_batch.is_some();
     let mut should_compact = false;
     if let Some(batch) = committed_batch {
         let sequence = current_sequence + 1;
         persistence.repl_offset.store(sequence, Ordering::SeqCst);
         match persist_ordered_mutation(persistence, sequence, &batch).await {
-            Ok(value) => should_compact = value,
+            Ok(value) => {
+                should_compact = value;
+                attempt.commit();
+            }
             Err(error) => {
-                rollback_attempted_mutation(store, &before, &evicted_entries);
+                attempt.rollback();
                 persistence
                     .repl_offset
                     .store(current_sequence, Ordering::SeqCst);
@@ -5998,8 +4939,7 @@ async fn execute_obp_command(
                 let _visibility_guard = persistence.visibility_gate.read().await;
                 (
                     store
-                        .engine
-                        .get(key)
+                        .get_entry(key)
                         .map(|e| e.value)
                         .unwrap_or(OnyxValue::Blob(Bytes::new())),
                     false,
@@ -6033,22 +4973,15 @@ async fn execute_obp_command(
                     };
                 }
                 let key = args[0].clone();
-                let before =
-                    std::collections::HashMap::from([(key.clone(), store.engine.peek(&key))]);
-                let memory_before = store.used_memory_bytes();
-                let key_count_before = store.engine.stats().total_keys;
+                let affected_keys = [key.clone()];
+                let mut attempt = store.begin_mutation(&affected_keys);
                 let value = OnyxValue::Blob(args[1].clone());
-                store.engine.set(key.clone(), value, None);
+                store.set_value(key.clone(), value, None);
                 let protected_keys = HashSet::from([key.clone()]);
-                let evicted_entries = match enforce_write_admission(
-                    store,
-                    memory_before,
-                    key_count_before,
-                    &protected_keys,
-                ) {
-                    Ok(entries) => entries,
+                match attempt.admit(&protected_keys) {
+                    Ok(()) => {}
                     Err(error) => {
-                        rollback_attempted_mutation(store, &before, &[]);
+                        attempt.rollback();
                         return OBPFrame {
                             cmd: 0x00,
                             flags: 0,
@@ -6057,20 +4990,14 @@ async fn execute_obp_command(
                             payload: Some(Bytes::from(error.message())),
                         };
                     }
-                };
-                let entry = store
-                    .engine
-                    .peek(&key)
-                    .map(PersistentEntry::from)
-                    .expect("OBP SET must leave the committed key present");
-                let mut effects = evicted_entries
-                    .iter()
-                    .map(|(evicted_key, _)| CommittedEffect::Delete {
-                        key: evicted_key.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                effects.push(CommittedEffect::Put { key, entry });
-                let batch = CommittedBatch { effects };
+                }
+                let batch = derive_committed_batch(
+                    store,
+                    &affected_keys,
+                    attempt.before_entries(),
+                    attempt.evicted_entries(),
+                )
+                .expect("OBP SET must produce a committed effect");
                 let sequence = current_sequence + 1;
                 persistence.repl_offset.store(sequence, Ordering::SeqCst);
                 let persistence_result =
@@ -6078,10 +5005,11 @@ async fn execute_obp_command(
                 drop(write_guard);
                 match persistence_result {
                     Ok(should_compact) => {
+                        attempt.commit();
                         schedule_compaction(store, persistence, should_compact);
                     }
                     Err(error) => {
-                        rollback_attempted_mutation(store, &before, &evicted_entries);
+                        attempt.rollback();
                         persistence
                             .repl_offset
                             .store(current_sequence, Ordering::SeqCst);
@@ -6134,9 +5062,9 @@ async fn execute_obp_command(
                         payload: Some(Bytes::from("MISCONF persistence sequence is exhausted")),
                     };
                 }
-                let before =
-                    std::collections::HashMap::from([(key.clone(), store.engine.peek(key))]);
-                let deleted = store.engine.delete(key);
+                let affected_keys = [key.clone()];
+                let attempt = store.begin_mutation(&affected_keys);
+                let deleted = store.delete_bytes(key);
                 if deleted {
                     let batch = CommittedBatch {
                         effects: vec![CommittedEffect::Delete { key: key.clone() }],
@@ -6148,10 +5076,11 @@ async fn execute_obp_command(
                     drop(write_guard);
                     match persistence_result {
                         Ok(should_compact) => {
+                            attempt.commit();
                             schedule_compaction(store, persistence, should_compact);
                         }
                         Err(error) => {
-                            rollback_attempted_mutation(store, &before, &[]);
+                            attempt.rollback();
                             persistence
                                 .repl_offset
                                 .store(current_sequence, Ordering::SeqCst);
@@ -6266,11 +5195,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics_listener = TcpListener::bind(&metrics_addr).await?;
     info!("Server listening on {}", bind_addr);
     info!("OBP (binary) server listening on {}", obp_addr);
-
-    tokio::spawn(async {
-        time_updater_task().await;
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let store = Arc::new(ShardedStore::with_maxmemory(maxmemory_val, mm_policy));
     let paths = PersistencePaths::in_directory(runtime_directory.directory());
@@ -7025,7 +5949,7 @@ async fn run_replica(
                                 ));
                                 break;
                             }
-                            staging.engine.apply_entry(key, entry);
+                            staging.apply_entry(key, entry);
                         }
                         if let Err(error) = receive_result {
                             Err(error)
@@ -7586,7 +6510,7 @@ mod tests {
     #[test]
     fn expired_entries_are_absent_to_conditional_and_collection_mutations() {
         let store = ShardedStore::new();
-        store.engine.set(
+        store.set_value(
             Bytes::from_static(b"conditional"),
             OnyxValue::Blob(Bytes::from_static(b"stale")),
             Some(now()),
@@ -7594,7 +6518,7 @@ mod tests {
         assert!(store.setnx("conditional", "fresh"));
         assert_eq!(store.get("conditional"), Ok(Some("fresh".to_string())));
 
-        store.engine.set(
+        store.set_value(
             Bytes::from_static(b"list"),
             OnyxValue::List(vec![Bytes::from_static(b"stale")]),
             Some(now()),
@@ -7632,7 +6556,7 @@ mod tests {
         let expired = Some(now());
 
         for key in ["delete", "expire", "rename", "copy", "conditional"] {
-            store.engine.set(
+            store.set_value(
                 Bytes::copy_from_slice(key.as_bytes()),
                 OnyxValue::Blob(Bytes::from_static(b"stale")),
                 expired,
@@ -7643,7 +6567,7 @@ mod tests {
         assert!(!store.expire("expire", 10));
         assert!(!store.rename("rename", "renamed"));
         assert!(!store.copy("copy", "copied"));
-        assert!(!store.engine.set_conditional(
+        assert!(!store.set_conditional_value(
             Bytes::from_static(b"conditional"),
             OnyxValue::Blob(Bytes::from_static(b"replacement")),
             None,
@@ -7668,51 +6592,6 @@ mod tests {
         assert_eq!(store.sadd("set", "member"), Ok(true));
         assert_eq!(store.srem("set", "member"), Ok(true));
         assert!(!store.exists("set"));
-    }
-
-    #[test]
-    fn empty_collection_deletion_holds_the_shard_lock_through_removal() {
-        let store = Arc::new(ShardedStore::new());
-        assert_eq!(store.lpush("list", "old".to_string()), Ok(1));
-        let (mutation_started_tx, mutation_started_rx) = std::sync::mpsc::channel();
-        let (release_mutation_tx, release_mutation_rx) = std::sync::mpsc::channel();
-        let pop_store = Arc::clone(&store);
-        let pop = std::thread::spawn(move || {
-            pop_store
-                .engine
-                .update_if_exists_with_action(&Bytes::from_static(b"list"), |value| {
-                    let OnyxValue::List(list) = value else {
-                        panic!("test key changed type");
-                    };
-                    assert_eq!(list.pop(), Some(Bytes::from_static(b"old")));
-                    mutation_started_tx.send(()).unwrap();
-                    release_mutation_rx.recv().unwrap();
-                    EntryMutation::Delete(())
-                })
-        });
-        mutation_started_rx.recv().unwrap();
-
-        let (push_started_tx, push_started_rx) = std::sync::mpsc::channel();
-        let (push_complete_tx, push_complete_rx) = std::sync::mpsc::channel();
-        let push_store = Arc::clone(&store);
-        let push = std::thread::spawn(move || {
-            push_started_tx.send(()).unwrap();
-            let result = push_store.rpush("list", "new".to_string());
-            push_complete_tx.send(result).unwrap();
-        });
-        push_started_rx.recv().unwrap();
-        assert!(
-            push_complete_rx
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
-            "a concurrent write entered the shard before deletion completed"
-        );
-
-        release_mutation_tx.send(()).unwrap();
-        assert_eq!(pop.join().unwrap(), Some(()));
-        assert_eq!(push_complete_rx.recv().unwrap(), Ok(1));
-        push.join().unwrap();
-        assert_eq!(store.lrange("list", 0, -1), Ok(vec!["new".to_string()]));
     }
 
     #[test]
@@ -7784,7 +6663,7 @@ mod tests {
     #[test]
     fn json_observes_the_same_expired_and_wrong_type_boundary() {
         let store = ShardedStore::new();
-        store.engine.set(
+        store.set_value(
             Bytes::from_static(b"document"),
             OnyxValue::Blob(Bytes::from_static(b"stale")),
             Some(now()),
@@ -7826,15 +6705,6 @@ mod tests {
         assert!(store.rename("old", "new"));
         assert_eq!(store.get("old"), Ok(None));
         assert_eq!(store.get("new"), Ok(Some("value".to_string())));
-    }
-
-    #[test]
-    fn test_glob_match() {
-        assert!(glob_match("user:*", "user:42"));
-        assert!(glob_match("*", "any"));
-        assert!(!glob_match("user:*", "product:1"));
-        assert!(glob_match("exact", "exact"));
-        assert!(!glob_match("exact", "different"));
     }
 
     #[test]
@@ -7894,7 +6764,7 @@ mod tests {
     #[test]
     fn expiring_set_normalization_preserves_argument_boundaries() {
         let store = ShardedStore::new();
-        store.engine.set(
+        store.set_value(
             Bytes::from("key with spaces"),
             OnyxValue::Blob(Bytes::from("hello world")),
             Some(u64::MAX),
@@ -8114,7 +6984,7 @@ mod tests {
             let (response, _) = execute_command(&snapshot_store, &args);
             assert!(!matches!(response, RESPValue::Error(_)));
         }
-        write_snapshot_file(snapshot_store.engine.snapshot_all(), 6, &directory.paths).unwrap();
+        write_snapshot_file(snapshot_store.raw_entries(), 6, &directory.paths).unwrap();
 
         for (index, command) in snapshot_commands.iter().enumerate() {
             append_test_binlog_record(&directory.paths, index as u64 + 1, command);
@@ -8151,7 +7021,7 @@ mod tests {
         let directory = TestPersistenceDirectory::new();
         let previous_store = ShardedStore::new();
         previous_store.set("safe".to_string(), "old".to_string());
-        write_snapshot_file(previous_store.engine.snapshot_all(), 1, &directory.paths).unwrap();
+        write_snapshot_file(previous_store.raw_entries(), 1, &directory.paths).unwrap();
         append_test_binlog_record(&directory.paths, 2, &["APPEND", "safe", "-log"]);
         let previous_snapshot = fs::read(&directory.paths.snapshot).unwrap();
 
@@ -8264,7 +7134,7 @@ mod tests {
         let directory = TestPersistenceDirectory::new();
         let store = ShardedStore::new();
         store.set("safe".to_string(), "value".to_string());
-        write_snapshot_file(store.engine.snapshot_all(), 3, &directory.paths).unwrap();
+        write_snapshot_file(store.raw_entries(), 3, &directory.paths).unwrap();
         append_test_binlog_record(&directory.paths, 1, &["SET", "safe", "old"]);
         fs::rename(&directory.paths.snapshot, &directory.paths.snapshot_backup).unwrap();
 
@@ -8307,12 +7177,12 @@ mod tests {
         let store = ShardedStore::new();
         let binary_key = Bytes::from_static(b"key\t\xff\n");
         let binary_value = Bytes::from_static(b"value\0|=\xff\n");
-        store.engine.set(
+        store.set_value(
             binary_key.clone(),
             OnyxValue::Blob(binary_value.clone()),
             Some(u64::MAX),
         );
-        store.engine.set(
+        store.set_value(
             Bytes::from_static(b"list"),
             OnyxValue::List(vec![
                 Bytes::from_static(b"left|right"),
@@ -8320,10 +7190,8 @@ mod tests {
             ]),
             None,
         );
-        store
-            .engine
-            .set(Bytes::from_static(b"float"), OnyxValue::Float(-0.0), None);
-        store.engine.set(
+        store.set_value(Bytes::from_static(b"float"), OnyxValue::Float(-0.0), None);
+        store.set_value(
             Bytes::from_static(b"vector"),
             OnyxValue::Vector(vec![1.25, -3.5, f32::INFINITY]),
             None,
@@ -8333,7 +7201,7 @@ mod tests {
             Bytes::from_static(b"field=|"),
             Bytes::from_static(b"value\n\xff"),
         );
-        store.engine.set(
+        store.set_value(
             Bytes::from_static(b"hash"),
             OnyxValue::Hash(hash.clone()),
             None,
@@ -8344,41 +7212,38 @@ mod tests {
         ]
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
-        store.engine.set(
+        store.set_value(
             Bytes::from_static(b"set"),
             OnyxValue::Set(set.clone()),
             None,
         );
 
-        write_snapshot_file(store.engine.snapshot_all(), 4, &directory.paths).unwrap();
+        write_snapshot_file(store.raw_entries(), 4, &directory.paths).unwrap();
         let recovered = ShardedStore::new();
         load_data_from_paths(&recovered, &directory.paths).unwrap();
 
-        let binary_entry = recovered.engine.get(&binary_key).unwrap();
+        let binary_entry = recovered.get_entry(&binary_key).unwrap();
         assert_eq!(binary_entry.expires_at, Some(u64::MAX));
         assert!(matches!(binary_entry.value, OnyxValue::Blob(value) if value == binary_value));
-        let list_entry = recovered.engine.get(&Bytes::from_static(b"list")).unwrap();
+        let list_entry = recovered.get_entry(&Bytes::from_static(b"list")).unwrap();
         assert!(matches!(
             list_entry.value,
             OnyxValue::List(values)
                 if values == vec![Bytes::from_static(b"left|right"), Bytes::from_static(b"line\n\xff")]
         ));
-        let float_entry = recovered.engine.get(&Bytes::from_static(b"float")).unwrap();
+        let float_entry = recovered.get_entry(&Bytes::from_static(b"float")).unwrap();
         assert!(matches!(
             float_entry.value,
             OnyxValue::Float(value) if value.to_bits() == (-0.0f64).to_bits()
         ));
-        let vector_entry = recovered
-            .engine
-            .get(&Bytes::from_static(b"vector"))
-            .unwrap();
+        let vector_entry = recovered.get_entry(&Bytes::from_static(b"vector")).unwrap();
         assert!(matches!(
             vector_entry.value,
             OnyxValue::Vector(values) if values == vec![1.25, -3.5, f32::INFINITY]
         ));
-        let hash_entry = recovered.engine.get(&Bytes::from_static(b"hash")).unwrap();
+        let hash_entry = recovered.get_entry(&Bytes::from_static(b"hash")).unwrap();
         assert!(matches!(hash_entry.value, OnyxValue::Hash(values) if values == hash));
-        let set_entry = recovered.engine.get(&Bytes::from_static(b"set")).unwrap();
+        let set_entry = recovered.get_entry(&Bytes::from_static(b"set")).unwrap();
         assert!(matches!(set_entry.value, OnyxValue::Set(values) if values == set));
     }
 
@@ -8550,22 +7415,20 @@ mod tests {
         let directory = TestPersistenceDirectory::new();
         let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
         let store = Arc::new(ShardedStore::new());
-        store.engine.set(
+        store.set_value(
             Bytes::from_static(b"stale"),
             OnyxValue::Blob(Bytes::from_static(b"must disappear")),
             None,
         );
 
         let staging = ShardedStore::new();
-        staging.engine.set(
+        staging.set_value(
             Bytes::from_static(b"binary\0\xff"),
             OnyxValue::Blob(Bytes::from_static(b"value\r\n\0\xff")),
             Some(u64::MAX),
         );
-        staging
-            .engine
-            .set(Bytes::from_static(b"counter"), OnyxValue::Int(9), None);
-        staging.engine.set(
+        staging.set_value(Bytes::from_static(b"counter"), OnyxValue::Int(9), None);
+        staging.set_value(
             Bytes::from_static(b"document"),
             OnyxValue::Json(serde_json::json!({"visits": 2})),
             None,
@@ -8574,10 +7437,9 @@ mod tests {
         install_full_sync(&store, &persistence, 71, 40, staging)
             .await
             .unwrap();
-        assert!(store.engine.get(&Bytes::from_static(b"stale")).is_none());
+        assert!(store.get_entry(&Bytes::from_static(b"stale")).is_none());
         let binary = store
-            .engine
-            .get(&Bytes::from_static(b"binary\0\xff"))
+            .get_entry(&Bytes::from_static(b"binary\0\xff"))
             .unwrap();
         assert_eq!(binary.expires_at, Some(u64::MAX));
         assert!(matches!(
@@ -8619,8 +7481,7 @@ mod tests {
         assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 41);
         assert!(matches!(
             store
-                .engine
-                .get(&Bytes::from_static(b"counter"))
+                .get_entry(&Bytes::from_static(b"counter"))
                 .unwrap()
                 .value,
             OnyxValue::Int(10)
@@ -8634,16 +7495,10 @@ mod tests {
         let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
         assert_eq!(recovery.snapshot_watermark, 40);
         assert_eq!(recovery.last_sequence, 41);
-        assert!(
-            recovered
-                .engine
-                .get(&Bytes::from_static(b"stale"))
-                .is_none()
-        );
+        assert!(recovered.get_entry(&Bytes::from_static(b"stale")).is_none());
         assert!(matches!(
             recovered
-                .engine
-                .get(&Bytes::from_static(b"counter"))
+                .get_entry(&Bytes::from_static(b"counter"))
                 .unwrap()
                 .value,
             OnyxValue::Int(10)
@@ -8662,12 +7517,12 @@ mod tests {
         let directory = TestPersistenceDirectory::new();
         let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
         let store = Arc::new(ShardedStore::new());
-        store.engine.set(
+        store.set_value(
             Bytes::from_static(b"first"),
             OnyxValue::Blob(Bytes::from_static(b"old-first")),
             None,
         );
-        store.engine.set(
+        store.set_value(
             Bytes::from_static(b"second"),
             OnyxValue::Blob(Bytes::from_static(b"old-second")),
             None,
@@ -8700,17 +7555,17 @@ mod tests {
         );
 
         let replacement = ShardedStore::new();
-        replacement.engine.set(
+        replacement.set_value(
             Bytes::from_static(b"first"),
             OnyxValue::Blob(Bytes::from_static(b"new-first")),
             None,
         );
-        replacement.engine.set(
+        replacement.set_value(
             Bytes::from_static(b"second"),
             OnyxValue::Blob(Bytes::from_static(b"new-second")),
             None,
         );
-        store.engine.replace_all(replacement.engine.snapshot_all());
+        store.replace_all(replacement.raw_entries());
         drop(installation_guard);
 
         let (response, is_write) = read_task.await.unwrap();
@@ -8738,9 +7593,7 @@ mod tests {
         let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
         let store = Arc::new(ShardedStore::new());
         let staging = ShardedStore::new();
-        staging
-            .engine
-            .set(Bytes::from_static(b"counter"), OnyxValue::Int(3), None);
+        staging.set_value(Bytes::from_static(b"counter"), OnyxValue::Int(3), None);
         install_full_sync(&store, &persistence, 81, 12, staging)
             .await
             .unwrap();
@@ -8773,8 +7626,7 @@ mod tests {
         assert_eq!(recovery.last_sequence, 13);
         assert!(matches!(
             recovered
-                .engine
-                .get(&Bytes::from_static(b"counter"))
+                .get_entry(&Bytes::from_static(b"counter"))
                 .unwrap()
                 .value,
             OnyxValue::Int(4)
@@ -9180,9 +8032,7 @@ mod tests {
         persistence.upstream_replid.store(33, Ordering::SeqCst);
         persistence.replication_ready.store(true, Ordering::SeqCst);
         let store = Arc::new(ShardedStore::new());
-        store
-            .engine
-            .set(Bytes::from_static(b"counter"), OnyxValue::Int(5), None);
+        store.set_value(Bytes::from_static(b"counter"), OnyxValue::Int(5), None);
         let effect = CommittedBatch::new(vec![CommittedEffect::Put {
             key: Bytes::from_static(b"counter"),
             entry: PersistentEntry {
@@ -9202,8 +8052,7 @@ mod tests {
         assert!(!persistence.replication_ready.load(Ordering::SeqCst));
         assert!(matches!(
             store
-                .engine
-                .get(&Bytes::from_static(b"counter"))
+                .get_entry(&Bytes::from_static(b"counter"))
                 .unwrap()
                 .value,
             OnyxValue::Int(5)
@@ -9217,12 +8066,12 @@ mod tests {
     async fn failed_full_sync_install_keeps_old_live_state_and_blocks_promotion() {
         let directory = TestPersistenceDirectory::new();
         let old_disk_state = ShardedStore::new();
-        old_disk_state.engine.set(
+        old_disk_state.set_value(
             Bytes::from_static(b"old"),
             OnyxValue::Blob(Bytes::from_static(b"durable")),
             None,
         );
-        write_snapshot_file(old_disk_state.engine.snapshot_all(), 3, &directory.paths).unwrap();
+        write_snapshot_file(old_disk_state.raw_entries(), 3, &directory.paths).unwrap();
         write_replica_identity(
             &directory.paths,
             ReplicaIdentity {
@@ -9239,13 +8088,13 @@ mod tests {
         persistence.upstream_replid.store(51, Ordering::SeqCst);
         persistence.replication_ready.store(true, Ordering::SeqCst);
         let store = Arc::new(ShardedStore::new());
-        store.engine.set(
+        store.set_value(
             Bytes::from_static(b"old"),
             OnyxValue::Blob(Bytes::from_static(b"live")),
             None,
         );
         let staging = ShardedStore::new();
-        staging.engine.set(
+        staging.set_value(
             Bytes::from_static(b"new"),
             OnyxValue::Blob(Bytes::from_static(b"uncommitted")),
             None,
@@ -9487,7 +8336,7 @@ mod tests {
         let directory = TestPersistenceDirectory::new();
         let (persistence, worker) = start_test_persistence(directory.paths.clone(), 0).await;
         let store = Arc::new(ShardedStore::new());
-        store.engine.set(
+        store.set_value(
             Bytes::from_static(b"list"),
             OnyxValue::List(vec![Bytes::from_static(b"stale")]),
             Some(now()),
@@ -9796,7 +8645,7 @@ mod tests {
 
         for iteration in 0..ITERATIONS {
             let key = format!("list-{iteration}");
-            store.engine.set(
+            store.set_value(
                 Bytes::copy_from_slice(key.as_bytes()),
                 OnyxValue::List(vec![Bytes::from_static(b"old")]),
                 None,
@@ -10261,286 +9110,6 @@ mod tests {
         // from the previous process merely because its backlog is empty.
         assert!(!partial_resync_possible(9, None, 0));
     }
-    // ============================================================
-    // JSON path parsing and navigation.
-    // ============================================================
-
-    #[test]
-    fn parse_json_root_path() {
-        assert_eq!(parse_json_path("$"), Some(vec![]));
-    }
-
-    #[test]
-    fn parse_single_json_field() {
-        assert_eq!(
-            parse_json_path("$.name"),
-            Some(vec![JsonPathSegment::Field("name".to_string())])
-        );
-    }
-
-    #[test]
-    fn parse_nested_json_fields() {
-        assert_eq!(
-            parse_json_path("$.address.city"),
-            Some(vec![
-                JsonPathSegment::Field("address".to_string()),
-                JsonPathSegment::Field("city".to_string()),
-            ])
-        );
-    }
-
-    #[test]
-    fn parse_json_array_index() {
-        assert_eq!(
-            parse_json_path("$.tag[0]"),
-            Some(vec![
-                JsonPathSegment::Field("tag".to_string()),
-                JsonPathSegment::Index(0)
-            ])
-        );
-    }
-
-    #[test]
-    fn parse_long_mixed_json_path() {
-        assert_eq!(
-            parse_json_path("$.a[1].b[2]"),
-            Some(vec![
-                JsonPathSegment::Field("a".to_string()),
-                JsonPathSegment::Index(1),
-                JsonPathSegment::Field("b".to_string()),
-                JsonPathSegment::Index(2),
-            ])
-        );
-    }
-
-    #[test]
-    fn json_path_requires_a_root_marker() {
-        assert_eq!(parse_json_path("name"), None);
-    }
-
-    #[test]
-    fn json_path_rejects_an_empty_field_segment() {
-        assert_eq!(parse_json_path("$..name"), None);
-    }
-
-    #[test]
-    fn json_path_rejects_an_unclosed_array_index() {
-        assert_eq!(parse_json_path("$.tag[0"), None);
-    }
-
-    #[test]
-    fn json_path_rejects_a_non_numeric_array_index() {
-        assert_eq!(parse_json_path("$.tag[x]"), None);
-    }
-
-    #[test]
-    fn get_json_path_returns_an_existing_field() {
-        let val: serde_json::Value = serde_json::json!({"name": "Marco", "age": 18});
-        let path = parse_json_path("$.name").unwrap();
-        assert_eq!(
-            get_json_path(&val, &path),
-            Some(&serde_json::json!("Marco"))
-        );
-    }
-
-    #[test]
-    fn get_json_path_returns_a_nested_field() {
-        let val: serde_json::Value = serde_json::json!({"address": {"city": "Rome"}});
-        let path = parse_json_path("$.address.city").unwrap();
-        assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("Rome")));
-    }
-
-    #[test]
-    fn get_json_path_returns_none_for_a_missing_field() {
-        let val: serde_json::Value = serde_json::json!({"name": "Marco"});
-        let path = parse_json_path("$.surname").unwrap();
-        assert_eq!(get_json_path(&val, &path), None);
-    }
-
-    #[test]
-    fn get_json_path_returns_an_array_element() {
-        let val: serde_json::Value = serde_json::json!({"tag": ["dev", "rust"]});
-        let path = parse_json_path("$.tag[1]").unwrap();
-        assert_eq!(get_json_path(&val, &path), Some(&serde_json::json!("rust")));
-    }
-
-    #[test]
-    fn get_json_path_rejects_an_out_of_range_index() {
-        let val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
-        let path = parse_json_path("$.tag[5]").unwrap();
-        assert_eq!(get_json_path(&val, &path), None);
-    }
-
-    #[test]
-    fn test_get_json_path_wrong_type_none() {
-        // Array indexing is invalid on an object.
-        let val: serde_json::Value = serde_json::json!({"name": "Marco"});
-        let path = parse_json_path("$.name[0]").unwrap();
-        assert_eq!(get_json_path(&val, &path), None);
-    }
-
-    #[test]
-    fn set_json_path_replaces_the_complete_document() {
-        let mut val: serde_json::Value = serde_json::json!({"old": true});
-        let path = parse_json_path("$").unwrap();
-        assert!(set_json_path(
-            &mut val,
-            &path,
-            serde_json::json!({"new": true})
-        ));
-        assert_eq!(val, serde_json::json!({"new": true}));
-    }
-
-    #[test]
-    fn set_json_path_replaces_an_existing_field() {
-        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
-        let path = parse_json_path("$.name").unwrap();
-        assert!(set_json_path(&mut val, &path, serde_json::json!("Ahmed")));
-        assert_eq!(val, serde_json::json!({"name": "Ahmed"}));
-    }
-
-    #[test]
-    fn set_json_path_adds_a_field_to_an_existing_object() {
-        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
-        let path = parse_json_path("$.age").unwrap();
-        assert!(set_json_path(&mut val, &path, serde_json::json!(18)));
-        assert_eq!(val, serde_json::json!({"name": "Marco", "age": 18}));
-    }
-
-    #[test]
-    fn set_json_path_rejects_a_missing_parent() {
-        // Intermediate objects are not created automatically.
-        let mut val: serde_json::Value = serde_json::json!({});
-        let path = parse_json_path("$.a.b.c").unwrap();
-        assert!(!set_json_path(&mut val, &path, serde_json::json!(1)));
-    }
-
-    #[test]
-    fn set_json_path_replaces_an_existing_array_element() {
-        let mut val: serde_json::Value = serde_json::json!({"tag": ["dev", "rust"]});
-        let path = parse_json_path("$.tag[0]").unwrap();
-        assert!(set_json_path(&mut val, &path, serde_json::json!("go")));
-        assert_eq!(val, serde_json::json!({"tag": ["go", "rust"]}));
-    }
-
-    #[test]
-    fn set_json_path_appends_at_the_array_end() {
-        let mut val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
-        let path = parse_json_path("$.tag[1]").unwrap();
-        assert!(set_json_path(&mut val, &path, serde_json::json!("rust")));
-        assert_eq!(val, serde_json::json!({"tag": ["dev", "rust"]}));
-    }
-
-    #[test]
-    fn set_json_path_rejects_an_index_past_the_array_end() {
-        let mut val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
-        let path = parse_json_path("$.tag[5]").unwrap();
-        assert!(!set_json_path(&mut val, &path, serde_json::json!("x")));
-    }
-
-    #[test]
-    fn delete_json_path_removes_a_field() {
-        let mut val: serde_json::Value = serde_json::json!({"name": "Marco", "age": 18});
-        let path = parse_json_path("$.age").unwrap();
-        assert!(delete_json_path(&mut val, &path));
-        assert_eq!(val, serde_json::json!({"name": "Marco"}));
-    }
-
-    #[test]
-    fn delete_json_path_removes_an_array_element() {
-        let mut val: serde_json::Value = serde_json::json!({"tag": ["dev", "rust"]});
-        let path = parse_json_path("$.tag[0]").unwrap();
-        assert!(delete_json_path(&mut val, &path));
-        assert_eq!(val, serde_json::json!({"tag": ["rust"]}));
-    }
-
-    #[test]
-    fn delete_json_path_returns_false_for_a_missing_field() {
-        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
-        let path = parse_json_path("$.surname").unwrap();
-        assert!(!delete_json_path(&mut val, &path));
-    }
-
-    #[test]
-    fn delete_json_path_rejects_the_document_root() {
-        // Root deletion is handled as a normal key deletion.
-        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
-        let path = parse_json_path("$").unwrap();
-        assert!(!delete_json_path(&mut val, &path));
-    }
-    // ============================================================
-    // JSON NUMINCRBY / ARRAPPEND
-    // ============================================================
-
-    #[test]
-    fn json_numincrby_updates_an_integer() {
-        let mut val: serde_json::Value = serde_json::json!({"visits": 5});
-        let path = parse_json_path("$.visits").unwrap();
-        let result = numincrby_json_path(&mut val, &path, 3.0);
-        assert_eq!(result, Ok(8.0));
-        assert_eq!(val, serde_json::json!({"visits": 8}));
-    }
-
-    #[test]
-    fn test_numincrby_json_path_with_negative_delta() {
-        let mut val: serde_json::Value = serde_json::json!({"balance": 10});
-        let path = parse_json_path("$.balance").unwrap();
-        let result = numincrby_json_path(&mut val, &path, -3.0);
-        assert_eq!(result, Ok(7.0));
-    }
-
-    #[test]
-    fn test_numincrby_json_path_with_float_values() {
-        let mut val: serde_json::Value = serde_json::json!({"price": 9.5});
-        let path = parse_json_path("$.price").unwrap();
-        let result = numincrby_json_path(&mut val, &path, 0.5);
-        assert_eq!(result, Ok(10.0));
-    }
-
-    #[test]
-    fn test_numincrby_json_path_with_string_value_fails() {
-        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
-        let path = parse_json_path("$.name").unwrap();
-        assert!(numincrby_json_path(&mut val, &path, 1.0).is_err());
-    }
-
-    #[test]
-    fn json_numincrby_rejects_a_missing_path() {
-        let mut val: serde_json::Value = serde_json::json!({});
-        let path = parse_json_path("$.counter").unwrap();
-        assert!(numincrby_json_path(&mut val, &path, 1.0).is_err());
-    }
-
-    #[test]
-    fn json_arrappend_updates_an_existing_array() {
-        let mut val: serde_json::Value = serde_json::json!({"tag": ["dev"]});
-        let path = parse_json_path("$.tag").unwrap();
-        let result = arrappend_json_path(&mut val, &path, serde_json::json!("rust"));
-        assert_eq!(result, Ok(2));
-        assert_eq!(val, serde_json::json!({"tag": ["dev", "rust"]}));
-    }
-
-    #[test]
-    fn json_arrappend_updates_an_empty_array() {
-        let mut val: serde_json::Value = serde_json::json!({"tag": []});
-        let path = parse_json_path("$.tag").unwrap();
-        let result = arrappend_json_path(&mut val, &path, serde_json::json!("primo"));
-        assert_eq!(result, Ok(1));
-    }
-
-    #[test]
-    fn json_arrappend_rejects_a_non_array() {
-        let mut val: serde_json::Value = serde_json::json!({"name": "Marco"});
-        let path = parse_json_path("$.name").unwrap();
-        assert!(arrappend_json_path(&mut val, &path, serde_json::json!("x")).is_err());
-    }
-
-    #[test]
-    fn json_arrappend_rejects_a_missing_path() {
-        let mut val: serde_json::Value = serde_json::json!({});
-        let path = parse_json_path("$.tag").unwrap();
-        assert!(arrappend_json_path(&mut val, &path, serde_json::json!("x")).is_err());
-    }
     #[test]
     fn json_arrlen_and_objkeys_work_through_the_store() {
         let store = ShardedStore::new();
@@ -10617,8 +9186,7 @@ mod tests {
 
     fn persistent_state(store: &ShardedStore) -> std::collections::HashMap<Bytes, PersistentEntry> {
         store
-            .engine
-            .snapshot_all()
+            .raw_entries()
             .into_iter()
             .map(|(key, entry)| (key, entry.into()))
             .collect()
@@ -10964,7 +9532,7 @@ mod tests {
         let directory = TestPersistenceDirectory::new();
         let snapshot_store = ShardedStore::new();
         snapshot_store.set("snapshot-key".to_string(), "snapshot-value".to_string());
-        write_snapshot_file(snapshot_store.engine.snapshot_all(), 1, &directory.paths).unwrap();
+        write_snapshot_file(snapshot_store.raw_entries(), 1, &directory.paths).unwrap();
 
         let mut snapshot_bytes = fs::read(&directory.paths.snapshot).unwrap();
         assert!(snapshot_bytes.len() > 8);
@@ -11008,7 +9576,7 @@ mod tests {
 
         let recovered = Arc::new(ShardedStore::new());
         let recovery = load_data_from_paths(&recovered, &directory.paths).unwrap();
-        let entry = recovered.engine.peek(&key).unwrap();
+        let entry = recovered.peek_entry(&key).unwrap();
         assert_eq!(entry.value, OnyxValue::Blob(value));
 
         let (persistence, worker) =
@@ -11033,7 +9601,7 @@ mod tests {
 
         let recovered_after_delete = ShardedStore::new();
         load_data_from_paths(&recovered_after_delete, &directory.paths).unwrap();
-        assert!(recovered_after_delete.engine.peek(&key).is_none());
+        assert!(recovered_after_delete.peek_entry(&key).is_none());
     }
 
     #[tokio::test]
@@ -11044,20 +9612,17 @@ mod tests {
         apply_test_command(&store, &persistence, &["SET", "first", "aaaaaaaa"]).await;
         apply_test_command(&store, &persistence, &["SET", "second", "bbbbbbbb"]).await;
 
-        let limit = store.engine.total_memory_bytes().saturating_sub(1);
-        let evicted = store
-            .engine
-            .evict_to_fit(limit, EvictionPolicy::AllKeysLru, &HashSet::new());
+        let limit = store.used_memory_bytes().saturating_sub(1);
+        let evicted = store.evict_to_fit(limit, EvictionPolicy::AllKeysLru, &HashSet::new());
         assert!(!evicted.is_empty());
         let written_key = Bytes::from_static(b"causing-write");
-        store.engine.set(
+        store.set_value(
             written_key.clone(),
             OnyxValue::Blob(Bytes::from_static(b"committed")),
             None,
         );
         let written_entry = store
-            .engine
-            .peek(&written_key)
+            .peek_entry(&written_key)
             .map(PersistentEntry::from)
             .unwrap();
         let mut effects: Vec<CommittedEffect> = evicted
@@ -11087,7 +9652,7 @@ mod tests {
         load_data_from_paths(&recovered, &directory.paths).unwrap();
         assert_eq!(persistent_state(&recovered), expected);
         for (key, _) in evicted {
-            assert!(recovered.engine.peek(&key).is_none());
+            assert!(recovered.peek_entry(&key).is_none());
         }
     }
 
@@ -11095,16 +9660,16 @@ mod tests {
     fn evicted_target_recreated_with_same_value_is_replayed_as_delete_then_put() {
         let store = ShardedStore::new();
         let key = Bytes::from_static(b"target");
-        store.engine.set(
+        store.set_value(
             key.clone(),
             OnyxValue::Blob(Bytes::from_static(b"same-value")),
             None,
         );
         let keys = vec![key.clone()];
         let before = capture_entries(&store, &keys);
-        let evicted_entry = store.engine.peek(&key).unwrap();
-        assert!(store.engine.delete(&key));
-        store.engine.set(
+        let evicted_entry = store.peek_entry(&key).unwrap();
+        assert!(store.delete_bytes(&key));
+        store.set_value(
             key.clone(),
             OnyxValue::Blob(Bytes::from_static(b"same-value")),
             None,
@@ -11118,7 +9683,7 @@ mod tests {
         ));
 
         let replayed = ShardedStore::new();
-        replayed.engine.set(
+        replayed.set_value(
             key.clone(),
             OnyxValue::Blob(Bytes::from_static(b"same-value")),
             None,

@@ -4,6 +4,7 @@
 //! Each shard has an independent mutex, so contention is limited to keys that
 //! map to the same shard.
 
+use crate::clock::unix_seconds;
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 
@@ -171,7 +172,7 @@ impl Shard {
     /// The mutable receiver is safe because callers already hold the shard mutex.
     #[inline]
     fn get(&mut self, key: &Bytes) -> Option<&DataEntry> {
-        let ts = now();
+        let ts = unix_seconds();
         self.purge_if_expired(key, ts);
         let entry = self.data.get_mut(key)?;
         entry.last_accessed = ts;
@@ -181,7 +182,7 @@ impl Shard {
     #[inline]
     fn insert(&mut self, key: Bytes, entry: DataEntry) -> Option<DataEntry> {
         self.op_count += 1;
-        self.last_modified = now();
+        self.last_modified = unix_seconds();
         let new_size = approx_entry_size(&key, &entry);
         let old = self.data.insert(key.clone(), entry);
         if let Some(ref old_entry) = old {
@@ -194,11 +195,11 @@ impl Shard {
 
     #[inline]
     fn remove(&mut self, key: &Bytes) -> Option<DataEntry> {
-        if self.purge_if_expired(key, now()) {
+        if self.purge_if_expired(key, unix_seconds()) {
             return None;
         }
         self.op_count += 1;
-        self.last_modified = now();
+        self.last_modified = unix_seconds();
         let removed = self.data.remove(key);
         if let Some(ref e) = removed {
             let size = approx_entry_size(key, e);
@@ -209,7 +210,7 @@ impl Shard {
 
     /// Removes expired keys and returns the number removed.
     fn expire_keys(&mut self) -> usize {
-        let now = now();
+        let now = unix_seconds();
         let expired: Vec<Bytes> = self
             .data
             .iter()
@@ -251,7 +252,7 @@ impl Shard {
     where
         F: FnOnce(&mut OnyxValue) -> EntryMutation<R>,
     {
-        let ts = now();
+        let ts = unix_seconds();
         self.purge_if_expired(key, ts);
         match self.data.get_mut(key) {
             Some(entry) => {
@@ -314,7 +315,7 @@ impl Shard {
     where
         F: FnOnce(&mut DataEntry, bool) -> R,
     {
-        let ts = now();
+        let ts = unix_seconds();
         self.purge_if_expired(&key, ts);
         self.op_count += 1;
         self.last_modified = ts;
@@ -351,7 +352,7 @@ impl Shard {
         timestamp: u64,
         require_expiry: Option<bool>,
     ) -> bool {
-        let current = now();
+        let current = unix_seconds();
         if self.purge_if_expired(key, current) {
             return false;
         }
@@ -368,7 +369,7 @@ impl Shard {
             Some(entry) => {
                 entry.expires_at = Some(timestamp);
                 self.op_count += 1;
-                self.last_modified = now();
+                self.last_modified = unix_seconds();
                 true
             }
             None => false,
@@ -377,12 +378,12 @@ impl Shard {
 
     /// Inserts only when the key is absent, atomically under the shard lock.
     fn insert_if_absent(&mut self, key: Bytes, entry: DataEntry) -> bool {
-        self.purge_if_expired(&key, now());
+        self.purge_if_expired(&key, unix_seconds());
         if self.data.contains_key(&key) {
             false
         } else {
             self.op_count += 1;
-            self.last_modified = now();
+            self.last_modified = unix_seconds();
             let size = approx_entry_size(&key, &entry);
             self.data.insert(key, entry);
             self.mem_bytes = self.mem_bytes.saturating_add(size);
@@ -471,7 +472,7 @@ impl OnyxEngine {
     pub fn peek(&self, key: &Bytes) -> Option<DataEntry> {
         let shard_idx = shard_for_key(key);
         let mut shard = self.shards[shard_idx].lock().unwrap();
-        shard.purge_if_expired(key, now());
+        shard.purge_if_expired(key, unix_seconds());
         shard.data.get(key).cloned()
     }
 
@@ -479,8 +480,11 @@ impl OnyxEngine {
     pub fn apply_entry(&self, key: Bytes, entry: DataEntry) -> Option<DataEntry> {
         let shard_idx = shard_for_key(&key);
         let mut shard = self.shards[shard_idx].lock().unwrap();
-        shard.purge_if_expired(&key, now());
-        if entry.expires_at.is_some_and(|expiry| now() >= expiry) {
+        shard.purge_if_expired(&key, unix_seconds());
+        if entry
+            .expires_at
+            .is_some_and(|expiry| unix_seconds() >= expiry)
+        {
             return shard.remove(&key);
         }
         shard.insert(key, entry)
@@ -500,7 +504,7 @@ impl OnyxEngine {
             shard.data.clear();
             shard.mem_bytes = 0;
             shard.op_count += 1;
-            shard.last_modified = now();
+            shard.last_modified = unix_seconds();
         }
         for (key, entry) in entries {
             let shard_idx = shard_for_key(&key);
@@ -513,15 +517,15 @@ impl OnyxEngine {
     pub fn set(&self, key: Bytes, value: OnyxValue, expires: Option<u64>) -> Option<DataEntry> {
         let shard_idx = shard_for_key(&key);
         let mut shard = self.shards[shard_idx].lock().unwrap();
-        shard.purge_if_expired(&key, now());
-        if expires.is_some_and(|expiry| now() >= expiry) {
+        shard.purge_if_expired(&key, unix_seconds());
+        if expires.is_some_and(|expiry| unix_seconds() >= expiry) {
             return shard.remove(&key);
         }
         let entry = DataEntry {
             value,
             expires_at: expires,
-            created_at: now(),
-            last_accessed: now(),
+            created_at: unix_seconds(),
+            last_accessed: unix_seconds(),
         };
         shard.insert(key, entry)
     }
@@ -630,7 +634,7 @@ impl OnyxEngine {
     ) -> bool {
         let shard_idx = shard_for_key(&key);
         let mut shard = self.shards[shard_idx].lock().unwrap();
-        shard.purge_if_expired(&key, now());
+        shard.purge_if_expired(&key, unix_seconds());
         let exists = shard.data.contains_key(&key);
         let allowed = match condition {
             Some(true) => !exists, // NX
@@ -638,7 +642,7 @@ impl OnyxEngine {
             None => true,
         };
         if allowed {
-            let ts = now();
+            let ts = unix_seconds();
             shard.insert(
                 key,
                 DataEntry {
@@ -656,7 +660,7 @@ impl OnyxEngine {
     pub fn set_if_absent(&self, key: Bytes, value: OnyxValue) -> bool {
         let shard_idx = shard_for_key(&key);
         let mut shard = self.shards[shard_idx].lock().unwrap();
-        let ts = now();
+        let ts = unix_seconds();
         shard.insert_if_absent(
             key,
             DataEntry {
@@ -712,7 +716,7 @@ impl OnyxEngine {
     pub fn copy(&self, from: &Bytes, to: Bytes) -> bool {
         let from_shard = shard_for_key(from);
         let to_shard = shard_for_key(&to);
-        let timestamp = now();
+        let timestamp = unix_seconds();
 
         if from_shard == to_shard {
             let mut shard = self.shards[from_shard].lock().unwrap();
@@ -904,16 +908,4 @@ pub struct EngineStats {
     pub total_keys: usize,
     pub total_ops: u64,
     pub num_shards: usize,
-}
-
-// ============================================================
-// UTILS
-// ============================================================
-
-#[inline]
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
 }

@@ -23,12 +23,15 @@ the authoritative boundary for state changes.
 | Module | Responsibility | Current constraint |
 | --- | --- | --- |
 | `src/config.rs` | Startup argument/environment parsing, defaults, validation, secret-safe debug output | Pure configuration boundary; it does not start runtime services |
+| `src/clock.rs` | Shared wall-clock source for TTL, recovery, and lifecycle timestamps | Wall-clock seconds; not a monotonic duration source |
 | `src/client.rs` | Bounded RESP response parsing, command encoding, connections, and interactive argument tokenization | Tooling client; the server runtime does not depend on it |
 | `src/command.rs` | Shared mutation and replica-read command classification | Command names must be normalized before classification |
 | `src/engine.rs` | Sharded in-memory values, expiration, type-safe mutation primitives, logical memory accounting, eviction | 64 mutex-protected shards selected by FNV-1a |
+| `src/store.rs` | Typed data operations plus tentative mutation capture, admission, and rollback | Does not assign sequences or decide durability |
+| `src/store/json_path.rs` | Pure parsing and execution for the supported JSON field/index path subset | No persistence, protocol, or server dependencies |
 | `src/resp.rs` | Bounded RESP command framing and response encoding | RESP command subset, not complete Redis compatibility |
 | `src/protocol.rs` | Bounded OBP framing and encoding | Internal/experimental protocol with a small command subset |
-| `src/main.rs` | Store facade, command dispatch, authoritative mutation ordering, persistence, replication, networking, metrics, lifecycle | Still too broad; extraction remains incremental |
+| `src/main.rs` | Command dispatch, authoritative mutation ordering, committed effects, persistence, replication, networking, metrics, lifecycle | Still broad; durable ordering remains intentionally co-located |
 | `src/onyx-cli.rs` | Minimal interactive RESP client | Not a complete shell parser or `redis-cli` replacement |
 | `src/onyx-bench.rs` | Bounded RESP benchmark runner with repeatable workloads, percentiles, and error accounting | No OBP workload or coordinated-omission correction yet |
 
@@ -82,6 +85,20 @@ batch.
 Transactions containing writes hold the same ordering boundary for the whole
 execution. Successful effects are persisted and replicated as one batch. If
 batch persistence fails, every effect is rolled back.
+
+### Store mutation boundary
+
+The store owns engine-facing tentative mutation mechanics. `MutationAttempt`
+captures the exact affected entries plus pre-command key and logical-memory
+usage. After command semantics run, it enforces projected admission and returns
+ordered eviction victims. The server either derives canonical committed effects
+from that state or asks the same attempt to restore its baseline and victims.
+
+The store does not assign sequences, append the binlog, publish replication, or
+decide when a tentative mutation is durable. Those responsibilities remain on
+the server side of the boundary. Exact entry installation and full replacement
+APIs exist for validated recovery and synchronization paths; normal RESP command
+semantics use typed store operations.
 
 ## Engine semantics
 
@@ -260,7 +277,8 @@ must follow the actual dependency graph rather than target file size alone.
 
 The preferred dependency order, subject to new evidence, is:
 
-1. Extract the store/value semantics and JSON path implementation.
+1. Extract command execution and its typed mutation outcome without moving the
+   authoritative durability gate.
 2. Extract committed effects plus persistence codecs/recovery as one cohesive
    subsystem.
 3. Extract replication only after its ownership of durable identity, task

@@ -37,6 +37,11 @@ All notable changes to OnyxDB are documented in this file.
   secret debug output.
 - Established an experimental library boundary for the engine, protocol,
   command classification, and bounded RESP client components.
+- Extracted typed store and JSON path ownership from the server runtime, with a
+  persistence-independent mutation attempt boundary for capture, projected
+  admission, eviction, and rollback.
+- Unified engine, store, command expiration, and recovery checks on one shared
+  wall-clock source instead of a separately refreshed runtime cache.
 - Consolidated CLI and benchmark RESP handling onto one binary-safe, bounded
   response parser and command encoder.
 - Added a deterministic benchmark methodology with warmup, configurable GET,
