@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 mod codec;
 mod model;
 mod recovery;
+mod replica_state;
 mod runtime;
 pub(crate) use codec::*;
 pub(crate) use model::*;
 pub(crate) use recovery::*;
+pub(crate) use replica_state::*;
 pub(crate) use runtime::*;
 
 const SNAPSHOT_PATH: &str = "onyx.snapshot";

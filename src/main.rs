@@ -25,7 +25,8 @@ use onyxdb::{protocol, resp};
 use persistence::*;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,7 +36,9 @@ use tokio::io::{
     AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter as TokioBufWriter,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 // High-performance allocator.
@@ -43,8 +46,6 @@ use tracing::{error, info, warn};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const RUNTIME_LOCK_PATH: &str = "onyx.lock";
-const REPLICA_STATE_MAGIC: &str = "ONYXREPL";
-const REPLICA_STATE_VERSION: u8 = 2;
 const REPLICATION_CHUNK_SIZE: usize = 256 * 1024;
 const MAX_REPLICATION_FRAME_BULK_SIZE: i64 = (REPLICATION_CHUNK_SIZE * 2 + 64) as i64;
 const COMPACTION_THRESHOLD: usize = 100000;
@@ -168,18 +169,6 @@ fn check_credentials(username: &str, password: &str) -> bool {
     }
 }
 
-// ============================================================
-// FSYNC POLICY
-// - Always: fsync after every committed batch for maximum durability.
-// - EverySec: fsync once per second in the background. A system or hardware
-//   crash may lose up to approximately one second of acknowledged writes.
-// - No: flush userspace buffers without an explicit fsync.
-static FSYNC_POLICY: std::sync::OnceLock<FsyncPolicy> = std::sync::OnceLock::new();
-
-fn fsync_policy() -> FsyncPolicy {
-    *FSYNC_POLICY.get().unwrap_or(&FsyncPolicy::EverySec)
-}
-
 /// Opens or creates the binlog and retries transient I/O failures every three
 /// seconds. This is intentionally blocking because it runs only at startup.
 fn open_binlog_file(path: &Path) -> File {
@@ -227,23 +216,6 @@ static CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
 
 /// Maximum number of committed batches retained for partial synchronization.
 const BACKLOG_CAPACITY: usize = 10_000;
-
-enum LogMessage {
-    Append {
-        sequence: u64,
-        record: Vec<u8>,
-        completion: oneshot::Sender<Result<(), String>>,
-    },
-    Flush {
-        completion: oneshot::Sender<Result<(), String>>,
-    },
-    SyncData {
-        completion: oneshot::Sender<Result<(), String>>,
-    },
-    Truncate {
-        completion: oneshot::Sender<Result<(), String>>,
-    },
-}
 
 /// Monitoring state for a connected replica.
 struct ReplicaStatus {
@@ -371,23 +343,11 @@ impl<T> Drop for AbortTaskOnDrop<T> {
 }
 
 struct Persistence {
-    log_tx: mpsc::Sender<LogMessage>,
-    write_count: AtomicUsize,
-    compaction_pending: AtomicBool,
-    accepting_writes: AtomicBool,
-    /// Readers take a shared guard while commands observe state. Mutations,
-    /// replicated batches, and full-sync installation take an exclusive guard
-    /// so no client can observe a partially committed state transition. Code
-    /// that needs both gates must acquire write_gate before visibility_gate.
-    visibility_gate: Arc<tokio::sync::RwLock<()>>,
-    write_gate: Arc<tokio::sync::Mutex<()>>,
-    paths: PersistencePaths,
+    commit_runtime: CommitRuntime,
     // Broadcasts each committed batch to connected replicas with its sequence.
     replica_tx: tokio::sync::broadcast::Sender<(u64, CommittedBatch)>,
     // Marks a replica that has crossed the authoritative promotion boundary.
     promote_to_master: Arc<AtomicBool>,
-    // Monotonic committed-batch sequence used by persistence and replication.
-    repl_offset: AtomicU64,
     // Recent committed batches retained for gap-free partial synchronization.
     backlog: std::sync::Mutex<std::collections::VecDeque<(u64, CommittedBatch)>>,
     next_replica_id: AtomicU64,
@@ -399,10 +359,17 @@ struct Persistence {
     // Channel-to-subscriber IDs used to report PUBLISH recipient counts.
     subscriptions:
         std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<u64>>>,
-    failure: std::sync::Mutex<Option<String>>,
     upstream_replid: AtomicU64,
     replication_ready: AtomicBool,
     replica_lifecycle: Arc<ReplicaLifecycle>,
+}
+
+impl std::ops::Deref for Persistence {
+    type Target = CommitRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.commit_runtime
+    }
 }
 
 fn mark_persistence_failed(persistence: &Persistence, message: impl Into<String>) {
@@ -1620,187 +1587,8 @@ async fn active_expiration_task(store: Arc<ShardedStore>) {
         }
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReplicaIdentity {
-    replid: u64,
-    baseline_sequence: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DurableReplicaState {
-    Detached,
-    Installing,
-    Ready(ReplicaIdentity),
-}
-
-fn load_durable_replica_state(
-    paths: &PersistencePaths,
-    snapshot_watermark: u64,
-) -> Result<Option<DurableReplicaState>, PersistenceError> {
-    if !paths.replica_state.exists() {
-        return Ok(None);
-    }
-    let metadata = fs::metadata(&paths.replica_state)?;
-    if metadata.len() > MAX_SNAPSHOT_METADATA_SIZE as u64 {
-        return Err(PersistenceError::new(
-            "Replica identity metadata exceeds the format limit",
-        ));
-    }
-    let contents = fs::read_to_string(&paths.replica_state)?;
-    let fields: Vec<&str> = contents.trim_end().split('\t').collect();
-    if fields.len() != 5 || fields[0] != REPLICA_STATE_MAGIC {
-        return Err(PersistenceError::new("Malformed durable replica state"));
-    }
-    let version = fields[1]
-        .parse::<u8>()
-        .map_err(|_| PersistenceError::new("Invalid durable replica state version"))?;
-    if version != REPLICA_STATE_VERSION {
-        return Err(PersistenceError::new(format!(
-            "Unsupported durable replica state version: {}",
-            version
-        )));
-    }
-    let replid = fields[3]
-        .parse::<u64>()
-        .map_err(|_| PersistenceError::new("Invalid upstream replication ID"))?;
-    let baseline_sequence = fields[4]
-        .parse::<u64>()
-        .map_err(|_| PersistenceError::new("Invalid replica baseline sequence"))?;
-    match fields[2] {
-        "DETACHED" if replid == 0 && baseline_sequence == 0 => {
-            Ok(Some(DurableReplicaState::Detached))
-        }
-        "INSTALLING" if replid == 0 && baseline_sequence == 0 => {
-            Ok(Some(DurableReplicaState::Installing))
-        }
-        "READY" if replid != 0 => {
-            if baseline_sequence != snapshot_watermark {
-                warn!(
-                    "Replica identity does not match the installed snapshot; forcing a full synchronization"
-                );
-                Ok(Some(DurableReplicaState::Installing))
-            } else {
-                Ok(Some(DurableReplicaState::Ready(ReplicaIdentity {
-                    replid,
-                    baseline_sequence,
-                })))
-            }
-        }
-        _ => Err(PersistenceError::new(
-            "Invalid durable replica state fields",
-        )),
-    }
-}
-
-fn write_durable_replica_state(
-    paths: &PersistencePaths,
-    state: DurableReplicaState,
-) -> Result<(), PersistenceError> {
-    let (status, replid, baseline_sequence) = match state {
-        DurableReplicaState::Detached => ("DETACHED", 0, 0),
-        DurableReplicaState::Installing => ("INSTALLING", 0, 0),
-        DurableReplicaState::Ready(identity) => {
-            ("READY", identity.replid, identity.baseline_sequence)
-        }
-    };
-    let mut file = File::create(&paths.replica_state_temp)?;
-    writeln!(
-        file,
-        "{}\t{}\t{}\t{}\t{}",
-        REPLICA_STATE_MAGIC, REPLICA_STATE_VERSION, status, replid, baseline_sequence
-    )?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-    durable_rename(&paths.replica_state_temp, &paths.replica_state)?;
-    sync_parent_directory(&paths.replica_state)?;
-    Ok(())
-}
-
-fn write_replica_identity(
-    paths: &PersistencePaths,
-    identity: ReplicaIdentity,
-) -> Result<(), PersistenceError> {
-    write_durable_replica_state(paths, DurableReplicaState::Ready(identity))
-}
-
-fn write_replica_installing(paths: &PersistencePaths) -> Result<(), PersistenceError> {
-    write_durable_replica_state(paths, DurableReplicaState::Installing)
-}
-
-fn write_replica_detached(paths: &PersistencePaths) -> Result<(), PersistenceError> {
-    write_durable_replica_state(paths, DurableReplicaState::Detached)
-}
-
-#[cfg(test)]
-fn load_replica_identity(
-    paths: &PersistencePaths,
-    snapshot_watermark: u64,
-) -> Result<Option<ReplicaIdentity>, PersistenceError> {
-    Ok(
-        match load_durable_replica_state(paths, snapshot_watermark)? {
-            Some(DurableReplicaState::Ready(identity)) => Some(identity),
-            Some(DurableReplicaState::Detached | DurableReplicaState::Installing) | None => None,
-        },
-    )
-}
-
-fn prepare_replication_startup(
-    paths: &PersistencePaths,
-    snapshot_watermark: u64,
-    configured_as_replica: bool,
-) -> Result<Option<ReplicaIdentity>, PersistenceError> {
-    let state = load_durable_replica_state(paths, snapshot_watermark)?;
-    if configured_as_replica {
-        return Ok(match state {
-            Some(DurableReplicaState::Ready(identity)) => Some(identity),
-            Some(DurableReplicaState::Detached | DurableReplicaState::Installing) | None => None,
-        });
-    }
-    match state {
-        Some(DurableReplicaState::Installing) => Err(PersistenceError::new(
-            "Cannot start as master while replica baseline installation is incomplete",
-        )),
-        Some(DurableReplicaState::Ready(_)) => {
-            write_replica_detached(paths)?;
-            Ok(None)
-        }
-        Some(DurableReplicaState::Detached) | None => Ok(None),
-    }
-}
-
-async fn request_log_flush(persistence: &Persistence) -> Result<(), PersistenceError> {
-    let (completion_tx, completion_rx) = oneshot::channel();
-    persistence
-        .log_tx
-        .send(LogMessage::Flush {
-            completion: completion_tx,
-        })
-        .await
-        .map_err(|_| PersistenceError::new("Binlog worker is unavailable"))?;
-    completion_rx
-        .await
-        .map_err(|_| PersistenceError::new("Binlog flush completion was dropped"))?
-        .map_err(PersistenceError::new)
-}
-
-async fn request_log_sync_data(persistence: &Persistence) -> Result<(), PersistenceError> {
-    let (completion_tx, completion_rx) = oneshot::channel();
-    persistence
-        .log_tx
-        .send(LogMessage::SyncData {
-            completion: completion_tx,
-        })
-        .await
-        .map_err(|_| PersistenceError::new("Binlog worker is unavailable"))?;
-    completion_rx
-        .await
-        .map_err(|_| PersistenceError::new("Binlog sync completion was dropped"))?
-        .map_err(PersistenceError::new)
-}
-
 async fn run_periodic_sync_once(persistence: &Persistence) -> Result<(), PersistenceError> {
-    match request_log_sync_data(persistence).await {
+    match persistence.binlog.sync_data().await {
         Ok(()) => Ok(()),
         Err(error) => {
             mark_persistence_failed(
@@ -1812,127 +1600,14 @@ async fn run_periodic_sync_once(persistence: &Persistence) -> Result<(), Persist
     }
 }
 
-async fn request_log_truncate(persistence: &Persistence) -> Result<(), PersistenceError> {
-    let (completion_tx, completion_rx) = oneshot::channel();
-    persistence
-        .log_tx
-        .send(LogMessage::Truncate {
-            completion: completion_tx,
-        })
-        .await
-        .map_err(|_| PersistenceError::new("Binlog worker is unavailable"))?;
-    completion_rx
-        .await
-        .map_err(|_| PersistenceError::new("Binlog truncate completion was dropped"))?
-        .map_err(PersistenceError::new)
-}
-
-async fn run_binlog_worker(
-    mut receiver: mpsc::Receiver<LogMessage>,
-    binlog: Arc<std::sync::Mutex<File>>,
-) {
-    while let Some(message) = receiver.recv().await {
-        match message {
-            LogMessage::Append {
-                sequence,
-                record,
-                completion,
-            } => {
-                let result = (|| -> Result<(), PersistenceError> {
-                    let encoded = encode_versioned_binlog_record(sequence, &record)?;
-                    let length = u32::try_from(encoded.len()).map_err(|_| {
-                        PersistenceError::new("Binlog record exceeds the format limit")
-                    })?;
-                    let mut file = binlog
-                        .lock()
-                        .map_err(|_| PersistenceError::new("Binlog file lock is poisoned"))?;
-                    file.seek(SeekFrom::End(0))?;
-                    file.write_all(&length.to_be_bytes())?;
-                    file.write_all(&encoded)?;
-                    file.flush()?;
-                    if fsync_policy() == FsyncPolicy::Always {
-                        file.sync_data()?;
-                    }
-                    Ok(())
-                })();
-                let _ = completion.send(result.map_err(|error| error.to_string()));
-            }
-            LogMessage::Flush { completion } => {
-                let result = (|| -> Result<(), PersistenceError> {
-                    let mut file = binlog
-                        .lock()
-                        .map_err(|_| PersistenceError::new("Binlog file lock is poisoned"))?;
-                    file.flush()?;
-                    file.sync_all()?;
-                    Ok(())
-                })();
-                let _ = completion.send(result.map_err(|error| error.to_string()));
-            }
-            LogMessage::SyncData { completion } => {
-                let result = (|| -> Result<(), PersistenceError> {
-                    let file = binlog
-                        .lock()
-                        .map_err(|_| PersistenceError::new("Binlog file lock is poisoned"))?;
-                    file.sync_data()?;
-                    Ok(())
-                })();
-                let _ = completion.send(result.map_err(|error| error.to_string()));
-            }
-            LogMessage::Truncate { completion } => {
-                let result = (|| -> Result<(), PersistenceError> {
-                    let mut file = binlog
-                        .lock()
-                        .map_err(|_| PersistenceError::new("Binlog file lock is poisoned"))?;
-                    file.flush()?;
-                    file.set_len(0)?;
-                    file.seek(SeekFrom::Start(0))?;
-                    file.sync_all()?;
-                    Ok(())
-                })();
-                let _ = completion.send(result.map_err(|error| error.to_string()));
-            }
-        }
-    }
-}
-
 async fn compact_store(
     store: &Arc<ShardedStore>,
     persistence: &Arc<Persistence>,
 ) -> Result<u64, PersistenceError> {
-    let _write_guard = persistence.write_gate.lock().await;
-    request_log_flush(persistence)
+    persistence
+        .commit_runtime
+        .compact(store, &persistence.upstream_replid)
         .await
-        .map_err(|error| PersistenceError::new(format!("Binlog flush failed: {}", error)))?;
-
-    let watermark = persistence.repl_offset.load(Ordering::SeqCst);
-    let entries = store.raw_entries();
-    let paths = persistence.paths.clone();
-    tokio::task::spawn_blocking(move || write_snapshot_file(entries, watermark, &paths))
-        .await
-        .map_err(|error| PersistenceError::new(format!("Snapshot task failed: {}", error)))?
-        .map_err(|error| {
-            PersistenceError::new(format!("Snapshot installation failed: {}", error))
-        })?;
-
-    request_log_truncate(persistence)
-        .await
-        .map_err(|error| PersistenceError::new(format!("Binlog rotation failed: {}", error)))?;
-    let upstream_replid = persistence.upstream_replid.load(Ordering::SeqCst);
-    if upstream_replid != 0 {
-        write_replica_identity(
-            &persistence.paths,
-            ReplicaIdentity {
-                replid: upstream_replid,
-                baseline_sequence: watermark,
-            },
-        )?;
-    }
-    persistence.write_count.store(0, Ordering::SeqCst);
-    info!(
-        "Compaction complete at sequence {}: snapshot installed and binlog truncated",
-        watermark
-    );
-    Ok(watermark)
 }
 fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) -> String {
     let uptime = now().saturating_sub(START_TIME.load(Ordering::Relaxed));
@@ -2158,38 +1833,6 @@ async fn handle_obp_client_with_timeouts(
     let _ = tokio::time::timeout(frame_timeout, buf_writer.flush()).await;
 }
 
-async fn append_committed_batch(
-    persistence: &Persistence,
-    sequence: u64,
-    batch: &CommittedBatch,
-) -> Result<(), PersistenceError> {
-    let effect_record = encode_committed_batch(batch)?;
-
-    let (completion_tx, completion_rx) = oneshot::channel();
-    persistence
-        .log_tx
-        .send(LogMessage::Append {
-            sequence,
-            record: effect_record,
-            completion: completion_tx,
-        })
-        .await
-        .map_err(|_| PersistenceError::new("Binlog worker is unavailable"))?;
-    completion_rx
-        .await
-        .map_err(|_| PersistenceError::new("Binlog append completion was dropped"))?
-        .map_err(PersistenceError::new)?;
-    Ok(())
-}
-
-fn record_persisted_write(persistence: &Persistence) -> bool {
-    persistence.write_count.fetch_add(1, Ordering::SeqCst) + 1 >= COMPACTION_THRESHOLD
-        && persistence
-            .compaction_pending
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-}
-
 /// Persists and publishes one already-applied master mutation at its assigned
 /// sequence. The caller must own the authoritative commit boundary.
 async fn persist_and_publish_master_batch(
@@ -2197,7 +1840,7 @@ async fn persist_and_publish_master_batch(
     sequence: u64,
     batch: &CommittedBatch,
 ) -> Result<bool, PersistenceError> {
-    append_committed_batch(persistence, sequence, batch).await?;
+    persistence.binlog.append_batch(sequence, batch).await?;
     persistence.repl_offset.store(sequence, Ordering::SeqCst);
     // The exact same committed batch is published to the backlog and live
     // replication only after its binlog append has been acknowledged.
@@ -2213,7 +1856,7 @@ async fn persist_and_publish_master_batch(
     }
     let _ = persistence.replica_tx.send((sequence, batch.clone()));
 
-    Ok(record_persisted_write(persistence))
+    Ok(persistence.record_persisted_write(COMPACTION_THRESHOLD))
 }
 
 async fn finalize_master_commit(
@@ -2287,8 +1930,7 @@ async fn persist_and_apply_replica_effect(
     sequence: u64,
     batch: &CommittedBatch,
 ) -> Result<(), PersistenceError> {
-    let boundary =
-        CommitBoundary::acquire(&persistence.write_gate, &persistence.visibility_gate).await;
+    let boundary = persistence.acquire_commit_boundary().await;
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
         return Err(PersistenceError::new(persistence_unavailable_message(
             persistence,
@@ -2313,8 +1955,10 @@ async fn persist_and_apply_replica_effect(
     let persistence_for_finalizer = Arc::clone(persistence);
     let batch = batch.clone();
     let finalizer = tokio::spawn(async move {
-        if let Err(error) =
-            append_committed_batch(&persistence_for_finalizer, sequence, &batch).await
+        if let Err(error) = persistence_for_finalizer
+            .binlog
+            .append_batch(sequence, &batch)
+            .await
         {
             mark_persistence_failed(
                 &persistence_for_finalizer,
@@ -2329,7 +1973,7 @@ async fn persist_and_apply_replica_effect(
         persistence_for_finalizer
             .repl_offset
             .store(sequence, Ordering::SeqCst);
-        let should_compact = record_persisted_write(&persistence_for_finalizer);
+        let should_compact = persistence_for_finalizer.record_persisted_write(COMPACTION_THRESHOLD);
         drop(boundary);
         schedule_compaction(&store, &persistence_for_finalizer, should_compact);
         Ok(())
@@ -2393,13 +2037,13 @@ async fn install_full_sync(
         )));
     }
     persistence.replication_ready.store(false, Ordering::SeqCst);
-    request_log_flush(persistence).await?;
+    persistence.binlog.flush().await?;
     // Invalidate promotability durably before truncating the old incremental
     // history. A crash from this point until the new identity is installed
     // must force another full synchronization rather than promote an older
     // snapshot whose post-boundary log may already be gone.
     write_replica_installing(&persistence.paths)?;
-    request_log_truncate(persistence).await?;
+    persistence.binlog.truncate().await?;
     let entries = staging.raw_entries();
     let snapshot_entries = entries.clone();
     let paths = persistence.paths.clone();
@@ -2446,7 +2090,7 @@ async fn commit_replica_promotion(persistence: &Arc<Persistence>) -> Result<(), 
             "Replica is not durably synchronized and cannot be promoted",
         ));
     }
-    request_log_flush(persistence).await?;
+    persistence.binlog.flush().await?;
     write_replica_detached(&persistence.paths)?;
     persistence.upstream_replid.store(0, Ordering::SeqCst);
     persistence.replication_ready.store(false, Ordering::SeqCst);
@@ -2495,8 +2139,7 @@ async fn execute_transaction(
         );
     }
 
-    let boundary =
-        CommitBoundary::acquire(&persistence.write_gate, &persistence.visibility_gate).await;
+    let boundary = persistence.acquire_commit_boundary().await;
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
         return RESPValue::Error(persistence_unavailable_message(persistence));
     }
@@ -2590,8 +2233,7 @@ async fn execute_ordered_command(
         return execute_command(store, args);
     }
 
-    let boundary =
-        CommitBoundary::acquire(&persistence.write_gate, &persistence.visibility_gate).await;
+    let boundary = persistence.acquire_commit_boundary().await;
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
         return CommandOutcome {
             response: RESPValue::Error(persistence_unavailable_message(persistence)),
@@ -2748,9 +2390,7 @@ async fn execute_obp_command(
         }
         0x02 => {
             if args.len() >= 2 {
-                let boundary =
-                    CommitBoundary::acquire(&persistence.write_gate, &persistence.visibility_gate)
-                        .await;
+                let boundary = persistence.acquire_commit_boundary().await;
                 if !persistence.accepting_writes.load(Ordering::SeqCst) {
                     return OBPFrame {
                         cmd: 0x00,
@@ -2831,9 +2471,7 @@ async fn execute_obp_command(
         }
         0x03 => {
             if let Some(key) = args.first() {
-                let boundary =
-                    CommitBoundary::acquire(&persistence.write_gate, &persistence.visibility_gate)
-                        .await;
+                let boundary = persistence.acquire_commit_boundary().await;
                 if !persistence.accepting_writes.load(Ordering::SeqCst) {
                     return OBPFrame {
                         cmd: 0x00,
@@ -2950,7 +2588,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if num_users > 0 {
         info!("Authentication required: {} user(s) configured", num_users);
     }
-    FSYNC_POLICY.set(policy).ok();
     info!("Binlog fsync policy: {:?}", policy);
     if maxmemory_val > 0 {
         info!(
@@ -2999,19 +2636,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let promote_flag = Arc::new(AtomicBool::new(false));
     let replica_lifecycle = Arc::new(ReplicaLifecycle::new(master_addr.is_none()));
     let persistence = Arc::new(Persistence {
-        log_tx: tx,
-        write_count: AtomicUsize::new(0),
-        compaction_pending: AtomicBool::new(false),
+        commit_runtime: CommitRuntime::new(
+            BinlogHandle::new(tx),
+            recovery.last_sequence,
+            paths.clone(),
+        ),
         replica_tx,
         promote_to_master: Arc::clone(&promote_flag),
-        repl_offset: AtomicU64::new(recovery.last_sequence),
         backlog: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(BACKLOG_CAPACITY)),
         next_replica_id: AtomicU64::new(0),
         replica_status: std::sync::Mutex::new(std::collections::HashMap::new()),
         pubsub_tx,
         next_subscriber_id: AtomicU64::new(0),
         subscriptions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        failure: std::sync::Mutex::new(None),
         upstream_replid: AtomicU64::new(
             recovered_replica_identity
                 .map(|identity| identity.replid)
@@ -3019,17 +2656,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         replication_ready: AtomicBool::new(recovered_replica_identity.is_some()),
         replica_lifecycle,
-        accepting_writes: AtomicBool::new(true),
-        visibility_gate: Arc::new(tokio::sync::RwLock::new(())),
-        write_gate: Arc::new(tokio::sync::Mutex::new(())),
-        paths: paths.clone(),
     });
 
     let binlog_shared: Arc<std::sync::Mutex<File>> =
         Arc::new(std::sync::Mutex::new(open_binlog_file(&paths.binlog)));
 
     // The default `everysec` policy synchronizes the current binlog once per second.
-    if fsync_policy() == FsyncPolicy::EverySec {
+    if policy == FsyncPolicy::EverySec {
         let persistence_fsync = Arc::clone(&persistence);
         tokio::spawn(async move {
             loop {
@@ -3042,7 +2675,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let binlog_writer = Arc::clone(&binlog_shared);
-    tokio::spawn(run_binlog_worker(rx, binlog_writer));
+    tokio::spawn(run_binlog_worker(rx, binlog_writer, policy));
 
     if let Some(addr) = master_addr {
         IS_REPLICA.store(true, Ordering::Relaxed);
@@ -4084,26 +3717,18 @@ mod tests {
         let (replica_tx, _) = tokio::sync::broadcast::channel(4096);
         let (pubsub_tx, _) = tokio::sync::broadcast::channel(16);
         Arc::new(Persistence {
-            log_tx,
-            write_count: AtomicUsize::new(0),
-            compaction_pending: AtomicBool::new(false),
+            commit_runtime: CommitRuntime::new(BinlogHandle::new(log_tx), initial_sequence, paths),
             replica_tx,
             promote_to_master: Arc::new(AtomicBool::new(false)),
-            repl_offset: AtomicU64::new(initial_sequence),
             backlog: std::sync::Mutex::new(std::collections::VecDeque::new()),
             next_replica_id: AtomicU64::new(0),
             replica_status: std::sync::Mutex::new(std::collections::HashMap::new()),
             pubsub_tx,
             next_subscriber_id: AtomicU64::new(0),
             subscriptions: std::sync::Mutex::new(std::collections::HashMap::new()),
-            failure: std::sync::Mutex::new(None),
             upstream_replid: AtomicU64::new(0),
             replication_ready: AtomicBool::new(false),
             replica_lifecycle: Arc::new(ReplicaLifecycle::new(true)),
-            accepting_writes: AtomicBool::new(true),
-            visibility_gate: Arc::new(tokio::sync::RwLock::new(())),
-            write_gate: Arc::new(tokio::sync::Mutex::new(())),
-            paths,
         })
     }
 
@@ -4157,6 +3782,7 @@ mod tests {
         let worker = tokio::spawn(run_binlog_worker(
             receiver,
             Arc::new(std::sync::Mutex::new(file)),
+            FsyncPolicy::EverySec,
         ));
         (persistence, worker)
     }
@@ -5338,7 +4964,7 @@ mod tests {
             OnyxValue::Int(10)
         ));
 
-        request_log_flush(&persistence).await.unwrap();
+        persistence.binlog.flush().await.unwrap();
         drop(persistence);
         worker.await.unwrap();
 
@@ -6136,7 +5762,7 @@ mod tests {
             assert_eq!(backlog.front().unwrap().1.effects.len(), 2);
         }
 
-        request_log_flush(&persistence).await.unwrap();
+        persistence.binlog.flush().await.unwrap();
         drop(persistence);
         worker.await.unwrap();
 
@@ -6197,7 +5823,7 @@ mod tests {
         apply_test_command(&store, &persistence, &["LPOP", "list"]).await;
         assert!(!store.exists("list"));
 
-        request_log_flush(&persistence).await.unwrap();
+        persistence.binlog.flush().await.unwrap();
         drop(persistence);
         worker.await.unwrap();
 
@@ -6686,7 +6312,7 @@ mod tests {
             MUTATION_COUNT
         );
 
-        request_log_flush(&persistence).await.unwrap();
+        persistence.binlog.flush().await.unwrap();
         let mut binlog_sequences = Vec::new();
         for_each_binlog_record(&directory.paths.binlog, |record| {
             let DecodedBinlogRecord::Versioned { sequence, .. } = decode_binlog_record(record)?;
@@ -6749,7 +6375,7 @@ mod tests {
             assert_eq!(store.lrange(&key, 0, -1), Ok(vec!["new".to_string()]));
         }
 
-        request_log_flush(&persistence).await.unwrap();
+        persistence.binlog.flush().await.unwrap();
         drop(persistence);
         worker.await.unwrap();
     }
@@ -7275,7 +6901,7 @@ mod tests {
         assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
         assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
 
-        request_log_flush(&persistence).await.unwrap();
+        persistence.binlog.flush().await.unwrap();
         drop(persistence);
         worker.await.unwrap();
 
@@ -7315,7 +6941,7 @@ mod tests {
             offset_before_overflow
         );
 
-        request_log_flush(&persistence).await.unwrap();
+        persistence.binlog.flush().await.unwrap();
         drop(persistence);
         worker.await.unwrap();
 
@@ -7638,7 +7264,7 @@ mod tests {
             false,
         )
         .await;
-        request_log_flush(&persistence).await.unwrap();
+        persistence.binlog.flush().await.unwrap();
         drop(persistence);
         worker.await.unwrap();
 
@@ -7663,7 +7289,7 @@ mod tests {
             false,
         )
         .await;
-        request_log_flush(&persistence).await.unwrap();
+        persistence.binlog.flush().await.unwrap();
         drop(persistence);
         worker.await.unwrap();
 
@@ -7713,7 +7339,7 @@ mod tests {
             .unwrap();
         let expected = persistent_state(&store);
 
-        request_log_flush(&persistence).await.unwrap();
+        persistence.binlog.flush().await.unwrap();
         drop(persistence);
         worker.await.unwrap();
         let recovered = ShardedStore::new();

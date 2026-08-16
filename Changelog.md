@@ -51,6 +51,9 @@ All notable changes to OnyxDB are documented in this file.
 - Consolidated committed-effect models, checksummed ONX4 and snapshot codecs,
   bounded recovery, and atomic snapshot installation under a dedicated
   persistence module.
+- Moved authoritative sequence state, binlog worker operations, compaction,
+  durable replica identity, and cancellation-safe commit guards under one
+  persistence runtime boundary.
 - Consolidated CLI and benchmark RESP handling onto one binary-safe, bounded
   response parser and command encoder.
 - Added a deterministic benchmark methodology with warmup, configurable GET,

@@ -30,10 +30,10 @@ the authoritative boundary for state changes.
 | `src/store.rs` | Typed data operations plus tentative mutation capture, admission, and rollback | Does not assign sequences or decide durability |
 | `src/store/json_path.rs` | Pure parsing and execution for the supported JSON field/index path subset | No persistence, protocol, or server dependencies |
 | `src/execution.rs` | RESP data-command semantics, affected-key planning, and typed mutation outcomes | Tentative outcomes do not decide admission or durability |
-| `src/persistence/` | Committed-effect model, ONX4 and snapshot codecs, bounded recovery, atomic snapshot installation, and cancellation-safe commit guards | Runtime sequence publication and replication fan-out are still server-owned |
+| `src/persistence/` | Committed-effect model, ONX4 and snapshot codecs, bounded recovery, binlog worker, authoritative sequence state, compaction, durable replica state, and cancellation-safe commit guards | Replication fan-out and lifecycle task supervision are still server-owned |
 | `src/resp.rs` | Bounded RESP command framing and response encoding | RESP command subset, not complete Redis compatibility |
 | `src/protocol.rs` | Bounded OBP framing and encoding | Internal/experimental protocol with a small command subset |
-| `src/main.rs` | Runtime commands, authoritative mutation ordering, committed effects, persistence, replication, networking, metrics, lifecycle | Still broad; durable ordering remains intentionally co-located |
+| `src/main.rs` | Runtime commands, tentative-to-durable commit coordination, replication publication and task lifecycle, networking, metrics, shutdown | Still broad; publication remains adjacent to durable acceptance |
 | `src/onyx-cli.rs` | Minimal interactive RESP client | Not a complete shell parser or `redis-cli` replacement |
 | `src/onyx-bench.rs` | Bounded RESP benchmark runner with repeatable workloads, percentiles, and error accounting | No OBP workload or coordinated-omission correction yet |
 
@@ -294,22 +294,21 @@ must follow the actual dependency graph rather than target file size alone.
 - `main.rs` remains large during the transition.
 - Each extraction must preserve the invariants in this document and include
   focused tests for its new public/internal boundary.
-- Persistence and replication should not be separated until shared sequence,
-  lifecycle, and write-gate ownership has an explicit home.
+- Durable sequence, binlog, compaction, and write-gate ownership now have an
+  explicit persistence runtime. Replication publication remains adjacent until
+  its post-acceptance handoff can be extracted without creating a second order.
 - Temporary duplication is acceptable only inside one reviewable transition;
   permanent parallel implementations of command classification, framing, or
   committed-effect semantics are not.
 
 ## Next decomposition candidates
 
-The preferred dependency order, subject to new evidence, is:
+The remaining preferred dependency order, subject to new evidence, is:
 
-1. Consolidate sequence assignment and durable acceptance behind the
-   persistence boundary without moving replica lifecycle ownership.
-2. Extract replication only after its ownership of durable identity, task
+1. Extract replication only after its ownership of durable identity, task
    cancellation, and sequence publication is explicit.
-3. Extract listener ownership, connection supervision, metrics, and shutdown.
-4. Reduce `main.rs` to process bootstrap and top-level error reporting.
+2. Extract listener ownership, connection supervision, metrics, and shutdown.
+3. Reduce `main.rs` to process bootstrap and top-level error reporting.
 
 Benchmark modernization should precede performance optimization. Public
 performance claims require reproducible workloads, latency percentiles,
