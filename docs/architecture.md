@@ -30,6 +30,7 @@ the authoritative boundary for state changes.
 | `src/store.rs` | Typed data operations plus tentative mutation capture, admission, and rollback | Does not assign sequences or decide durability |
 | `src/store/json_path.rs` | Pure parsing and execution for the supported JSON field/index path subset | No persistence, protocol, or server dependencies |
 | `src/execution.rs` | RESP data-command semantics, affected-key planning, and typed mutation outcomes | Tentative outcomes do not decide admission or durability |
+| `src/persistence/` | Committed-effect model, ONX4 and snapshot codecs, bounded recovery, and atomic snapshot installation | Runtime sequence assignment and replication publication are still server-owned |
 | `src/resp.rs` | Bounded RESP command framing and response encoding | RESP command subset, not complete Redis compatibility |
 | `src/protocol.rs` | Bounded OBP framing and encoding | Internal/experimental protocol with a small command subset |
 | `src/main.rs` | Runtime commands, authoritative mutation ordering, committed effects, persistence, replication, networking, metrics, lifecycle | Still broad; durable ordering remains intentionally co-located |
@@ -291,8 +292,8 @@ must follow the actual dependency graph rather than target file size alone.
 
 The preferred dependency order, subject to new evidence, is:
 
-1. Extract committed effects plus persistence codecs/recovery as one cohesive
-   subsystem.
+1. Consolidate sequence assignment and durable acceptance behind the
+   persistence boundary without moving replica lifecycle ownership.
 2. Extract replication only after its ownership of durable identity, task
    cancellation, and sequence publication is explicit.
 3. Extract listener ownership, connection supervision, metrics, and shutdown.

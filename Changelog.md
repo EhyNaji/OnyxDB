@@ -45,6 +45,9 @@ All notable changes to OnyxDB are documented in this file.
 - Extracted RESP data-command execution and affected-key planning behind typed
   read, no-change, tentative, and committed mutation outcomes while retaining
   authoritative durability decisions in the server.
+- Consolidated committed-effect models, checksummed ONX4 and snapshot codecs,
+  bounded recovery, and atomic snapshot installation under a dedicated
+  persistence module.
 - Consolidated CLI and benchmark RESP handling onto one binary-safe, bounded
   response parser and command encoder.
 - Added a deterministic benchmark methodology with warmup, configurable GET,
