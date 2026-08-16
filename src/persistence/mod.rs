@@ -42,6 +42,7 @@ impl PersistencePaths {
 pub(crate) struct PersistenceError {
     message: String,
     upstream_unavailable: bool,
+    indeterminate: bool,
 }
 
 impl PersistenceError {
@@ -49,6 +50,7 @@ impl PersistenceError {
         Self {
             message: message.into(),
             upstream_unavailable: false,
+            indeterminate: false,
         }
     }
 
@@ -56,11 +58,24 @@ impl PersistenceError {
         Self {
             message: message.into(),
             upstream_unavailable: true,
+            indeterminate: false,
+        }
+    }
+
+    pub(crate) fn indeterminate(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_unavailable: false,
+            indeterminate: true,
         }
     }
 
     pub(crate) fn indicates_upstream_unavailable(&self) -> bool {
         self.upstream_unavailable
+    }
+
+    pub(crate) fn is_indeterminate(&self) -> bool {
+        self.indeterminate
     }
 }
 

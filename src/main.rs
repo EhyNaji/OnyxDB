@@ -384,6 +384,22 @@ fn mark_persistence_failed(persistence: &Persistence, message: impl Into<String>
     error!("Persistence entered a failed state: {}", message);
 }
 
+fn enter_persistence_fail_stop_with_boundary(
+    persistence: &Persistence,
+    boundary: CommitBoundary,
+    message: impl Into<String>,
+) {
+    persistence.replication_ready.store(false, Ordering::SeqCst);
+    persistence.replica_lifecycle.request_stop();
+    persistence.enter_fail_stop_with_boundary(boundary, message);
+}
+
+async fn enter_persistence_fail_stop(persistence: &Persistence, message: impl Into<String>) {
+    persistence.replication_ready.store(false, Ordering::SeqCst);
+    persistence.replica_lifecycle.request_stop();
+    persistence.enter_fail_stop(message).await;
+}
+
 fn persistence_unavailable_message(persistence: &Persistence) -> String {
     let reason = persistence
         .failure
@@ -1588,10 +1604,12 @@ async fn run_periodic_sync_once(persistence: &Persistence) -> Result<(), Persist
     match persistence.binlog.sync_data().await {
         Ok(()) => Ok(()),
         Err(error) => {
-            mark_persistence_failed(
-                persistence,
-                format!("Periodic binlog sync failed: {}", error),
-            );
+            let message = format!("Periodic binlog sync failed: {}", error);
+            if error.is_indeterminate() {
+                enter_persistence_fail_stop(persistence, message).await;
+            } else {
+                mark_persistence_failed(persistence, message);
+            }
             Err(error)
         }
     }
@@ -1606,6 +1624,18 @@ async fn compact_store(
         .compact(store, &persistence.upstream_replid)
         .await
 }
+
+async fn await_persistence_fail_stop(persistence: &Persistence) -> PersistenceError {
+    let reason = persistence.wait_for_fail_stop().await;
+    persistence.replication_ready.store(false, Ordering::SeqCst);
+    persistence.replica_lifecycle.request_stop();
+    error!(
+        "Terminating without compaction after an indeterminate persistence outcome: {}",
+        reason
+    );
+    PersistenceError::indeterminate(reason)
+}
+
 fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) -> String {
     let uptime = now().saturating_sub(START_TIME.load(Ordering::Relaxed));
     let num_keys = store.stats().total_keys;
@@ -1700,6 +1730,10 @@ async fn run_metrics_server(
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf).await;
 
+            let _visibility_guard = persistence_clone.visibility_gate.read().await;
+            if persistence_clone.is_fail_stopped() {
+                return;
+            }
             let body = format_prometheus_metrics(&store_clone, &persistence_clone);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1857,6 +1891,54 @@ async fn persist_and_publish_master_batch(
     Ok(should_compact)
 }
 
+struct PersistenceCommitGuard {
+    persistence: Arc<Persistence>,
+    boundary: Option<CommitBoundary>,
+    interruption_context: &'static str,
+}
+
+impl PersistenceCommitGuard {
+    fn new(
+        persistence: Arc<Persistence>,
+        boundary: CommitBoundary,
+        interruption_context: &'static str,
+    ) -> Self {
+        Self {
+            persistence,
+            boundary: Some(boundary),
+            interruption_context,
+        }
+    }
+
+    fn release(mut self) {
+        self.boundary.take();
+    }
+
+    fn fail_stop(mut self, message: impl Into<String>) {
+        let boundary = self
+            .boundary
+            .take()
+            .expect("an armed persistence commit guard owns its boundary");
+        enter_persistence_fail_stop_with_boundary(&self.persistence, boundary, message);
+    }
+}
+
+impl Drop for PersistenceCommitGuard {
+    fn drop(&mut self) {
+        let Some(boundary) = self.boundary.take() else {
+            return;
+        };
+        enter_persistence_fail_stop_with_boundary(
+            &self.persistence,
+            boundary,
+            format!(
+                "{} was interrupted before its persistence outcome became authoritative",
+                self.interruption_context
+            ),
+        );
+    }
+}
+
 async fn finalize_master_commit(
     store: Arc<ShardedStore>,
     persistence: Arc<Persistence>,
@@ -1866,20 +1948,30 @@ async fn finalize_master_commit(
     rollback: MutationRollback,
     failure_context: &'static str,
 ) -> Result<(), PersistenceError> {
+    let commit_guard =
+        PersistenceCommitGuard::new(Arc::clone(&persistence), boundary, failure_context);
     let persistence_result = persist_and_publish_master_batch(&persistence, sequence, &batch).await;
     let should_compact = match persistence_result {
         Ok(should_compact) => should_compact,
         Err(error) => {
+            if error.is_indeterminate() {
+                commit_guard.fail_stop(format!(
+                    "{} at sequence {}: {}",
+                    failure_context, sequence, error
+                ));
+                return Err(error);
+            }
             rollback.restore(&store);
             mark_persistence_failed(
                 &persistence,
                 format!("{} at sequence {}: {}", failure_context, sequence, error),
             );
+            commit_guard.release();
             return Err(error);
         }
     };
 
-    drop(boundary);
+    commit_guard.release();
     schedule_compaction(&store, &persistence, should_compact);
     Ok(())
 }
@@ -1891,8 +1983,13 @@ async fn await_commit_finalizer(
     match finalizer.await {
         Ok(result) => result,
         Err(error) => {
-            let error = PersistenceError::new(format!("Commit finalizer failed: {}", error));
-            mark_persistence_failed(persistence, error.to_string());
+            let error = PersistenceError::indeterminate(format!(
+                "Commit finalizer completion is indeterminate: {}",
+                error
+            ));
+            if !persistence.is_fail_stopped() {
+                enter_persistence_fail_stop(persistence, error.to_string()).await;
+            }
             Err(error)
         }
     }
@@ -1953,12 +2050,24 @@ async fn persist_and_apply_replica_effect(
     let persistence_for_finalizer = Arc::clone(persistence);
     let batch = batch.clone();
     let finalizer = tokio::spawn(async move {
+        let commit_guard = PersistenceCommitGuard::new(
+            Arc::clone(&persistence_for_finalizer),
+            boundary,
+            "Replicated effect commit finalizer",
+        );
         let should_compact = match persistence_for_finalizer
             .accept_next_batch(sequence, &batch, COMPACTION_THRESHOLD)
             .await
         {
             Ok(should_compact) => should_compact,
             Err(error) => {
+                if error.is_indeterminate() {
+                    commit_guard.fail_stop(format!(
+                        "Replicated effect persistence is indeterminate at sequence {}: {}",
+                        sequence, error
+                    ));
+                    return Err(error);
+                }
                 mark_persistence_failed(
                     &persistence_for_finalizer,
                     format!(
@@ -1966,11 +2075,12 @@ async fn persist_and_apply_replica_effect(
                         sequence, error
                     ),
                 );
+                commit_guard.release();
                 return Err(error);
             }
         };
         apply_committed_batch(&store, &batch);
-        drop(boundary);
+        commit_guard.release();
         schedule_compaction(&store, &persistence_for_finalizer, should_compact);
         Ok(())
     });
@@ -2018,8 +2128,7 @@ async fn install_full_sync(
             "Full synchronization requires a non-zero replication ID",
         ));
     }
-    let _write_guard = persistence.write_gate.lock().await;
-    let _visibility_guard = persistence.visibility_gate.write().await;
+    let boundary = persistence.acquire_commit_boundary().await;
     if persistence.promote_to_master.load(Ordering::SeqCst)
         || persistence.replica_lifecycle.stop_requested()
     {
@@ -2033,28 +2142,62 @@ async fn install_full_sync(
         )));
     }
     persistence.replication_ready.store(false, Ordering::SeqCst);
-    persistence.binlog.flush().await?;
+    if let Err(error) = persistence.binlog.flush().await {
+        if error.is_indeterminate() {
+            enter_persistence_fail_stop_with_boundary(
+                persistence,
+                boundary,
+                format!("Replica baseline flush is indeterminate: {}", error),
+            );
+        }
+        return Err(error);
+    }
     // Invalidate promotability durably before truncating the old incremental
     // history. A crash from this point until the new identity is installed
     // must force another full synchronization rather than promote an older
     // snapshot whose post-boundary log may already be gone.
     write_replica_installing(&persistence.paths)?;
-    persistence.binlog.truncate().await?;
+    if let Err(error) = persistence.binlog.truncate().await {
+        if error.is_indeterminate() {
+            enter_persistence_fail_stop_with_boundary(
+                persistence,
+                boundary,
+                format!("Replica baseline rotation is indeterminate: {}", error),
+            );
+        }
+        return Err(error);
+    }
     let entries = staging.raw_entries();
     let snapshot_entries = entries.clone();
     let paths = persistence.paths.clone();
-    tokio::task::spawn_blocking(move || write_snapshot_file(snapshot_entries, sequence, &paths))
-        .await
-        .map_err(|error| {
-            PersistenceError::new(format!("Replica snapshot task failed: {}", error))
-        })??;
-    write_replica_identity(
+    let snapshot_result = tokio::task::spawn_blocking(move || {
+        write_snapshot_file(snapshot_entries, sequence, &paths)
+    })
+    .await
+    .map_err(|error| PersistenceError::new(format!("Replica snapshot task failed: {}", error)))
+    .and_then(|result| result);
+    if let Err(error) = snapshot_result {
+        let error = PersistenceError::indeterminate(format!(
+            "Replica baseline snapshot failed after binlog rotation: {}",
+            error
+        ));
+        enter_persistence_fail_stop_with_boundary(persistence, boundary, error.to_string());
+        return Err(error);
+    }
+    if let Err(error) = write_replica_identity(
         &persistence.paths,
         ReplicaIdentity {
             replid,
             baseline_sequence: sequence,
         },
-    )?;
+    ) {
+        let error = PersistenceError::indeterminate(format!(
+            "Replica identity installation failed after baseline replacement: {}",
+            error
+        ));
+        enter_persistence_fail_stop_with_boundary(persistence, boundary, error.to_string());
+        return Err(error);
+    }
 
     store.replace_all(entries);
     persistence.install_baseline(sequence);
@@ -2079,13 +2222,22 @@ async fn prepare_replica_promotion(persistence: &Arc<Persistence>) -> Result<(),
 }
 
 async fn commit_replica_promotion(persistence: &Arc<Persistence>) -> Result<(), PersistenceError> {
-    let _write_guard = persistence.write_gate.lock().await;
+    let boundary = persistence.acquire_commit_boundary().await;
     if !persistence.replication_ready.load(Ordering::SeqCst) {
         return Err(PersistenceError::new(
             "Replica is not durably synchronized and cannot be promoted",
         ));
     }
-    persistence.binlog.flush().await?;
+    if let Err(error) = persistence.binlog.flush().await {
+        if error.is_indeterminate() {
+            enter_persistence_fail_stop_with_boundary(
+                persistence,
+                boundary,
+                format!("Replica promotion flush is indeterminate: {}", error),
+            );
+        }
+        return Err(error);
+    }
     write_replica_detached(&persistence.paths)?;
     persistence.upstream_replid.store(0, Ordering::SeqCst);
     persistence.replication_ready.store(false, Ordering::SeqCst);
@@ -2753,7 +2905,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             result?;
         }
+        error = await_persistence_fail_stop(&persistence_shutdown) => {
+            return Err(
+                Box::new(error) as Box<dyn std::error::Error>
+            );
+        }
         _ = tokio::signal::ctrl_c() => {
+            if persistence_shutdown.is_fail_stopped() {
+                let error = await_persistence_fail_stop(&persistence_shutdown).await;
+                return Err(Box::new(error) as Box<dyn std::error::Error>);
+            }
             info!("Shutdown signal received, saving final state...");
             persistence_shutdown.accepting_writes.store(false, Ordering::SeqCst);
             compact_store(&store_shutdown, &persistence_shutdown).await?;
@@ -4552,7 +4713,8 @@ mod tests {
                         let _ = completion.send(Ok(()));
                     }
                     LogMessage::Truncate { completion } => {
-                        let _ = completion.send(Err("injected rotation failure".to_string()));
+                        let _ = completion
+                            .send(Err(StorageFailure::rejected("injected rotation failure")));
                     }
                     LogMessage::Append { completion, .. } => {
                         let _ = completion.send(Ok(()));
@@ -4570,6 +4732,53 @@ mod tests {
         assert!(compact_store(&store, &persistence).await.is_err());
         assert!(directory.paths.snapshot.exists());
         assert!(fs::metadata(&directory.paths.binlog).unwrap().len() > 0);
+        drop(persistence);
+        worker.await.unwrap();
+
+        let recovered = ShardedStore::new();
+        let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(state.snapshot_watermark, 7);
+        assert_eq!(recovered.get("safe"), Ok(Some("new".to_string())));
+    }
+
+    #[tokio::test]
+    async fn indeterminate_binlog_rotation_enters_fail_stop_after_snapshot_installation() {
+        let directory = TestPersistenceDirectory::new();
+        append_test_binlog_record(&directory.paths, 1, &["SET", "safe", "old"]);
+        let (log_tx, mut receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    LogMessage::Truncate { completion } => {
+                        let _ = completion.send(Err(StorageFailure::indeterminate(
+                            "injected ambiguous rotation failure",
+                        )));
+                    }
+                    LogMessage::Append { completion, .. }
+                    | LogMessage::Flush { completion }
+                    | LogMessage::SyncData { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 7);
+        let store = Arc::new(ShardedStore::new());
+        store.set("safe".to_string(), "new".to_string());
+
+        let error = compact_store(&store, &persistence).await.unwrap_err();
+
+        assert!(error.is_indeterminate());
+        assert!(persistence.is_fail_stopped());
+        assert!(directory.paths.snapshot.exists());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                persistence.visibility_gate.read()
+            )
+            .await
+            .is_err()
+        );
         drop(persistence);
         worker.await.unwrap();
 
@@ -5490,7 +5699,9 @@ mod tests {
             while let Some(message) = receiver.recv().await {
                 match message {
                     LogMessage::Append { completion, .. } => {
-                        let _ = completion.send(Err("injected replica append failure".to_string()));
+                        let _ = completion.send(Err(StorageFailure::rejected(
+                            "injected replica append failure",
+                        )));
                     }
                     LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
@@ -5917,7 +6128,9 @@ mod tests {
             while let Some(message) = receiver.recv().await {
                 match message {
                     LogMessage::Append { completion, .. } => {
-                        let _ = completion.send(Err("injected transaction failure".to_string()));
+                        let _ = completion.send(Err(StorageFailure::rejected(
+                            "injected transaction failure",
+                        )));
                     }
                     LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
@@ -5977,7 +6190,9 @@ mod tests {
             while let Some(message) = receiver.recv().await {
                 match message {
                     LogMessage::Append { completion, .. } => {
-                        let _ = completion.send(Err("injected transaction failure".to_string()));
+                        let _ = completion.send(Err(StorageFailure::rejected(
+                            "injected transaction failure",
+                        )));
                     }
                     LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
@@ -6229,7 +6444,8 @@ mod tests {
             while let Some(message) = receiver.recv().await {
                 match message {
                     LogMessage::Append { completion, .. } => {
-                        let _ = completion.send(Err("injected append failure".to_string()));
+                        let _ = completion
+                            .send(Err(StorageFailure::rejected("injected append failure")));
                     }
                     LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
@@ -7375,14 +7591,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn periodic_sync_failure_disables_subsequent_writes() {
+    async fn periodic_sync_failure_enters_fail_stop_and_fences_the_dataset() {
         let directory = TestPersistenceDirectory::new();
         let (log_tx, mut receiver) = mpsc::channel(4);
         let worker = tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 match message {
                     LogMessage::SyncData { completion } => {
-                        let _ = completion.send(Err("injected sync failure".to_string()));
+                        let _ = completion
+                            .send(Err(StorageFailure::indeterminate("injected sync failure")));
                     }
                     LogMessage::Append { completion, .. }
                     | LogMessage::Flush { completion }
@@ -7395,6 +7612,7 @@ mod tests {
         let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
         assert!(run_periodic_sync_once(&persistence).await.is_err());
         assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
+        assert!(persistence.is_fail_stopped());
         assert!(
             persistence
                 .failure
@@ -7404,16 +7622,125 @@ mod tests {
                 .is_some_and(|message| message.contains("injected sync failure"))
         );
 
-        let store = Arc::new(ShardedStore::new());
-        let command = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
-        let outcome = execute_ordered_command(&store, &persistence, &command).await;
-        assert_eq!(outcome.mutation, MutationState::NoChange);
         assert!(
-            matches!(outcome.response, RESPValue::Error(message) if message.contains("injected sync failure"))
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                persistence.visibility_gate.read()
+            )
+            .await
+            .is_err()
         );
-        assert_eq!(store.get("key"), Ok(None));
         drop(persistence);
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn panicking_commit_finalizer_enters_fail_stop_before_releasing_visibility() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let boundary = persistence.acquire_commit_boundary().await;
+        let guard = PersistenceCommitGuard::new(
+            Arc::clone(&persistence),
+            boundary,
+            "Injected commit finalizer",
+        );
+        let finalizer = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("injected commit finalizer panic");
+            #[allow(unreachable_code)]
+            Ok::<(), PersistenceError>(())
+        });
+
+        let error = await_commit_finalizer(&persistence, finalizer)
+            .await
+            .unwrap_err();
+
+        assert!(error.is_indeterminate());
+        assert!(persistence.is_fail_stopped());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                persistence.visibility_gate.read()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn indeterminate_append_fail_stop_subprocess_child() {
+        let Some(root) = env::var_os("ONYXDB_FAIL_STOP_TEST_DIRECTORY") else {
+            return;
+        };
+        let paths = PersistencePaths::in_directory(Path::new(&root));
+        let (log_tx, mut receiver) = mpsc::channel(4);
+        let binlog_path = paths.binlog.clone();
+        let worker = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    LogMessage::Append {
+                        sequence,
+                        record,
+                        completion,
+                    } => {
+                        let encoded = encode_versioned_binlog_record(sequence, &record).unwrap();
+                        let mut file = OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&binlog_path)
+                            .unwrap();
+                        file.write_all(&(encoded.len() as u32).to_be_bytes())
+                            .unwrap();
+                        file.write_all(&encoded).unwrap();
+                        file.flush().unwrap();
+                        file.sync_all().unwrap();
+                        let _ = completion.send(Err(StorageFailure::indeterminate(
+                            "injected ambiguous completion after durable write",
+                        )));
+                    }
+                    LogMessage::Flush { completion }
+                    | LogMessage::SyncData { completion }
+                    | LogMessage::Truncate { completion } => {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            }
+        });
+        let persistence = test_persistence(paths, log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        let command = vec!["SET".to_string(), "key".to_string(), "accepted".to_string()];
+
+        let outcome = execute_ordered_command(&store, &persistence, &command).await;
+
+        assert_eq!(outcome.mutation, MutationState::NoChange);
+        assert!(matches!(outcome.response, RESPValue::Error(_)));
+        assert_eq!(store.get("key"), Ok(Some("accepted".to_string())));
+        let error = await_persistence_fail_stop(&persistence).await;
+        assert!(error.is_indeterminate());
+        drop(persistence);
+        worker.await.unwrap();
+        std::process::exit(86);
+    }
+
+    #[test]
+    fn subprocess_fail_stop_exits_without_compaction_and_recovery_uses_durable_record() {
+        let directory = TestPersistenceDirectory::new();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::indeterminate_append_fail_stop_subprocess_child")
+            .arg("--nocapture")
+            .env("ONYXDB_FAIL_STOP_TEST_DIRECTORY", &directory.root)
+            .status()
+            .unwrap();
+
+        assert_eq!(status.code(), Some(86));
+        assert!(!directory.paths.snapshot.exists());
+        let recovered = ShardedStore::new();
+        let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
+        assert_eq!(state.last_sequence, 1);
+        assert_eq!(recovered.get("key"), Ok(Some("accepted".to_string())));
     }
 
     #[test]

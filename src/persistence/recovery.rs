@@ -428,10 +428,41 @@ pub(crate) fn durable_rename(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::rename(from, to)
 }
 
+trait SnapshotInstaller {
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn sync_parent(&mut self, path: &Path) -> std::io::Result<()>;
+}
+
+struct OperatingSystemSnapshotInstaller;
+
+impl SnapshotInstaller for OperatingSystemSnapshotInstaller {
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        durable_rename(from, to)
+    }
+
+    fn sync_parent(&mut self, path: &Path) -> std::io::Result<()> {
+        sync_parent_directory(path)
+    }
+}
+
 pub(crate) fn write_snapshot_file(
     entries: Vec<(Bytes, DataEntry)>,
     watermark: u64,
     paths: &PersistencePaths,
+) -> Result<(), PersistenceError> {
+    write_snapshot_file_with_installer(
+        entries,
+        watermark,
+        paths,
+        &mut OperatingSystemSnapshotInstaller,
+    )
+}
+
+fn write_snapshot_file_with_installer(
+    entries: Vec<(Bytes, DataEntry)>,
+    watermark: u64,
+    paths: &PersistencePaths,
+    installer: &mut impl SnapshotInstaller,
 ) -> Result<(), PersistenceError> {
     let file = File::create(&paths.snapshot_temp)?;
     let mut encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
@@ -456,17 +487,187 @@ pub(crate) fn write_snapshot_file(
     drop(snapshot_file);
 
     if paths.snapshot.exists() {
-        durable_rename(&paths.snapshot, &paths.snapshot_backup)?;
-        sync_parent_directory(&paths.snapshot)?;
+        installer.rename(&paths.snapshot, &paths.snapshot_backup)?;
+        installer.sync_parent(&paths.snapshot)?;
     }
 
-    if let Err(error) = durable_rename(&paths.snapshot_temp, &paths.snapshot) {
+    if let Err(error) = installer.rename(&paths.snapshot_temp, &paths.snapshot) {
         if !paths.snapshot.exists() && paths.snapshot_backup.exists() {
-            let _ = durable_rename(&paths.snapshot_backup, &paths.snapshot);
-            let _ = sync_parent_directory(&paths.snapshot);
+            let _ = installer.rename(&paths.snapshot_backup, &paths.snapshot);
+            let _ = installer.sync_parent(&paths.snapshot);
         }
         return Err(error.into());
     }
-    sync_parent_directory(&paths.snapshot)?;
+    installer.sync_parent(&paths.snapshot)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::{
+        CommittedBatch, CommittedEffect, PersistentEntry, encode_committed_batch,
+        encode_versioned_binlog_record,
+    };
+    use onyxdb::clock::unix_seconds;
+    use onyxdb::engine::OnyxValue;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = NEXT_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "onyxdb-snapshot-install-{}-{}",
+                std::process::id(),
+                id
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn paths(&self) -> PersistencePaths {
+            PersistencePaths::in_directory(&self.0)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum InstallFailureTiming {
+        BeforeRename,
+        AfterRename,
+    }
+
+    struct FailingSnapshotInstaller {
+        install_target: PathBuf,
+        timing: InstallFailureTiming,
+        failed: bool,
+    }
+
+    impl SnapshotInstaller for FailingSnapshotInstaller {
+        fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if to == self.install_target && !self.failed {
+                self.failed = true;
+                if matches!(self.timing, InstallFailureTiming::AfterRename) {
+                    durable_rename(from, to)?;
+                }
+                return Err(std::io::Error::other("injected snapshot install failure"));
+            }
+            durable_rename(from, to)
+        }
+
+        fn sync_parent(&mut self, path: &Path) -> std::io::Result<()> {
+            sync_parent_directory(path)
+        }
+    }
+
+    fn snapshot_entries(value: &'static [u8]) -> Vec<(Bytes, DataEntry)> {
+        let timestamp = unix_seconds();
+        vec![(
+            Bytes::from_static(b"key"),
+            DataEntry {
+                value: OnyxValue::Blob(Bytes::from_static(value)),
+                expires_at: None,
+                created_at: timestamp,
+                last_accessed: timestamp,
+            },
+        )]
+    }
+
+    fn write_following_binlog_record(paths: &PersistencePaths) -> Vec<u8> {
+        let batch = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"key"),
+            entry: PersistentEntry {
+                value: OnyxValue::Blob(Bytes::from_static(b"new")),
+                expires_at: None,
+            },
+        }])
+        .unwrap();
+        let effect = encode_committed_batch(&batch).unwrap();
+        let record = encode_versioned_binlog_record(2, &effect).unwrap();
+        let mut framed = Vec::with_capacity(4 + record.len());
+        framed.extend_from_slice(&(record.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&record);
+        fs::write(&paths.binlog, &framed).unwrap();
+        framed
+    }
+
+    fn assert_recovers_new_value(paths: &PersistencePaths) {
+        let store = ShardedStore::new();
+        let recovered = load_data_from_paths(&store, paths).unwrap();
+        assert_eq!(recovered.last_sequence, 2);
+        assert_eq!(
+            store
+                .get_entry(&Bytes::from_static(b"key"))
+                .map(|entry| entry.value),
+            Some(OnyxValue::Blob(Bytes::from_static(b"new")))
+        );
+    }
+
+    #[test]
+    fn install_failure_before_rename_restores_previous_snapshot_and_keeps_binlog() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        write_snapshot_file(snapshot_entries(b"old"), 1, &paths).unwrap();
+        let binlog = write_following_binlog_record(&paths);
+        let mut installer = FailingSnapshotInstaller {
+            install_target: paths.snapshot.clone(),
+            timing: InstallFailureTiming::BeforeRename,
+            failed: false,
+        };
+
+        let error =
+            write_snapshot_file_with_installer(snapshot_entries(b"new"), 2, &paths, &mut installer)
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected snapshot install failure")
+        );
+        assert_eq!(
+            inspect_snapshot(&paths.snapshot).unwrap(),
+            SnapshotFormat::Versioned { watermark: 1 }
+        );
+        assert_eq!(fs::read(&paths.binlog).unwrap(), binlog);
+        assert_recovers_new_value(&paths);
+    }
+
+    #[test]
+    fn ambiguous_install_error_keeps_new_snapshot_recoverable_without_discarding_history() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        write_snapshot_file(snapshot_entries(b"old"), 1, &paths).unwrap();
+        let binlog = write_following_binlog_record(&paths);
+        let mut installer = FailingSnapshotInstaller {
+            install_target: paths.snapshot.clone(),
+            timing: InstallFailureTiming::AfterRename,
+            failed: false,
+        };
+
+        let error =
+            write_snapshot_file_with_installer(snapshot_entries(b"new"), 2, &paths, &mut installer)
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected snapshot install failure")
+        );
+        assert_eq!(
+            inspect_snapshot(&paths.snapshot).unwrap(),
+            SnapshotFormat::Versioned { watermark: 2 }
+        );
+        assert_eq!(fs::read(&paths.binlog).unwrap(), binlog);
+        assert_recovers_new_value(&paths);
+    }
 }
