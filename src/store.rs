@@ -42,6 +42,10 @@ impl AdmissionError {
     }
 }
 
+fn key_limit_requires_exact_count(physical_keys: usize, possible_new_keys: usize) -> bool {
+    possible_new_keys > 0 && physical_keys.saturating_add(possible_new_keys) > MAX_KEYS
+}
+
 /// Captures the exact pre-command state required for admission and rollback.
 ///
 /// The caller owns higher-level write and visibility serialization. This type
@@ -51,8 +55,8 @@ impl AdmissionError {
 pub struct MutationAttempt<'a> {
     store: &'a ShardedStore,
     before_entries: HashMap<Bytes, Option<DataEntry>>,
-    memory_before: usize,
-    key_count_before: usize,
+    memory_before: Option<usize>,
+    key_count_before: Option<usize>,
     evicted_entries: Vec<(Bytes, DataEntry)>,
     active: bool,
 }
@@ -87,25 +91,34 @@ impl MutationAttempt<'_> {
         &self.evicted_entries
     }
 
-    pub fn admit(&mut self, protected_keys: &HashSet<Bytes>) -> Result<(), AdmissionError> {
-        let key_count_after = self.store.stats().total_keys;
-        if key_count_after > MAX_KEYS && key_count_after > self.key_count_before {
-            return Err(AdmissionError::KeyLimit);
+    pub fn admit(&mut self, protected_keys: &[Bytes]) -> Result<(), AdmissionError> {
+        if let Some(key_count_before) = self.key_count_before {
+            let key_count_after = self.store.stats().total_keys;
+            if key_count_after > MAX_KEYS && key_count_after > key_count_before {
+                return Err(AdmissionError::KeyLimit);
+            }
         }
 
         let limit = self.store.maxmemory_bytes();
+        if limit == 0 {
+            return Ok(());
+        }
         let memory_after = self.store.used_memory_bytes();
-        if limit == 0 || memory_after <= limit || memory_after <= self.memory_before {
+        let memory_before = self
+            .memory_before
+            .expect("maxmemory admission requires a pre-mutation memory baseline");
+        if memory_after <= limit || memory_after <= memory_before {
             return Ok(());
         }
         if self.store.maxmemory_policy() == EvictionPolicy::NoEviction {
             return Err(AdmissionError::Maxmemory);
         }
 
+        let protected_keys = protected_keys.iter().cloned().collect::<HashSet<_>>();
         let evicted =
             self.store
                 .engine
-                .evict_to_fit(limit, self.store.maxmemory_policy(), protected_keys);
+                .evict_to_fit(limit, self.store.maxmemory_policy(), &protected_keys);
         if self.store.used_memory_bytes() <= limit {
             self.evicted_entries.extend(evicted);
             return Ok(());
@@ -182,15 +195,23 @@ impl ShardedStore {
     }
 
     pub fn begin_mutation(&self, keys: &[Bytes]) -> MutationAttempt<'_> {
-        let before_entries = keys
+        let before_entries: HashMap<Bytes, Option<DataEntry>> = keys
             .iter()
             .map(|key| (key.clone(), self.engine.peek(key)))
             .collect();
+        let possible_new_keys = before_entries
+            .values()
+            .filter(|entry| entry.is_none())
+            .count();
+        let key_count_before =
+            key_limit_requires_exact_count(self.engine.physical_key_count(), possible_new_keys)
+                .then(|| self.stats().total_keys);
+        let memory_before = (self.maxmemory_bytes > 0).then(|| self.used_memory_bytes());
         MutationAttempt {
             store: self,
             before_entries,
-            memory_before: self.used_memory_bytes(),
-            key_count_before: self.stats().total_keys,
+            memory_before,
+            key_count_before,
             evicted_entries: Vec::new(),
             active: true,
         }
@@ -1005,6 +1026,14 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn exact_key_count_scan_is_reserved_for_possible_limit_crossings() {
+        assert!(!key_limit_requires_exact_count(MAX_KEYS - 1, 1));
+        assert!(key_limit_requires_exact_count(MAX_KEYS, 1));
+        assert!(!key_limit_requires_exact_count(MAX_KEYS + 1, 0));
+        assert!(key_limit_requires_exact_count(usize::MAX, 1));
+    }
+
+    #[test]
     fn glob_matching_supports_literals_and_wildcards() {
         assert!(glob_match("user:*", "user:42"));
         assert!(glob_match("*", "any"));
@@ -1067,7 +1096,7 @@ mod tests {
         store.append("key", &"x".repeat(256)).unwrap();
 
         assert_eq!(
-            attempt.admit(&HashSet::from([key])),
+            attempt.admit(std::slice::from_ref(&key)),
             Err(AdmissionError::Maxmemory)
         );
         attempt.rollback();
@@ -1129,7 +1158,7 @@ mod tests {
         {
             let mut attempt = store.begin_mutation(std::slice::from_ref(&target));
             store.set("target".to_string(), "c".repeat(32));
-            attempt.admit(&HashSet::from([target.clone()])).unwrap();
+            attempt.admit(std::slice::from_ref(&target)).unwrap();
             assert!(!attempt.evicted_entries().is_empty());
         }
 
@@ -1149,7 +1178,7 @@ mod tests {
         let mut attempt = store.begin_mutation(std::slice::from_ref(&target));
         store.set("target".to_string(), "c".repeat(8));
 
-        attempt.admit(&HashSet::from([target])).unwrap();
+        attempt.admit(std::slice::from_ref(&target)).unwrap();
         assert!(!attempt.evicted_entries().is_empty());
         attempt.rollback();
 

@@ -7,6 +7,8 @@
 use crate::clock::unix_seconds;
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // The shard count is a power of two so routing can use a bitmask.
 pub const NUM_SHARDS: usize = 64; // 64 shard, bitmask 0x3F
@@ -140,16 +142,27 @@ pub struct Shard {
     last_modified: u64,
     /// Approximate logical bytes occupied by entries in this shard.
     mem_bytes: usize,
+    total_keys: Arc<AtomicUsize>,
 }
 
 impl Shard {
-    fn new() -> Self {
+    fn new(total_keys: Arc<AtomicUsize>) -> Self {
         Self {
             data: HashMap::with_capacity(1024),
             op_count: 0,
             last_modified: 0,
             mem_bytes: 0,
+            total_keys,
         }
+    }
+
+    fn record_key_removal(&self) {
+        let result = self
+            .total_keys
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            });
+        debug_assert!(result.is_ok(), "physical key count underflow");
     }
 
     fn purge_if_expired(&mut self, key: &Bytes, timestamp: u64) -> bool {
@@ -164,6 +177,7 @@ impl Shard {
             self.mem_bytes = self
                 .mem_bytes
                 .saturating_sub(approx_entry_size(key, &entry));
+            self.record_key_removal();
         }
         true
     }
@@ -185,6 +199,9 @@ impl Shard {
         self.last_modified = unix_seconds();
         let new_size = approx_entry_size(&key, &entry);
         let old = self.data.insert(key.clone(), entry);
+        if old.is_none() {
+            self.total_keys.fetch_add(1, Ordering::SeqCst);
+        }
         if let Some(ref old_entry) = old {
             let old_size = approx_entry_size(&key, old_entry);
             self.mem_bytes = self.mem_bytes.saturating_sub(old_size);
@@ -204,6 +221,7 @@ impl Shard {
         if let Some(ref e) = removed {
             let size = approx_entry_size(key, e);
             self.mem_bytes = self.mem_bytes.saturating_sub(size);
+            self.record_key_removal();
         }
         removed
     }
@@ -223,6 +241,7 @@ impl Shard {
             if let Some(e) = self.data.remove(&key) {
                 let size = approx_entry_size(&key, &e);
                 self.mem_bytes = self.mem_bytes.saturating_sub(size);
+                self.record_key_removal();
             }
         }
         count
@@ -267,6 +286,7 @@ impl Shard {
                 if delete {
                     self.data.remove(key);
                     self.mem_bytes = self.mem_bytes.saturating_sub(old_size);
+                    self.record_key_removal();
                 } else {
                     let new_size = self
                         .data
@@ -332,6 +352,9 @@ impl Shard {
             0
         };
         entry.last_accessed = ts;
+        if !existed {
+            self.total_keys.fetch_add(1, Ordering::SeqCst);
+        }
         let result = f(entry, existed);
         let new_size = approx_entry_size(&key, entry);
         self.mem_bytes = self
@@ -387,6 +410,7 @@ impl Shard {
             let size = approx_entry_size(&key, &entry);
             self.data.insert(key, entry);
             self.mem_bytes = self.mem_bytes.saturating_add(size);
+            self.total_keys.fetch_add(1, Ordering::SeqCst);
             true
         }
     }
@@ -442,6 +466,7 @@ impl Shard {
 
 pub struct OnyxEngine {
     shards: Vec<std::sync::Mutex<Shard>>,
+    total_keys: Arc<AtomicUsize>,
 }
 
 impl Default for OnyxEngine {
@@ -452,11 +477,19 @@ impl Default for OnyxEngine {
 
 impl OnyxEngine {
     pub fn new() -> Self {
+        let total_keys = Arc::new(AtomicUsize::new(0));
         let mut shards = Vec::with_capacity(NUM_SHARDS);
         for _ in 0..NUM_SHARDS {
-            shards.push(std::sync::Mutex::new(Shard::new()));
+            shards.push(std::sync::Mutex::new(Shard::new(Arc::clone(&total_keys))));
         }
-        Self { shards }
+        Self { shards, total_keys }
+    }
+
+    /// Returns the number of physically present keys without sweeping expiry.
+    /// Callers that are near a hard key limit must perform an exact expiry-aware
+    /// scan before rejecting growth.
+    pub fn physical_key_count(&self) -> usize {
+        self.total_keys.load(Ordering::SeqCst)
     }
 
     /// Reads one entry from a single shard.
@@ -506,6 +539,7 @@ impl OnyxEngine {
             shard.op_count += 1;
             shard.last_modified = unix_seconds();
         }
+        self.total_keys.store(0, Ordering::SeqCst);
         for (key, entry) in entries {
             let shard_idx = shard_for_key(&key);
             shards[shard_idx].insert(key, entry);
@@ -908,4 +942,103 @@ pub struct EngineStats {
     pub total_keys: usize,
     pub total_ops: u64,
     pub num_shards: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(value: &'static [u8], expires_at: Option<u64>) -> DataEntry {
+        DataEntry {
+            value: OnyxValue::Blob(Bytes::from_static(value)),
+            expires_at,
+            created_at: unix_seconds(),
+            last_accessed: unix_seconds(),
+        }
+    }
+
+    #[test]
+    fn physical_key_count_tracks_single_shard_mutations() {
+        let engine = OnyxEngine::new();
+        let first = Bytes::from_static(b"first");
+        let second = Bytes::from_static(b"second");
+
+        engine.set(first.clone(), OnyxValue::Int(1), None);
+        assert_eq!(engine.physical_key_count(), 1);
+        engine.set(first.clone(), OnyxValue::Int(2), None);
+        assert_eq!(engine.physical_key_count(), 1);
+
+        assert!(engine.set_if_absent(second.clone(), OnyxValue::Int(3)));
+        assert!(!engine.set_if_absent(second.clone(), OnyxValue::Int(4)));
+        assert_eq!(engine.physical_key_count(), 2);
+
+        assert!(engine.set_expiry(&second, 1));
+        assert_eq!(engine.physical_key_count(), 1);
+        assert!(engine.delete(&first));
+        assert_eq!(engine.physical_key_count(), 0);
+    }
+
+    #[test]
+    fn physical_key_count_tracks_replacement_expiry_and_action_deletion() {
+        let engine = OnyxEngine::new();
+        let first = Bytes::from_static(b"replacement:first");
+        let second = Bytes::from_static(b"replacement:second");
+        engine.replace_all(vec![
+            (first.clone(), entry(b"one", None)),
+            (second.clone(), entry(b"two", Some(1))),
+        ]);
+        assert_eq!(engine.physical_key_count(), 2);
+        assert_eq!(engine.gc_expired(), 1);
+        assert_eq!(engine.physical_key_count(), 1);
+
+        let deleted = engine.update_if_exists_with_action(&first, |_| EntryMutation::Delete(()));
+        assert_eq!(deleted, Some(()));
+        assert_eq!(engine.physical_key_count(), 0);
+
+        engine.replace_all(vec![(second, entry(b"replacement", None))]);
+        assert_eq!(engine.physical_key_count(), 1);
+        assert_eq!(engine.stats().total_keys, engine.physical_key_count());
+    }
+
+    #[test]
+    fn physical_key_count_remains_consistent_when_insert_mutation_unwinds() {
+        let engine = OnyxEngine::new();
+        let key = Bytes::from_static(b"unwind");
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.update_or_insert(
+                key.clone(),
+                || OnyxValue::Int(0),
+                |_| {
+                    panic!("injected mutation failure");
+                },
+            );
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(engine.physical_key_count(), 1);
+    }
+
+    #[test]
+    fn physical_key_count_converges_after_concurrent_shard_mutations() {
+        let engine = Arc::new(OnyxEngine::new());
+        let mut writers = Vec::new();
+        for worker in 0..4 {
+            let engine = Arc::clone(&engine);
+            writers.push(std::thread::spawn(move || {
+                for key in 0..256 {
+                    engine.set(
+                        Bytes::from(format!("worker:{worker}:key:{key}")),
+                        OnyxValue::Int(key),
+                        None,
+                    );
+                }
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        assert_eq!(engine.physical_key_count(), 1024);
+        assert_eq!(engine.stats().total_keys, 1024);
+    }
 }

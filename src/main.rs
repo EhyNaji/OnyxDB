@@ -2327,8 +2327,7 @@ async fn execute_transaction(
             continue;
         }
 
-        let protected_keys = affected_keys.iter().cloned().collect::<HashSet<_>>();
-        match attempt.admit(&protected_keys) {
+        match attempt.admit(&affected_keys) {
             Ok(()) => {
                 for (key, entry) in attempt.evicted_entries() {
                     if changed_key_set.insert(key.clone()) {
@@ -2405,8 +2404,7 @@ async fn execute_ordered_command(
         return outcome;
     }
 
-    let protected_keys = affected_keys.iter().cloned().collect::<HashSet<_>>();
-    match attempt.admit(&protected_keys) {
+    match attempt.admit(&affected_keys) {
         Ok(()) => {}
         Err(error) => {
             attempt.rollback();
@@ -2563,8 +2561,7 @@ async fn execute_obp_command(
                 let mut attempt = store.begin_mutation(&affected_keys);
                 let value = OnyxValue::Blob(args[1].clone());
                 store.set_value(key.clone(), value, None);
-                let protected_keys = HashSet::from([key.clone()]);
-                match attempt.admit(&protected_keys) {
+                match attempt.admit(&affected_keys) {
                     Ok(()) => {}
                     Err(error) => {
                         attempt.rollback();
