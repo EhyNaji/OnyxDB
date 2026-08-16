@@ -42,6 +42,9 @@ All notable changes to OnyxDB are documented in this file.
   admission, eviction, and rollback.
 - Unified engine, store, command expiration, and recovery checks on one shared
   wall-clock source instead of a separately refreshed runtime cache.
+- Extracted RESP data-command execution and affected-key planning behind typed
+  read, no-change, tentative, and committed mutation outcomes while retaining
+  authoritative durability decisions in the server.
 - Consolidated CLI and benchmark RESP handling onto one binary-safe, bounded
   response parser and command encoder.
 - Added a deterministic benchmark methodology with warmup, configurable GET,

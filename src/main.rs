@@ -9,6 +9,10 @@ use onyxdb::command::is_write_command;
 #[cfg(test)]
 use onyxdb::engine::EvictionPolicy;
 use onyxdb::engine::{DataEntry, OnyxValue};
+use onyxdb::execution::{
+    CommandOutcome, MutationState, affected_keys as persistent_keys_for_command,
+    execute_command as execute_data_command,
+};
 use onyxdb::protocol::{MAX_OBP_FRAME_SIZE, OBPFrame};
 use onyxdb::resp::{CLIENT_RESP_LIMITS, RESPReadLimits, RESPValue, read_command_with_timeouts};
 #[cfg(test)]
@@ -1390,40 +1394,6 @@ fn value_to_line(key: &str, entry: &DataEntry) -> String {
     let exp_val = entry.expires_at.unwrap_or(0);
     format!("{}\t{}\t{}\t{}", key, val_type, exp_val, val_str)
 }
-/// Classifies commands that can mutate authoritative state. The classification
-/// drives replica read-only enforcement and ordered persistence admission.
-fn persistent_keys_for_command(args: &[String]) -> Vec<Bytes> {
-    let command = args.first().map(String::as_str).unwrap_or("");
-    let mut keys = Vec::new();
-    match command {
-        "MSET" => {
-            let mut index = 1;
-            while index + 1 < args.len() {
-                keys.push(Bytes::copy_from_slice(args[index].as_bytes()));
-                index += 2;
-            }
-        }
-        "RENAME" | "COPY" => {
-            if let Some(key) = args.get(1) {
-                keys.push(Bytes::copy_from_slice(key.as_bytes()));
-            }
-            if let Some(key) = args.get(2) {
-                keys.push(Bytes::copy_from_slice(key.as_bytes()));
-            }
-        }
-        _ if is_write_command(command) => {
-            if let Some(key) = args.get(1) {
-                keys.push(Bytes::copy_from_slice(key.as_bytes()));
-            }
-        }
-        _ => {}
-    }
-
-    let mut unique = std::collections::HashSet::new();
-    keys.retain(|key| unique.insert(key.clone()));
-    keys
-}
-
 #[cfg(test)]
 fn capture_entries(
     store: &ShardedStore,
@@ -1499,510 +1469,51 @@ fn partial_resync_possible(
     }
 }
 
-fn execute_command(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
-    execute_command_dispatch(store, args)
-}
-
-fn execute_command_dispatch(store: &ShardedStore, args: &[String]) -> (RESPValue, bool) {
-    let cmd = args.first().map(|s| s.as_str()).unwrap_or("");
-    let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
-    let arg = args.get(2).map(|s| s.as_str()).unwrap_or("");
-
-    match cmd {
-        "SET" if args.len() >= 3 => {
-            // Accept Redis-compatible EX/PX/NX/XX options plus internal EXAT,
-            // which makes expiration deterministic during replay.
-            let mut expires_at: Option<u64> = None;
-            let mut condition: Option<bool> = None; // Some(true)=NX, Some(false)=XX
-            let mut i = 3;
-            let mut valid = true;
-            while i < args.len() {
-                match args[i].to_uppercase().as_str() {
-                    "EX" => match args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
-                        Some(secs) if secs > 0 => {
-                            expires_at = Some(now().saturating_add(secs));
-                            i += 2;
-                        }
-                        Some(_) | None => {
-                            valid = false;
-                            break;
-                        }
-                    },
-                    "PX" => match args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
-                        Some(millis) if millis > 0 => {
-                            let seconds = millis.saturating_add(999) / 1000;
-                            expires_at = Some(now().saturating_add(seconds));
-                            i += 2;
-                        }
-                        Some(_) | None => {
-                            valid = false;
-                            break;
-                        }
-                    },
-                    "EXAT" => match args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
-                        Some(ts) => {
-                            expires_at = Some(ts);
-                            i += 2;
-                        }
-                        None => {
-                            valid = false;
-                            break;
-                        }
-                    },
-                    "NX" => {
-                        condition = Some(true);
-                        i += 1;
-                    }
-                    "XX" => {
-                        condition = Some(false);
-                        i += 1;
-                    }
-                    _ => {
-                        valid = false;
-                        break;
-                    }
-                }
-            }
-            if !valid {
-                (RESPValue::Error("ERR syntax error".to_string()), false)
-            } else {
-                let ok = store.set_conditional_value(
-                    Bytes::from(key.to_string()),
-                    OnyxValue::Blob(Bytes::from(arg.to_string())),
-                    expires_at,
-                    condition,
-                );
-                if ok {
-                    (RESPValue::SimpleString("OK".to_string()), true)
-                } else {
-                    // A failed NX/XX condition performs no write and returns nil.
-                    (RESPValue::BulkString(None), false)
-                }
-            }
-        }
-        "GET" if args.len() >= 2 => match store.get(key) {
-            Ok(Some(value)) => (RESPValue::BulkString(Some(value)), false),
-            Ok(None) => (RESPValue::BulkString(None), false),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "DEL" if args.len() >= 2 => (
-            RESPValue::Integer(if store.delete(key) { 1 } else { 0 }),
-            true,
-        ),
-        "INCR" if args.len() >= 2 => match store.incr(key) {
-            Ok(value) => (RESPValue::Integer(value), true),
-            Err(message) => (RESPValue::Error(message.to_string()), false),
-        },
-        "LPUSH" if args.len() >= 3 => match store.lpush(key, arg.to_string()) {
-            Ok(length) => (RESPValue::Integer(length as i64), true),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "RPUSH" if args.len() >= 3 => match store.rpush(key, arg.to_string()) {
-            Ok(length) => (RESPValue::Integer(length as i64), true),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "LPOP" if args.len() >= 2 => match store.lpop(key) {
-            Ok(Some(value)) => (RESPValue::BulkString(Some(value)), true),
-            Ok(None) => (RESPValue::BulkString(None), false),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "RPOP" if args.len() >= 2 => match store.rpop(key) {
-            Ok(Some(value)) => (RESPValue::BulkString(Some(value)), true),
-            Ok(None) => (RESPValue::BulkString(None), false),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "LRANGE" if args.len() >= 2 => {
-            let start = args.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-            let stop = args
-                .get(3)
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(-1);
-            match store.lrange(key, start, stop) {
-                Ok(list) => (
-                    RESPValue::Array(
-                        list.into_iter()
-                            .map(|s| RESPValue::BulkString(Some(s)))
-                            .collect(),
-                    ),
-                    false,
-                ),
-                Err(error) => (RESPValue::Error(error.message().to_string()), false),
-            }
-        }
-
-        "EXPIREAT" if args.len() >= 3 => {
-            if let Ok(t) = arg.parse::<u64>() {
-                (
-                    RESPValue::Integer(if store.expire_at(key, t) { 1 } else { 0 }),
-                    true,
-                )
-            } else {
-                (RESPValue::Error("ERR invalid timestamp".to_string()), false)
-            }
-        }
-        "TTL" if args.len() >= 2 => (RESPValue::Integer(store.ttl(key)), false),
-        "EXISTS" if args.len() >= 2 => (
-            RESPValue::Integer(if store.exists(key) { 1 } else { 0 }),
-            false,
-        ),
-        "TYPE" if args.len() >= 2 => match store.value_type(key) {
-            Some(t) => (RESPValue::SimpleString(t.to_string()), false),
-            None => (RESPValue::SimpleString("none".to_string()), false),
-        },
-        "JSON.SET" => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
-            let raw_value = args.get(3).map(|s| s.as_str()).unwrap_or("");
-            if args.len() < 4 || path.is_empty() {
-                (
-                    RESPValue::Error("ERR usage: JSON.SET key path json-value".to_string()),
-                    false,
-                )
-            } else {
-                match serde_json::from_str::<serde_json::Value>(raw_value) {
-                    Ok(parsed) => match store.json_set(key, path, parsed) {
-                        Ok(()) => (RESPValue::SimpleString("OK".to_string()), true),
-                        Err(e) => (RESPValue::Error(e.to_string()), false),
-                    },
-                    Err(_) => (
-                        RESPValue::Error("ERR value is not valid JSON".to_string()),
-                        false,
-                    ),
-                }
-            }
-        }
-        "JSON.GET" if args.len() >= 2 => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
-            match store.json_get(key, path) {
-                Ok(Some(s)) => (RESPValue::BulkString(Some(s)), false),
-                Ok(None) => (RESPValue::BulkString(None), false),
-                Err(e) => (RESPValue::Error(e.to_string()), false),
-            }
-        }
-        "JSON.DEL" if args.len() >= 2 => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
-            match store.json_del(key, path) {
-                Ok(deleted) => (RESPValue::Integer(if deleted { 1 } else { 0 }), deleted),
-                Err(e) => (RESPValue::Error(e.to_string()), false),
-            }
-        }
-        "JSON.TYPE" if args.len() >= 2 => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
-            match store.json_type(key, path) {
-                Ok(Some(t)) => (RESPValue::SimpleString(t.to_string()), false),
-                Ok(None) => (RESPValue::BulkString(None), false),
-                Err(e) => (RESPValue::Error(e.to_string()), false),
-            }
-        }
-        "JSON.NUMINCRBY" if args.len() >= 2 => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
-            let delta_str = args.get(3).map(|s| s.as_str()).unwrap_or("");
-            match delta_str.parse::<f64>() {
-                Ok(delta) => match store.json_numincrby(key, path, delta) {
-                    Ok(new_val) => (RESPValue::BulkString(Some(new_val.to_string())), true),
-                    Err(e) => (RESPValue::Error(e), false),
-                },
-                Err(_) => (
-                    RESPValue::Error("ERR delta is not a valid number".to_string()),
-                    false,
-                ),
-            }
-        }
-        "JSON.ARRAPPEND" if args.len() >= 2 => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
-            let raw_value = args.get(3).map(|s| s.as_str()).unwrap_or("");
-            match serde_json::from_str::<serde_json::Value>(raw_value) {
-                Ok(parsed) => match store.json_arrappend(key, path, parsed) {
-                    Ok(new_len) => (RESPValue::Integer(new_len as i64), true),
-                    Err(e) => (RESPValue::Error(e), false),
-                },
-                Err(_) => (
-                    RESPValue::Error("ERR value is not valid JSON".to_string()),
-                    false,
-                ),
-            }
-        }
-        "JSON.ARRLEN" if args.len() >= 2 => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
-            match store.json_arrlen(key, path) {
-                Ok(Some(len)) => (RESPValue::Integer(len as i64), false),
-                Ok(None) => (RESPValue::BulkString(None), false),
-                Err(e) => (RESPValue::Error(e), false),
-            }
-        }
-        "JSON.OBJKEYS" if args.len() >= 2 => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("$");
-            match store.json_objkeys(key, path) {
-                Ok(Some(keys)) => (
-                    RESPValue::Array(
-                        keys.into_iter()
-                            .map(|k| RESPValue::BulkString(Some(k)))
-                            .collect(),
-                    ),
-                    false,
-                ),
-                Ok(None) => (RESPValue::Array(Vec::new()), false),
-                Err(e) => (RESPValue::Error(e), false),
-            }
-        }
-        "SADD" if args.len() >= 3 => match store.sadd(key, arg) {
-            Ok(added) => (RESPValue::Integer(if added { 1 } else { 0 }), true),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "SMEMBERS" if args.len() >= 2 => match store.smembers(key) {
-            Ok(members) => (
-                RESPValue::Array(
-                    members
-                        .into_iter()
-                        .map(|m| RESPValue::BulkString(Some(m)))
-                        .collect(),
-                ),
-                false,
-            ),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "SREM" if args.len() >= 3 => match store.srem(key, arg) {
-            Ok(removed) => (RESPValue::Integer(if removed { 1 } else { 0 }), removed),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "SISMEMBER" if args.len() >= 3 => match store.sismember(key, arg) {
-            Ok(present) => (RESPValue::Integer(if present { 1 } else { 0 }), false),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "LLEN" if args.len() >= 2 => match store.llen(key) {
-            Ok(length) => (RESPValue::Integer(length as i64), false),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "RENAME" if args.len() >= 3 => {
-            if store.rename(key, arg) {
-                (RESPValue::SimpleString("OK".to_string()), true)
-            } else {
-                (RESPValue::Error("ERR no such key".to_string()), false)
-            }
-        }
-        "MSET" => {
-            if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
-                (
-                    RESPValue::Error("ERR wrong number of arguments for 'mset'".to_string()),
-                    false,
-                )
-            } else {
-                let mut i = 1;
-                while i + 1 < args.len() {
-                    store.set(args[i].clone(), args[i + 1].clone());
-                    i += 2;
-                }
-                (RESPValue::SimpleString("OK".to_string()), true)
-            }
-        }
-        "MGET" => {
-            let results = args[1..]
-                .iter()
-                .map(|key| store.get(key))
-                .collect::<Result<Vec<_>, _>>();
-            match results {
-                Ok(values) => (
-                    RESPValue::Array(values.into_iter().map(RESPValue::BulkString).collect()),
-                    false,
-                ),
-                Err(error) => (RESPValue::Error(error.message().to_string()), false),
-            }
-        }
-        "KEYS" => {
-            let pattern = key;
-            let keys = store.keys_matching(pattern);
-            (
-                RESPValue::Array(
-                    keys.into_iter()
-                        .map(|k| RESPValue::BulkString(Some(k)))
-                        .collect(),
-                ),
-                false,
-            )
-        }
-        "HSET" if args.len() >= 3 => {
-            let field = arg;
-            let value = args.get(3).map(|s| s.as_str()).unwrap_or("");
-            if args.len() < 4 {
-                (
-                    RESPValue::Error("ERR wrong number of arguments for 'hset'".to_string()),
-                    false,
-                )
-            } else {
-                match store.hset(key, field, value) {
-                    Ok(is_new) => (RESPValue::Integer(if is_new { 1 } else { 0 }), true),
-                    Err(error) => (RESPValue::Error(error.message().to_string()), false),
-                }
-            }
-        }
-        "HGET" if args.len() >= 3 => {
-            let field = arg;
-            (
-                match store.hget(key, field) {
-                    Ok(value) => RESPValue::BulkString(value),
-                    Err(error) => RESPValue::Error(error.message().to_string()),
-                },
-                false,
-            )
-        }
-        "HGETALL" if args.len() >= 2 => match store.hgetall(key) {
-            Ok(pairs) => {
-                let mut flat = Vec::with_capacity(pairs.len() * 2);
-                for (f, v) in pairs {
-                    flat.push(RESPValue::BulkString(Some(f)));
-                    flat.push(RESPValue::BulkString(Some(v)));
-                }
-                (RESPValue::Array(flat), false)
-            }
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "HDEL" if args.len() >= 3 => {
-            let field = arg;
-            match store.hdel(key, field) {
-                Ok(removed) => (RESPValue::Integer(if removed { 1 } else { 0 }), removed),
-                Err(error) => (RESPValue::Error(error.message().to_string()), false),
-            }
-        }
-        "REPLICAOF" if key.eq_ignore_ascii_case("no") && arg.eq_ignore_ascii_case("one") => {
-            (RESPValue::SimpleString("OK".to_string()), false)
-        }
-        "INCRBY" if args.len() >= 3 => match arg.parse::<i64>() {
-            Ok(delta) => match store.incrby(key, delta) {
-                Ok(value) => (RESPValue::Integer(value), true),
-                Err(message) => (RESPValue::Error(message.to_string()), false),
-            },
-            Err(_) => (
-                RESPValue::Error("ERR value is not an integer".to_string()),
-                false,
-            ),
-        },
-        "DECRBY" if args.len() >= 3 => match arg.parse::<i64>() {
-            Ok(delta) => match delta.checked_neg() {
-                Some(negated) => match store.incrby(key, negated) {
-                    Ok(value) => (RESPValue::Integer(value), true),
-                    Err(message) => (RESPValue::Error(message.to_string()), false),
-                },
-                None => (
-                    RESPValue::Error("ERR increment or decrement would overflow".to_string()),
-                    false,
-                ),
-            },
-            Err(_) => (
-                RESPValue::Error("ERR value is not an integer".to_string()),
-                false,
-            ),
-        },
-        "APPEND" if args.len() >= 3 => match store.append(key, arg) {
-            Ok(length) => (RESPValue::Integer(length as i64), true),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "STRLEN" if args.len() >= 2 => match store.strlen(key) {
-            Ok(length) => (RESPValue::Integer(length as i64), false),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "GETSET" if args.len() >= 3 => match store.getset(key, arg) {
-            Ok(old) => (RESPValue::BulkString(old), true),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "INFO" => {
-            let uptime = now().saturating_sub(START_TIME.load(Ordering::Relaxed));
-            let role = if IS_REPLICA.load(Ordering::Relaxed) {
-                "replica"
-            } else {
-                "master"
-            };
-            let num_keys = store.stats().total_keys;
-            let active_conns = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
-            let total_cmds = TOTAL_COMMANDS.load(Ordering::Relaxed);
-            let hits = CACHE_HITS.load(Ordering::Relaxed);
-            let misses = CACHE_MISSES.load(Ordering::Relaxed);
-            let hit_rate = if hits + misses > 0 {
-                (hits as f64 / (hits + misses) as f64) * 100.0
-            } else {
-                0.0
-            };
-            let used_memory = store.used_memory_bytes();
-            let mm_limit = store.maxmemory_bytes();
-            let mm_policy_str = format!("{:?}", store.maxmemory_policy());
-
-            let info_text = format!(
-                "role:{}\nuptime_seconds:{}\nconnected_keys:{}\nmax_keys:{}\nactive_connections:{}\ntotal_commands:{}\ncache_hits:{}\ncache_misses:{}\nhit_rate_percent:{:.1}\nused_memory_bytes:{}\nmaxmemory_bytes:{}\nmaxmemory_policy:{}",
-                role,
-                uptime,
-                num_keys,
-                MAX_KEYS,
-                active_conns,
-                total_cmds,
-                hits,
-                misses,
-                hit_rate,
-                used_memory,
-                mm_limit,
-                mm_policy_str
-            );
-            (RESPValue::BulkString(Some(info_text)), false)
-        }
-        "SETNX" if args.len() >= 3 => (
-            RESPValue::Integer(if store.setnx(key, arg) { 1 } else { 0 }),
-            true,
-        ),
-        "HKEYS" if args.len() >= 2 => match store.hkeys(key) {
-            Ok(fields) => (
-                RESPValue::Array(
-                    fields
-                        .into_iter()
-                        .map(|f| RESPValue::BulkString(Some(f)))
-                        .collect(),
-                ),
-                false,
-            ),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "HVALS" if args.len() >= 2 => match store.hvals(key) {
-            Ok(vals) => (
-                RESPValue::Array(
-                    vals.into_iter()
-                        .map(|v| RESPValue::BulkString(Some(v)))
-                        .collect(),
-                ),
-                false,
-            ),
-            Err(error) => (RESPValue::Error(error.message().to_string()), false),
-        },
-        "COPY" if args.len() >= 3 => (
-            RESPValue::Integer(if store.copy(key, arg) { 1 } else { 0 }),
-            true,
-        ),
-        "EXPIRE" if args.len() >= 3 => {
-            let condition = args.get(3).map(|s| s.to_uppercase());
-            match arg.parse::<u64>() {
-                Ok(s) => {
-                    if condition
-                        .as_deref()
-                        .is_some_and(|value| !matches!(value, "NX" | "XX"))
-                    {
-                        (RESPValue::Error("ERR syntax error".to_string()), false)
-                    } else {
-                        let ok = match &condition {
-                            Some(c) => store.expire_conditional(key, s, c),
-                            None => store.expire(key, s),
-                        };
-                        (RESPValue::Integer(if ok { 1 } else { 0 }), ok)
-                    }
-                }
-                Err(_) => (
-                    RESPValue::Error("ERR invalid expire time".to_string()),
-                    false,
-                ),
-            }
-        }
-        "PING" => (RESPValue::SimpleString("PONG".to_string()), false),
-        _ => (
-            RESPValue::Error("ERR unknown command or wrong syntax".to_string()),
-            false,
-        ),
+fn execute_command(store: &ShardedStore, args: &[String]) -> CommandOutcome {
+    if args.first().is_some_and(|command| command == "INFO") {
+        return CommandOutcome::read(info_response(store));
     }
+    execute_data_command(store, args)
 }
 
+fn info_response(store: &ShardedStore) -> RESPValue {
+    let uptime = now().saturating_sub(START_TIME.load(Ordering::Relaxed));
+    let role = if IS_REPLICA.load(Ordering::Relaxed) {
+        "replica"
+    } else {
+        "master"
+    };
+    let num_keys = store.stats().total_keys;
+    let active_conns = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+    let total_cmds = TOTAL_COMMANDS.load(Ordering::Relaxed);
+    let hits = CACHE_HITS.load(Ordering::Relaxed);
+    let misses = CACHE_MISSES.load(Ordering::Relaxed);
+    let hit_rate = if hits + misses > 0 {
+        (hits as f64 / (hits + misses) as f64) * 100.0
+    } else {
+        0.0
+    };
+    let used_memory = store.used_memory_bytes();
+    let mm_limit = store.maxmemory_bytes();
+    let mm_policy_str = format!("{:?}", store.maxmemory_policy());
+
+    let info_text = format!(
+        "role:{}\\nuptime_seconds:{}\\nconnected_keys:{}\\nmax_keys:{}\\nactive_connections:{}\\ntotal_commands:{}\\ncache_hits:{}\\ncache_misses:{}\\nhit_rate_percent:{:.1}\\nused_memory_bytes:{}\\nmaxmemory_bytes:{}\\nmaxmemory_policy:{}",
+        role,
+        uptime,
+        num_keys,
+        MAX_KEYS,
+        active_conns,
+        total_cmds,
+        hits,
+        misses,
+        hit_rate,
+        used_memory,
+        mm_limit,
+        mm_policy_str
+    );
+    RESPValue::BulkString(Some(info_text))
+}
 #[cfg(test)]
 fn normalize_for_log(store: &ShardedStore, args: &[String]) -> Vec<String> {
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("");
@@ -3718,7 +3229,9 @@ async fn handle_client(stream: TcpStream, store: Arc<ShardedStore>, persistence:
             }
         } else {
             TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
-            let (mut resp, _is_write) = execute_ordered_command(&store, &persistence, &args).await;
+            let mut resp = execute_ordered_command(&store, &persistence, &args)
+                .await
+                .into_response();
             if cmd.eq_ignore_ascii_case("INFO")
                 && let RESPValue::BulkString(Some(ref mut text)) = resp
             {
@@ -4674,7 +4187,7 @@ async fn execute_transaction(
         return RESPValue::Array(
             commands
                 .iter()
-                .map(|args| execute_command(store, args).0)
+                .map(|args| execute_command(store, args).into_response())
                 .collect(),
         );
     }
@@ -4691,7 +4204,7 @@ async fn execute_transaction(
                             "READONLY this instance is a read-only replica".to_string(),
                         )
                     } else {
-                        execute_command(store, args).0
+                        execute_command(store, args).into_response()
                     }
                 })
                 .collect(),
@@ -4717,7 +4230,7 @@ async fn execute_transaction(
     for args in &commands {
         let command = args.first().map(String::as_str).unwrap_or("");
         if !is_write_command(command) {
-            results.push(execute_command(store, args).0);
+            results.push(execute_command(store, args).into_response());
             continue;
         }
 
@@ -4732,7 +4245,8 @@ async fn execute_transaction(
                 );
             }
         }
-        let (response, _) = execute_command(store, args);
+        let outcome = execute_command(store, args);
+        let response = outcome.response;
         if derive_committed_batch(store, &affected_keys, attempt.before_entries(), &[]).is_none() {
             attempt.commit();
             results.push(response);
@@ -4794,7 +4308,7 @@ async fn execute_ordered_command(
     store: &Arc<ShardedStore>,
     persistence: &Arc<Persistence>,
     args: &[String],
-) -> (RESPValue, bool) {
+) -> CommandOutcome {
     let command = args.first().map(|value| value.as_str()).unwrap_or("");
     if !is_write_command(command) {
         let _visibility_guard = persistence.visibility_gate.read().await;
@@ -4804,27 +4318,28 @@ async fn execute_ordered_command(
     let write_guard = persistence.write_gate.lock().await;
     let _visibility_guard = persistence.visibility_gate.write().await;
     if !persistence.accepting_writes.load(Ordering::SeqCst) {
-        return (
-            RESPValue::Error(persistence_unavailable_message(persistence)),
-            false,
-        );
+        return CommandOutcome {
+            response: RESPValue::Error(persistence_unavailable_message(persistence)),
+            mutation: MutationState::NoChange,
+        };
     }
     let current_sequence = persistence.repl_offset.load(Ordering::SeqCst);
     if current_sequence == u64::MAX {
         mark_persistence_failed(persistence, "Persistence sequence is exhausted");
-        return (
-            RESPValue::Error("MISCONF persistence sequence is exhausted".to_string()),
-            false,
-        );
+        return CommandOutcome {
+            response: RESPValue::Error("MISCONF persistence sequence is exhausted".to_string()),
+            mutation: MutationState::NoChange,
+        };
     }
 
     let affected_keys = persistent_keys_for_command(args);
     let mut attempt = store.begin_mutation(&affected_keys);
-    let (response, _) = execute_command(store, args);
+    let mut outcome = execute_command(store, args);
     if derive_committed_batch(store, &affected_keys, attempt.before_entries(), &[]).is_none() {
         attempt.commit();
         drop(write_guard);
-        return (response, false);
+        outcome.mutation = MutationState::NoChange;
+        return outcome;
     }
 
     let protected_keys = affected_keys.iter().cloned().collect::<HashSet<_>>();
@@ -4833,7 +4348,10 @@ async fn execute_ordered_command(
         Err(error) => {
             attempt.rollback();
             drop(write_guard);
-            return (RESPValue::Error(error.message().to_string()), false);
+            return CommandOutcome {
+                response: RESPValue::Error(error.message().to_string()),
+                mutation: MutationState::NoChange,
+            };
         }
     }
     let committed_batch = derive_committed_batch(
@@ -4842,39 +4360,54 @@ async fn execute_ordered_command(
         attempt.before_entries(),
         attempt.evicted_entries(),
     );
-    let is_write = committed_batch.is_some();
-    let mut should_compact = false;
-    if let Some(batch) = committed_batch {
-        let sequence = current_sequence + 1;
-        persistence.repl_offset.store(sequence, Ordering::SeqCst);
-        match persist_ordered_mutation(persistence, sequence, &batch).await {
-            Ok(value) => {
-                should_compact = value;
-                attempt.commit();
-            }
-            Err(error) => {
-                attempt.rollback();
-                persistence
-                    .repl_offset
-                    .store(current_sequence, Ordering::SeqCst);
-                mark_persistence_failed(
-                    persistence,
-                    format!(
-                        "Mutation persistence failed at sequence {}: {}",
-                        sequence, error
-                    ),
-                );
-                drop(write_guard);
-                return (
-                    RESPValue::Error(format!("MISCONF mutation persistence failed: {}", error)),
-                    false,
-                );
-            }
+    let Some(batch) = committed_batch else {
+        attempt.rollback();
+        mark_persistence_failed(
+            persistence,
+            "Committed effect derivation became empty after admission",
+        );
+        drop(write_guard);
+        return CommandOutcome {
+            response: RESPValue::Error(
+                "MISCONF committed effect derivation failed after admission".to_string(),
+            ),
+            mutation: MutationState::NoChange,
+        };
+    };
+
+    let sequence = current_sequence + 1;
+    persistence.repl_offset.store(sequence, Ordering::SeqCst);
+    let should_compact = match persist_ordered_mutation(persistence, sequence, &batch).await {
+        Ok(value) => {
+            attempt.commit();
+            outcome.mutation = MutationState::Committed;
+            value
         }
-    }
+        Err(error) => {
+            attempt.rollback();
+            persistence
+                .repl_offset
+                .store(current_sequence, Ordering::SeqCst);
+            mark_persistence_failed(
+                persistence,
+                format!(
+                    "Mutation persistence failed at sequence {}: {}",
+                    sequence, error
+                ),
+            );
+            drop(write_guard);
+            return CommandOutcome {
+                response: RESPValue::Error(format!(
+                    "MISCONF mutation persistence failed: {}",
+                    error
+                )),
+                mutation: MutationState::NoChange,
+            };
+        }
+    };
     drop(write_guard);
     schedule_compaction(store, persistence, should_compact);
-    (response, is_write)
+    outcome
 }
 
 async fn execute_obp_command(
@@ -6385,11 +5918,16 @@ mod tests {
         args: &[&str],
     ) {
         let command: Vec<String> = args.iter().map(|value| (*value).to_string()).collect();
-        let (response, is_write) = execute_ordered_command(store, persistence, &command).await;
-        assert!(is_write, "command was not treated as a mutation: {args:?}");
+        let outcome = execute_ordered_command(store, persistence, &command).await;
+        assert_eq!(
+            outcome.mutation,
+            MutationState::Committed,
+            "command was not committed as a mutation: {args:?}"
+        );
         assert!(
-            !matches!(response, RESPValue::Error(_)),
-            "mutation failed: {response:?}"
+            !matches!(&outcome.response, RESPValue::Error(_)),
+            "mutation failed: {:?}",
+            outcome.response
         );
     }
 
@@ -6464,15 +6002,15 @@ mod tests {
             .json_set("document", "$", serde_json::json!({"value": 1}))
             .unwrap();
 
-        let (exists, _) = execute_command(&store, &["EXISTS".to_string(), "document".to_string()]);
-        assert!(matches!(exists, RESPValue::Integer(1)));
+        let exists = execute_command(&store, &["EXISTS".to_string(), "document".to_string()]);
+        assert!(matches!(exists.response, RESPValue::Integer(1)));
 
-        let (get, changed) = execute_command(&store, &["GET".to_string(), "document".to_string()]);
+        let get = execute_command(&store, &["GET".to_string(), "document".to_string()]);
         assert!(matches!(
-            get,
+            get.response,
             RESPValue::Error(ref message) if message.starts_with("WRONGTYPE")
         ));
-        assert!(!changed);
+        assert_eq!(get.mutation, MutationState::NotRequested);
     }
 
     #[test]
@@ -6494,12 +6032,12 @@ mod tests {
                     "replacement".to_string(),
                 ],
             };
-            let (response, changed) = execute_command(&store, &args);
+            let outcome = execute_command(&store, &args);
             assert!(matches!(
-                response,
+                outcome.response,
                 RESPValue::Error(ref message) if message.starts_with("WRONGTYPE")
             ));
-            assert!(!changed);
+            assert_eq!(outcome.mutation, MutationState::NoChange);
             assert_eq!(
                 store.lrange("value", 0, -1),
                 Ok(vec!["original".to_string()])
@@ -6533,7 +6071,7 @@ mod tests {
         let store = ShardedStore::new();
         store.set("value".to_string(), "original".to_string());
 
-        let (response, changed) = execute_command(
+        let outcome = execute_command(
             &store,
             &[
                 "JSON.SET".to_string(),
@@ -6543,10 +6081,10 @@ mod tests {
             ],
         );
         assert!(matches!(
-            response,
+            outcome.response,
             RESPValue::Error(ref message) if message.starts_with("WRONGTYPE")
         ));
-        assert!(!changed);
+        assert_eq!(outcome.mutation, MutationState::NoChange);
         assert_eq!(store.get("value"), Ok(Some("original".to_string())));
     }
 
@@ -6617,16 +6155,19 @@ mod tests {
     #[test]
     fn empty_values_are_data_and_zero_duration_set_does_not_delete() {
         let store = ShardedStore::new();
-        let (set, changed) = execute_command(
+        let set = execute_command(
             &store,
             &["SET".to_string(), "empty".to_string(), String::new()],
         );
-        assert!(matches!(set, RESPValue::SimpleString(ref value) if value == "OK"));
-        assert!(changed);
+        assert!(matches!(
+            set.response,
+            RESPValue::SimpleString(ref value) if value == "OK"
+        ));
+        assert_eq!(set.mutation, MutationState::Tentative);
         assert_eq!(store.get("empty"), Ok(Some(String::new())));
 
         store.set("protected".to_string(), "original".to_string());
-        let (invalid, changed) = execute_command(
+        let invalid = execute_command(
             &store,
             &[
                 "SET".to_string(),
@@ -6636,8 +6177,8 @@ mod tests {
                 "0".to_string(),
             ],
         );
-        assert!(matches!(invalid, RESPValue::Error(_)));
-        assert!(!changed);
+        assert!(matches!(invalid.response, RESPValue::Error(_)));
+        assert_eq!(invalid.mutation, MutationState::NoChange);
         assert_eq!(store.get("protected"), Ok(Some("original".to_string())));
     }
 
@@ -6981,8 +6522,8 @@ mod tests {
         ];
         for command in &snapshot_commands {
             let args: Vec<String> = command.iter().map(|value| (*value).to_string()).collect();
-            let (response, _) = execute_command(&snapshot_store, &args);
-            assert!(!matches!(response, RESPValue::Error(_)));
+            let outcome = execute_command(&snapshot_store, &args);
+            assert!(!matches!(outcome.response, RESPValue::Error(_)));
         }
         write_snapshot_file(snapshot_store.raw_entries(), 6, &directory.paths).unwrap();
 
@@ -7568,9 +7109,9 @@ mod tests {
         store.replace_all(replacement.raw_entries());
         drop(installation_guard);
 
-        let (response, is_write) = read_task.await.unwrap();
-        assert!(!is_write);
-        let RESPValue::Array(values) = response else {
+        let outcome = read_task.await.unwrap();
+        assert_eq!(outcome.mutation, MutationState::NotRequested);
+        let RESPValue::Array(values) = outcome.response else {
             panic!("expected an MGET array response");
         };
         assert_eq!(values.len(), 2);
@@ -8415,7 +7956,7 @@ mod tests {
                 ],
             )
             .await
-            .0
+            .into_response()
         });
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut read)
@@ -8561,9 +8102,12 @@ mod tests {
         let store = Arc::new(ShardedStore::new());
 
         let command = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
-        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
-        assert!(!is_write);
-        assert!(matches!(response, RESPValue::Error(message) if message.starts_with("MISCONF")));
+        let outcome = execute_ordered_command(&store, &persistence, &command).await;
+        assert_eq!(outcome.mutation, MutationState::NoChange);
+        assert!(matches!(
+            outcome.response,
+            RESPValue::Error(message) if message.starts_with("MISCONF")
+        ));
         assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
         assert!(persistence.backlog.lock().unwrap().is_empty());
         assert!(live_receiver.try_recv().is_err());
@@ -8575,9 +8119,9 @@ mod tests {
             "second".to_string(),
             "rejected".to_string(),
         ];
-        let (second_response, _) =
-            execute_ordered_command(&store, &persistence, &second_command).await;
-        assert!(matches!(second_response, RESPValue::Error(_)));
+        let second_outcome = execute_ordered_command(&store, &persistence, &second_command).await;
+        assert!(matches!(second_outcome.response, RESPValue::Error(_)));
+        assert_eq!(second_outcome.mutation, MutationState::NoChange);
         assert_eq!(store.get("second"), Ok(None));
 
         drop(persistence);
@@ -9204,9 +8748,9 @@ mod tests {
             "key".to_string(),
             "replacement".to_string(),
         ];
-        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
-        assert!(matches!(response, RESPValue::Integer(0)));
-        assert!(!is_write);
+        let outcome = execute_ordered_command(&store, &persistence, &command).await;
+        assert!(matches!(outcome.response, RESPValue::Integer(0)));
+        assert_eq!(outcome.mutation, MutationState::NoChange);
         assert_eq!(persistence.repl_offset.load(Ordering::SeqCst), 1);
         assert_eq!(persistence.backlog.lock().unwrap().len(), 1);
 
@@ -9239,9 +8783,12 @@ mod tests {
         .await;
         let offset_before_overflow = persistence.repl_offset.load(Ordering::SeqCst);
         let overflow = vec!["INCR".to_string(), "maximum".to_string()];
-        let (response, is_write) = execute_ordered_command(&store, &persistence, &overflow).await;
-        assert!(matches!(response, RESPValue::Error(message) if message.contains("overflow")));
-        assert!(!is_write);
+        let outcome = execute_ordered_command(&store, &persistence, &overflow).await;
+        assert!(matches!(
+            outcome.response,
+            RESPValue::Error(message) if message.contains("overflow")
+        ));
+        assert_eq!(outcome.mutation, MutationState::NoChange);
         assert_eq!(
             persistence.repl_offset.load(Ordering::SeqCst),
             offset_before_overflow
@@ -9724,10 +9271,10 @@ mod tests {
 
         let store = Arc::new(ShardedStore::new());
         let command = vec!["SET".to_string(), "key".to_string(), "value".to_string()];
-        let (response, is_write) = execute_ordered_command(&store, &persistence, &command).await;
-        assert!(!is_write);
+        let outcome = execute_ordered_command(&store, &persistence, &command).await;
+        assert_eq!(outcome.mutation, MutationState::NoChange);
         assert!(
-            matches!(response, RESPValue::Error(message) if message.contains("injected sync failure"))
+            matches!(outcome.response, RESPValue::Error(message) if message.contains("injected sync failure"))
         );
         assert_eq!(store.get("key"), Ok(None));
         drop(persistence);

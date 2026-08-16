@@ -29,9 +29,10 @@ the authoritative boundary for state changes.
 | `src/engine.rs` | Sharded in-memory values, expiration, type-safe mutation primitives, logical memory accounting, eviction | 64 mutex-protected shards selected by FNV-1a |
 | `src/store.rs` | Typed data operations plus tentative mutation capture, admission, and rollback | Does not assign sequences or decide durability |
 | `src/store/json_path.rs` | Pure parsing and execution for the supported JSON field/index path subset | No persistence, protocol, or server dependencies |
+| `src/execution.rs` | RESP data-command semantics, affected-key planning, and typed mutation outcomes | Tentative outcomes do not decide admission or durability |
 | `src/resp.rs` | Bounded RESP command framing and response encoding | RESP command subset, not complete Redis compatibility |
 | `src/protocol.rs` | Bounded OBP framing and encoding | Internal/experimental protocol with a small command subset |
-| `src/main.rs` | Command dispatch, authoritative mutation ordering, committed effects, persistence, replication, networking, metrics, lifecycle | Still broad; durable ordering remains intentionally co-located |
+| `src/main.rs` | Runtime commands, authoritative mutation ordering, committed effects, persistence, replication, networking, metrics, lifecycle | Still broad; durable ordering remains intentionally co-located |
 | `src/onyx-cli.rs` | Minimal interactive RESP client | Not a complete shell parser or `redis-cli` replacement |
 | `src/onyx-bench.rs` | Bounded RESP benchmark runner with repeatable workloads, percentiles, and error accounting | No OBP workload or coordinated-omission correction yet |
 
@@ -99,6 +100,19 @@ decide when a tentative mutation is durable. Those responsibilities remain on
 the server side of the boundary. Exact entry installation and full replacement
 APIs exist for validated recovery and synchronization paths; normal RESP command
 semantics use typed store operations.
+
+### Command execution boundary
+
+The command executor owns data-command argument interpretation, RESP results,
+and affected-key planning. Its `MutationState` distinguishes commands that do
+not request mutation, semantic no-ops or rejections, and tentative store
+changes. It does not label a mutation committed.
+
+The server captures affected entries before execution and derives canonical
+effects from actual before/after state. That comparison remains authoritative
+even if the executor only reports a tentative mutation. The server changes the
+outcome to `Committed` only after admission, sequence assignment, and successful
+binlog acceptance. Persistence failure rolls state back and returns `NoChange`.
 
 ## Engine semantics
 
@@ -277,14 +291,12 @@ must follow the actual dependency graph rather than target file size alone.
 
 The preferred dependency order, subject to new evidence, is:
 
-1. Extract command execution and its typed mutation outcome without moving the
-   authoritative durability gate.
-2. Extract committed effects plus persistence codecs/recovery as one cohesive
+1. Extract committed effects plus persistence codecs/recovery as one cohesive
    subsystem.
-3. Extract replication only after its ownership of durable identity, task
+2. Extract replication only after its ownership of durable identity, task
    cancellation, and sequence publication is explicit.
-4. Extract listener ownership, connection supervision, metrics, and shutdown.
-5. Reduce `main.rs` to process bootstrap and top-level error reporting.
+3. Extract listener ownership, connection supervision, metrics, and shutdown.
+4. Reduce `main.rs` to process bootstrap and top-level error reporting.
 
 Benchmark modernization should precede performance optimization. Public
 performance claims require reproducible workloads, latency percentiles,

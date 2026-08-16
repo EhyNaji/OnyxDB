@@ -8,6 +8,7 @@ pub mod client;
 pub mod clock;
 pub mod command;
 pub mod engine;
+pub mod execution;
 pub mod protocol;
 pub mod resp;
 pub mod store;
