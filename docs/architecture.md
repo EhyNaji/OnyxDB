@@ -93,9 +93,10 @@ wait for the same write boundary before proceeding.
 
 Coordinator, binlog, and compaction paths expose cumulative Prometheus metrics
 for queue depth and wait, group composition and duration, logical batches per
-physical append, accepted ONX4 bytes, append acknowledgement time, and
-compaction phase duration. Metrics use relaxed atomics and never participate in
-correctness decisions. Scraping cannot change commit ordering or durability.
+physical append, accepted ONX4 bytes, append acknowledgement time, compaction
+serialization wait, commit-path write pause, retained suffix bytes, and phase
+duration. Metrics use relaxed atomics and never participate in correctness
+decisions. Scraping cannot change commit ordering or durability.
 
 ### Mutation invariant
 
@@ -198,14 +199,65 @@ greater than `W`, in contiguous order. Therefore:
 - post-boundary mutations remain recoverable;
 - a binlog that begins after `W + 1` is rejected as a history gap.
 
-Compaction holds the write gate and sends an ordered binlog barrier that waits
-for every preceding worker operation without strengthening the configured
-fsync policy. It then writes and synchronizes a temporary snapshot, durably
-replaces the current snapshot while retaining a previous snapshot, and only
-then truncates and synchronizes the binlog. The newly installed snapshot is the
-durable replacement for pre-watermark history. A failed snapshot installation
-never authorizes binlog truncation, while shutdown, promotion, and explicit
-durable flushes retain their stronger synchronization behavior.
+### Concurrent compaction protocol
+
+Automatic compaction, clean shutdown, and replica full synchronization share a
+baseline-replacement mutex. This prevents two independently valid snapshot and
+binlog transitions from interleaving. Compaction itself has four phases:
+
+1. Hold the complete write and visibility boundary, issue an ordered binlog
+   checkpoint, capture watermark `W`, and clone the committed store image.
+2. Release the boundary and write, synchronize, and install the snapshot while
+   normal commits continue appending to the original binlog.
+3. Issue another ordered checkpoint and prepare and synchronize the suffix from
+   the capture checkpoint through that later position, still without holding
+   the commit boundary.
+4. Reacquire the complete boundary, append only the records accepted after the
+   preparation checkpoint, and atomically promote the complete suffix.
+   Concurrently accepted write counts are retained for the next automatic
+   compaction.
+
+After a successful automatic attempt, ownership is atomically rearmed when the
+retained write count already exceeds the next threshold. This closes the race
+between clearing `compaction_pending` and a concurrent writer, and prevents a
+slow compaction from leaving an over-threshold suffix indefinitely quiescent.
+Failures are not retried in a tight loop; the next accepted write may schedule
+the retry.
+
+The checkpoint flushes prior userspace writes but does not strengthen the
+configured `appendfsync` policy. Snapshot serialization is cancellation-safe:
+an owned supervisor completes or fail-stops finalization even if the initiating
+task disconnects or is cancelled. Both short boundary phases use the visibility
+gate as well as the write gate, so compaction cannot capture or install a
+tentative mutation after an indeterminate commit has established fail-stop.
+
+Suffix replacement first writes and synchronizes `onyx.binlog.tmp`, renames the
+full active history to `onyx.binlog.previous`, then durably promotes the suffix
+to `onyx.binlog`. Recovery follows these rules:
+
+| On-disk state | Recovery decision |
+| --- | --- |
+| Active binlog exists | Validate and use the active file; stale rotation files are removed only after successful recovery |
+| Active missing, previous exists | Restore the previous full history and validate it |
+| Only temporary suffix exists | Fail closed because no authoritative predecessor can prove its boundary |
+
+Until the synchronized suffix becomes active, the full pre-compaction binlog is
+the recovery authority. Once it becomes active, the installed snapshot is the
+authority through `W` and the suffix contains every sequence after `W`. A
+failed snapshot installation never authorizes suffix replacement. An
+indeterminate replacement outcome enters fail-stop; restart recovery selects a
+single discoverable authority rather than attempting to merge files.
+
+The alternatives were holding the commit boundary for the entire snapshot,
+rotating to a permanent second log generation at capture time, and adopting a
+segmented log catalog. The first caused dataset-sized pauses. The latter two
+would eliminate the final suffix delta but add permanent generation metadata
+and recovery states. Snapshot-first prepared-suffix replacement was selected
+because it removes compression, snapshot I/O, and the bulk suffix copy from the
+commit path while retaining the existing single-binlog recovery model. The
+suffix-preparation, retained-byte, and write-pause metrics make the remaining
+delta cost explicit; a generation design should be reconsidered if that delta
+becomes dominant.
 
 Recovery may truncate only a recognizable incomplete final record after a valid
 history. Complete corruption and ambiguous framing fail startup. Recovery is

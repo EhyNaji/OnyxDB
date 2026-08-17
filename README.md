@@ -122,6 +122,8 @@ working directory:
   ownership of the canonical data directory.
 - `onyx.binlog`: ordered committed-effect records with sequence numbers and
   CRC32 checksums.
+- `onyx.binlog.tmp` and `onyx.binlog.previous`: transient crash-recovery files
+  used only while replacing snapshotted binlog history with its live suffix.
 - `onyx.snapshot`: the current versioned, gzip-compressed snapshot.
 - `onyx.snapshot.previous`: the previous snapshot retained across replacement.
 - `onyx.replica`: durable replica lifecycle and synchronization identity.
@@ -147,7 +149,8 @@ Recovery installs a snapshot and replays only binlog sequences after the
 snapshot watermark. A recognizable incomplete final record may be truncated;
 complete corrupted records, sequence gaps, and ambiguous legacy data fail
 startup rather than being skipped. Compaction installs and synchronizes the new
-snapshot before truncating the binlog.
+snapshot while commits continue, then crash-safely replaces snapshotted binlog
+history with the post-snapshot suffix under the commit boundary.
 
 ## Replication
 

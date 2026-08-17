@@ -299,6 +299,7 @@ pub(crate) fn load_data_from_paths(
     store: &ShardedStore,
     paths: &PersistencePaths,
 ) -> Result<RecoveryState, PersistenceError> {
+    recover_interrupted_binlog_rotation(paths)?;
     let snapshot_path = if paths.snapshot.exists() {
         &paths.snapshot
     } else if paths.snapshot_backup.exists() {
@@ -364,11 +365,54 @@ pub(crate) fn load_data_from_paths(
     }
     store.replace_all(staging.raw_entries());
     info!("Binlog replayed: {} commands", replayed);
+    cleanup_redundant_binlog_rotation_files(paths);
 
     Ok(RecoveryState {
         last_sequence: snapshot_watermark.max(binlog.max_sequence),
         snapshot_watermark,
     })
+}
+
+fn recover_interrupted_binlog_rotation(paths: &PersistencePaths) -> Result<(), PersistenceError> {
+    if paths.binlog.exists() {
+        return Ok(());
+    }
+    if paths.binlog_backup.exists() {
+        warn!(
+            "Active binlog is missing; restoring interrupted rotation from {}",
+            paths.binlog_backup.display()
+        );
+        durable_rename(&paths.binlog_backup, &paths.binlog)?;
+        sync_parent_directory(&paths.binlog)?;
+        return Ok(());
+    }
+    if paths.binlog_temp.exists() {
+        return Err(PersistenceError::new(
+            "Binlog rotation temporary file exists without an active or backup binlog",
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_redundant_binlog_rotation_files(paths: &PersistencePaths) {
+    let mut removed = false;
+    for path in [&paths.binlog_temp, &paths.binlog_backup] {
+        match fs::remove_file(path) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                "Unable to remove redundant binlog rotation file {}: {}",
+                path.display(),
+                error
+            ),
+        }
+    }
+    if removed && let Err(error) = sync_parent_directory(&paths.binlog) {
+        warn!(
+            "Unable to synchronize redundant binlog rotation cleanup: {}",
+            error
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -669,5 +713,49 @@ mod tests {
         );
         assert_eq!(fs::read(&paths.binlog).unwrap(), binlog);
         assert_recovers_new_value(&paths);
+    }
+
+    #[test]
+    fn interrupted_binlog_rotation_restores_the_full_backup() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        write_snapshot_file(snapshot_entries(b"old"), 1, &paths).unwrap();
+        let suffix = write_following_binlog_record(&paths);
+        durable_rename(&paths.binlog, &paths.binlog_backup).unwrap();
+        fs::write(&paths.binlog_temp, &suffix).unwrap();
+        assert!(!paths.binlog.exists());
+
+        assert_recovers_new_value(&paths);
+
+        assert!(paths.binlog.exists());
+        assert!(!paths.binlog_backup.exists());
+        assert!(!paths.binlog_temp.exists());
+    }
+
+    #[test]
+    fn completed_binlog_rotation_prefers_the_active_suffix() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        write_snapshot_file(snapshot_entries(b"old"), 1, &paths).unwrap();
+        let active_suffix = write_following_binlog_record(&paths);
+        fs::write(&paths.binlog_backup, b"obsolete corrupt backup").unwrap();
+
+        assert_recovers_new_value(&paths);
+
+        assert_eq!(fs::read(&paths.binlog).unwrap(), active_suffix);
+        assert!(!paths.binlog_backup.exists());
+    }
+
+    #[test]
+    fn orphaned_binlog_rotation_temporary_file_is_rejected() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        fs::write(&paths.binlog_temp, b"uncommitted suffix").unwrap();
+
+        let error = load_data_from_paths(&ShardedStore::new(), &paths)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("temporary file exists without an active or backup binlog"));
     }
 }

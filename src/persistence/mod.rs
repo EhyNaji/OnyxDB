@@ -13,6 +13,8 @@ pub(crate) use runtime::*;
 
 const SNAPSHOT_PATH: &str = "onyx.snapshot";
 const BINLOG_PATH: &str = "onyx.binlog";
+const BINLOG_TEMP_PATH: &str = "onyx.binlog.tmp";
+const BINLOG_BACKUP_PATH: &str = "onyx.binlog.previous";
 const REPLICA_STATE_PATH: &str = "onyx.replica";
 
 #[derive(Clone, Debug)]
@@ -21,6 +23,8 @@ pub(crate) struct PersistencePaths {
     pub(crate) snapshot_temp: PathBuf,
     pub(crate) snapshot_backup: PathBuf,
     pub(crate) binlog: PathBuf,
+    pub(crate) binlog_temp: PathBuf,
+    pub(crate) binlog_backup: PathBuf,
     pub(crate) replica_state: PathBuf,
     pub(crate) replica_state_temp: PathBuf,
 }
@@ -32,6 +36,8 @@ impl PersistencePaths {
             snapshot_temp: directory.join(format!("{}.tmp", SNAPSHOT_PATH)),
             snapshot_backup: directory.join(format!("{}.previous", SNAPSHOT_PATH)),
             binlog: directory.join(BINLOG_PATH),
+            binlog_temp: directory.join(BINLOG_TEMP_PATH),
+            binlog_backup: directory.join(BINLOG_BACKUP_PATH),
             replica_state: directory.join(REPLICA_STATE_PATH),
             replica_state_temp: directory.join(format!("{}.tmp", REPLICA_STATE_PATH)),
         }

@@ -35,8 +35,9 @@ before each measured run and again after the commit coordinator and automatic
 compaction become quiescent. Metrics sampling and the bounded quiescence wait
 are outside the measured elapsed time. Human reports summarize commit groups,
 logical batches, physical binlog appends, records per append, compaction time,
-queue wait, and queue high-water. JSON methodology version 2 includes complete
-`before`, `after`, and monotonic-counter `delta` maps for deeper analysis.
+commit-path write pause, retained binlog bytes, queue wait, and queue
+high-water. JSON methodology version 2 includes complete `before`, `after`, and
+monotonic-counter `delta` maps for deeper analysis.
 
 The option is deliberately explicit. A benchmark without `--metrics-address`
 does not contact a metrics endpoint and retains the same traffic shape as the
@@ -65,8 +66,12 @@ cargo run --release --locked --bin onyx-bench -- \
 ```
 
 Report commit latency percentiles together with compaction count, total and
-maximum duration, and the barrier, snapshot-capture, snapshot-write, and
-rotation phase counters. Dataset cardinality materially changes snapshot cost.
+maximum duration, serialization wait, checkpoint, snapshot-capture,
+snapshot-write, rotation, total/maximum write pause, and retained suffix bytes.
+Dataset cardinality materially changes snapshot capture and serialization cost;
+mutation rate during snapshot writing changes the suffix-copy cost. A useful
+long-running comparison therefore keeps both cardinality and offered write load
+constant and reports p99.9 rather than relying on throughput alone.
 
 ## Workloads
 

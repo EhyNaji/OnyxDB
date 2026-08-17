@@ -350,7 +350,7 @@ impl<T> Drop for AbortTaskOnDrop<T> {
 }
 
 struct Persistence {
-    commit_runtime: CommitRuntime,
+    commit_runtime: Arc<CommitRuntime>,
     master_commit: std::sync::OnceLock<MasterCommitCoordinator>,
     // Broadcasts each committed batch to connected replicas with its sequence.
     replica_tx: tokio::sync::broadcast::Sender<(u64, CommittedBatch)>,
@@ -367,7 +367,7 @@ struct Persistence {
     // Channel-to-subscriber IDs used to report PUBLISH recipient counts.
     subscriptions:
         std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<u64>>>,
-    upstream_replid: AtomicU64,
+    upstream_replid: Arc<AtomicU64>,
     replication_ready: AtomicBool,
     replica_lifecycle: Arc<ReplicaLifecycle>,
 }
@@ -2042,7 +2042,7 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
         ),
         (
             "onyxdb_compaction_in_progress",
-            "Snapshot compaction attempts currently active or waiting for the write gate",
+            "Snapshot compaction attempts currently active or waiting for baseline ownership",
             "gauge",
             compaction.in_progress,
         ),
@@ -2070,27 +2070,63 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
         ),
         (
             "onyxdb_compaction_gate_wait_seconds_total",
-            "Cumulative time compaction attempts waited for the write gate",
+            "Cumulative time compaction attempts waited for the authoritative commit boundary",
             "counter",
             seconds(compaction.gate_wait_nanoseconds_total),
         ),
         (
             "onyxdb_compaction_gate_wait_seconds_max",
-            "Longest observed compaction write-gate wait",
+            "Longest observed compaction commit-boundary wait",
             "gauge",
             seconds(compaction.gate_wait_nanoseconds_max),
         ),
         (
-            "onyxdb_compaction_barrier_seconds_total",
-            "Cumulative pre-snapshot ordered binlog barrier time",
+            "onyxdb_compaction_serialization_wait_seconds_total",
+            "Cumulative time compaction attempts waited for baseline-replacement ownership",
             "counter",
-            seconds(compaction.barrier_nanoseconds_total),
+            seconds(compaction.serialization_wait_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_serialization_wait_seconds_max",
+            "Longest observed wait for baseline-replacement ownership",
+            "gauge",
+            seconds(compaction.serialization_wait_nanoseconds_max),
+        ),
+        (
+            "onyxdb_compaction_write_pause_seconds_total",
+            "Cumulative time authoritative commits were paused for compaction capture or rotation",
+            "counter",
+            seconds(compaction.write_pause_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_write_pause_seconds_max",
+            "Longest observed individual compaction capture or rotation pause",
+            "gauge",
+            seconds(compaction.write_pause_nanoseconds_max),
+        ),
+        (
+            "onyxdb_compaction_checkpoint_seconds_total",
+            "Cumulative ordered binlog checkpoint time",
+            "counter",
+            seconds(compaction.checkpoint_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_checkpoint_seconds_max",
+            "Longest observed ordered binlog checkpoint",
+            "gauge",
+            seconds(compaction.checkpoint_nanoseconds_max),
+        ),
+        (
+            "onyxdb_compaction_barrier_seconds_total",
+            "Compatibility alias for cumulative ordered binlog checkpoint time",
+            "counter",
+            seconds(compaction.checkpoint_nanoseconds_total),
         ),
         (
             "onyxdb_compaction_barrier_seconds_max",
-            "Longest observed pre-snapshot ordered binlog barrier",
+            "Compatibility alias for the longest ordered binlog checkpoint",
             "gauge",
-            seconds(compaction.barrier_nanoseconds_max),
+            seconds(compaction.checkpoint_nanoseconds_max),
         ),
         (
             "onyxdb_compaction_snapshot_capture_seconds_total",
@@ -2117,6 +2153,18 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
             seconds(compaction.snapshot_write_nanoseconds_max),
         ),
         (
+            "onyxdb_compaction_suffix_prepare_seconds_total",
+            "Cumulative post-watermark binlog suffix preparation time outside the commit boundary",
+            "counter",
+            seconds(compaction.suffix_prepare_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_suffix_prepare_seconds_max",
+            "Longest observed post-watermark binlog suffix preparation",
+            "gauge",
+            seconds(compaction.suffix_prepare_nanoseconds_max),
+        ),
+        (
             "onyxdb_compaction_rotation_seconds_total",
             "Cumulative replica-state update and binlog rotation time",
             "counter",
@@ -2131,6 +2179,20 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
     ] {
         push_metric(&mut output, name, help, metric_type, value);
     }
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_retained_binlog_bytes_total",
+        "Post-watermark binlog bytes retained across completed compactions",
+        "counter",
+        compaction.retained_bytes_total,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_retained_binlog_bytes_max",
+        "Largest post-watermark binlog suffix retained by one compaction",
+        "gauge",
+        compaction.retained_bytes_max,
+    );
 
     output
 }
@@ -2462,15 +2524,21 @@ fn schedule_compaction(
     let store = Arc::clone(store);
     let persistence = Arc::clone(persistence);
     tokio::spawn(async move {
-        if let Err(error) = compact_store(&store, &persistence).await {
-            error!("Automatic compaction failed: {}", error);
-            persistence
-                .write_count
-                .store(COMPACTION_THRESHOLD, Ordering::SeqCst);
+        loop {
+            let succeeded = match compact_store(&store, &persistence).await {
+                Ok(_) => true,
+                Err(error) => {
+                    error!("Automatic compaction failed: {}", error);
+                    persistence
+                        .write_count
+                        .store(COMPACTION_THRESHOLD, Ordering::SeqCst);
+                    false
+                }
+            };
+            if !persistence.finish_compaction_schedule_and_rearm(COMPACTION_THRESHOLD, succeeded) {
+                break;
+            }
         }
-        persistence
-            .compaction_pending
-            .store(false, Ordering::SeqCst);
     });
 }
 
@@ -2583,6 +2651,7 @@ async fn install_full_sync(
             "Full synchronization requires a non-zero replication ID",
         ));
     }
+    let _compaction_guard = persistence.compaction_gate.lock().await;
     let boundary = persistence.acquire_commit_boundary().await;
     if persistence.promote_to_master.load(Ordering::SeqCst)
         || persistence.replica_lifecycle.stop_requested()
@@ -3377,11 +3446,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let promote_flag = Arc::new(AtomicBool::new(false));
     let replica_lifecycle = Arc::new(ReplicaLifecycle::new(master_addr.is_none()));
     let persistence = Arc::new(Persistence {
-        commit_runtime: CommitRuntime::new(
+        commit_runtime: Arc::new(CommitRuntime::new(
             BinlogHandle::new(tx),
             recovery.last_sequence,
             paths.clone(),
-        ),
+        )),
         master_commit: std::sync::OnceLock::new(),
         replica_tx,
         promote_to_master: Arc::clone(&promote_flag),
@@ -3391,11 +3460,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pubsub_tx,
         next_subscriber_id: AtomicU64::new(0),
         subscriptions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        upstream_replid: AtomicU64::new(
+        upstream_replid: Arc::new(AtomicU64::new(
             recovered_replica_identity
                 .map(|identity| identity.replid)
                 .unwrap_or(0),
-        ),
+        )),
         replication_ready: AtomicBool::new(recovered_replica_identity.is_some()),
         replica_lifecycle,
     });
@@ -3408,8 +3477,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .unwrap_or_else(|_| panic!("master commit coordinator initialized more than once"));
 
-    let binlog_shared: Arc<std::sync::Mutex<File>> =
-        Arc::new(std::sync::Mutex::new(open_binlog_file(&paths.binlog)));
+    let binlog_shared = Arc::new(std::sync::Mutex::new(ManagedBinlogFile::new(
+        open_binlog_file(&paths.binlog),
+        paths.clone(),
+    )));
 
     // The default `everysec` policy synchronizes the current binlog once per second.
     if policy == FsyncPolicy::EverySec {
@@ -4450,14 +4521,7 @@ mod tests {
                 sequence
             ));
             fs::create_dir_all(&root).unwrap();
-            let paths = PersistencePaths {
-                snapshot: root.join("onyx.snapshot"),
-                snapshot_temp: root.join("onyx.snapshot.tmp"),
-                snapshot_backup: root.join("onyx.snapshot.previous"),
-                binlog: root.join("onyx.binlog"),
-                replica_state: root.join("onyx.replica"),
-                replica_state_temp: root.join("onyx.replica.tmp"),
-            };
+            let paths = PersistencePaths::in_directory(&root);
             Self { root, paths }
         }
     }
@@ -4476,7 +4540,11 @@ mod tests {
         let (replica_tx, _) = tokio::sync::broadcast::channel(4096);
         let (pubsub_tx, _) = tokio::sync::broadcast::channel(16);
         Arc::new(Persistence {
-            commit_runtime: CommitRuntime::new(BinlogHandle::new(log_tx), initial_sequence, paths),
+            commit_runtime: Arc::new(CommitRuntime::new(
+                BinlogHandle::new(log_tx),
+                initial_sequence,
+                paths,
+            )),
             master_commit: std::sync::OnceLock::new(),
             replica_tx,
             promote_to_master: Arc::new(AtomicBool::new(false)),
@@ -4486,7 +4554,7 @@ mod tests {
             pubsub_tx,
             next_subscriber_id: AtomicU64::new(0),
             subscriptions: std::sync::Mutex::new(std::collections::HashMap::new()),
-            upstream_replid: AtomicU64::new(0),
+            upstream_replid: Arc::new(AtomicU64::new(0)),
             replication_ready: AtomicBool::new(false),
             replica_lifecycle: Arc::new(ReplicaLifecycle::new(true)),
         })
@@ -4531,11 +4599,16 @@ mod tests {
                     records,
                     completion,
                 } => return (records, completion),
-                LogMessage::Barrier { completion }
-                | LogMessage::Flush { completion }
+                LogMessage::Flush { completion }
                 | LogMessage::SyncData { completion }
                 | LogMessage::Truncate { completion } => {
                     let _ = completion.send(Ok(()));
+                }
+                LogMessage::Checkpoint { completion } => {
+                    let _ = completion.send(Ok(0));
+                }
+                LogMessage::CompactSuffix { completion, .. } => {
+                    let _ = completion.send(Ok(0));
                 }
             }
         }
@@ -4625,10 +4698,11 @@ mod tests {
             .write(true)
             .open(&paths.binlog)
             .unwrap();
+        let managed_file = ManagedBinlogFile::new(file, paths.clone());
         let persistence = test_persistence(paths, log_tx, initial_sequence);
         let worker = tokio::spawn(run_binlog_worker(
             receiver,
-            Arc::new(std::sync::Mutex::new(file)),
+            Arc::new(std::sync::Mutex::new(managed_file)),
             FsyncPolicy::EverySec,
         ));
         (persistence, worker)
@@ -4675,11 +4749,16 @@ mod tests {
                         let _ = completion.send(Ok(()));
                         completed_tx.take().unwrap().send(()).unwrap();
                     }
-                    LogMessage::Barrier { completion }
-                    | LogMessage::Flush { completion }
+                    LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Checkpoint { completion } => {
+                        let _ = completion.send(Ok(0));
+                    }
+                    LogMessage::CompactSuffix { completion, .. } => {
+                        let _ = completion.send(Ok(0));
                     }
                 }
             }
@@ -5344,7 +5423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_snapshot_creation_does_not_request_binlog_truncation() {
+    async fn failed_snapshot_creation_does_not_request_suffix_replacement() {
         let directory = TestPersistenceDirectory::new();
         let previous_store = ShardedStore::new();
         previous_store.set("safe".to_string(), "old".to_string());
@@ -5355,17 +5434,24 @@ mod tests {
         let mut failing_paths = directory.paths.clone();
         failing_paths.snapshot_temp = directory.root.join("missing").join("snapshot.tmp");
         let (log_tx, mut receiver) = mpsc::channel(8);
-        let truncate_requested = Arc::new(AtomicBool::new(false));
-        let truncate_observer = Arc::clone(&truncate_requested);
+        let suffix_replacement_requested = Arc::new(AtomicBool::new(false));
+        let suffix_replacement_observer = Arc::clone(&suffix_replacement_requested);
         let worker = tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 match message {
-                    LogMessage::Barrier { completion } | LogMessage::Flush { completion } => {
+                    LogMessage::Flush { completion } => {
                         let _ = completion.send(Ok(()));
                     }
                     LogMessage::Truncate { completion } => {
-                        truncate_observer.store(true, Ordering::SeqCst);
+                        suffix_replacement_observer.store(true, Ordering::SeqCst);
                         let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Checkpoint { completion } => {
+                        let _ = completion.send(Ok(0));
+                    }
+                    LogMessage::CompactSuffix { completion, .. } => {
+                        suffix_replacement_observer.store(true, Ordering::SeqCst);
+                        let _ = completion.send(Ok(0));
                     }
                     LogMessage::Append { completion, .. } => {
                         let _ = completion.send(Ok(()));
@@ -5381,7 +5467,7 @@ mod tests {
         store.set("safe".to_string(), "new".to_string());
 
         assert!(compact_store(&store, &persistence).await.is_err());
-        assert!(!truncate_requested.load(Ordering::SeqCst));
+        assert!(!suffix_replacement_requested.load(Ordering::SeqCst));
         assert_eq!(
             fs::read(&directory.paths.snapshot).unwrap(),
             previous_snapshot
@@ -5403,10 +5489,17 @@ mod tests {
         let worker = tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 match message {
-                    LogMessage::Barrier { completion } | LogMessage::Flush { completion } => {
+                    LogMessage::Flush { completion } => {
                         let _ = completion.send(Ok(()));
                     }
                     LogMessage::Truncate { completion } => {
+                        let _ = completion
+                            .send(Err(StorageFailure::rejected("injected rotation failure")));
+                    }
+                    LogMessage::Checkpoint { completion } => {
+                        let _ = completion.send(Ok(0));
+                    }
+                    LogMessage::CompactSuffix { completion, .. } => {
                         let _ = completion
                             .send(Err(StorageFailure::rejected("injected rotation failure")));
                     }
@@ -5448,8 +5541,15 @@ mod tests {
                             "injected ambiguous rotation failure",
                         )));
                     }
+                    LogMessage::Checkpoint { completion } => {
+                        let _ = completion.send(Ok(0));
+                    }
+                    LogMessage::CompactSuffix { completion, .. } => {
+                        let _ = completion.send(Err(StorageFailure::indeterminate(
+                            "injected ambiguous rotation failure",
+                        )));
+                    }
                     LogMessage::Append { completion, .. }
-                    | LogMessage::Barrier { completion }
                     | LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion } => {
                         let _ = completion.send(Ok(()));
@@ -5810,9 +5910,22 @@ mod tests {
             None,
         );
 
-        install_full_sync(&store, &persistence, 71, 40, staging)
-            .await
-            .unwrap();
+        let baseline_guard = persistence.compaction_gate.lock().await;
+        let install_store = Arc::clone(&store);
+        let install_persistence = Arc::clone(&persistence);
+        let (install_started_tx, install_started_rx) = oneshot::channel();
+        let install = tokio::spawn(async move {
+            let _ = install_started_tx.send(());
+            install_full_sync(&install_store, &install_persistence, 71, 40, staging).await
+        });
+        install_started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !install.is_finished(),
+            "full synchronization crossed concurrent baseline-replacement ownership"
+        );
+        drop(baseline_guard);
+        install.await.unwrap().unwrap();
         assert!(store.get_entry(&Bytes::from_static(b"stale")).is_none());
         let binary = store
             .get_entry(&Bytes::from_static(b"binary\0\xff"))
@@ -6398,11 +6511,16 @@ mod tests {
                             "injected replica append failure",
                         )));
                     }
-                    LogMessage::Barrier { completion }
-                    | LogMessage::Flush { completion }
+                    LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Checkpoint { completion } => {
+                        let _ = completion.send(Ok(0));
+                    }
+                    LogMessage::CompactSuffix { completion, .. } => {
+                        let _ = completion.send(Ok(0));
                     }
                 }
             }
@@ -7499,11 +7617,16 @@ mod tests {
                         }
                         let _ = completion.send(Ok(()));
                     }
-                    LogMessage::Barrier { completion }
-                    | LogMessage::Flush { completion }
+                    LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Checkpoint { completion } => {
+                        let _ = completion.send(Ok(0));
+                    }
+                    LogMessage::CompactSuffix { completion, .. } => {
+                        let _ = completion.send(Ok(0));
                     }
                 }
             }
@@ -7573,11 +7696,16 @@ mod tests {
                             "injected transaction failure",
                         )));
                     }
-                    LogMessage::Barrier { completion }
-                    | LogMessage::Flush { completion }
+                    LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Checkpoint { completion } => {
+                        let _ = completion.send(Ok(0));
+                    }
+                    LogMessage::CompactSuffix { completion, .. } => {
+                        let _ = completion.send(Ok(0));
                     }
                 }
             }
@@ -7636,11 +7764,16 @@ mod tests {
                             "injected transaction failure",
                         )));
                     }
-                    LogMessage::Barrier { completion }
-                    | LogMessage::Flush { completion }
+                    LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Checkpoint { completion } => {
+                        let _ = completion.send(Ok(0));
+                    }
+                    LogMessage::CompactSuffix { completion, .. } => {
+                        let _ = completion.send(Ok(0));
                     }
                 }
             }
@@ -7890,11 +8023,16 @@ mod tests {
                         let _ = completion
                             .send(Err(StorageFailure::rejected("injected append failure")));
                     }
-                    LogMessage::Barrier { completion }
-                    | LogMessage::Flush { completion }
+                    LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Checkpoint { completion } => {
+                        let _ = completion.send(Ok(0));
+                    }
+                    LogMessage::CompactSuffix { completion, .. } => {
+                        let _ = completion.send(Ok(0));
                     }
                 }
             }
@@ -9077,10 +9215,15 @@ mod tests {
                             .send(Err(StorageFailure::indeterminate("injected sync failure")));
                     }
                     LogMessage::Append { completion, .. }
-                    | LogMessage::Barrier { completion }
                     | LogMessage::Flush { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Checkpoint { completion } => {
+                        let _ = completion.send(Ok(0));
+                    }
+                    LogMessage::CompactSuffix { completion, .. } => {
+                        let _ = completion.send(Ok(0));
                     }
                 }
             }
@@ -9178,11 +9321,16 @@ mod tests {
                             "injected ambiguous completion after durable write",
                         )));
                     }
-                    LogMessage::Barrier { completion }
-                    | LogMessage::Flush { completion }
+                    LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
+                    }
+                    LogMessage::Checkpoint { completion } => {
+                        let _ = completion.send(Ok(0));
+                    }
+                    LogMessage::CompactSuffix { completion, .. } => {
+                        let _ = completion.send(Ok(0));
                     }
                 }
             }
