@@ -122,8 +122,10 @@ working directory:
   ownership of the canonical data directory.
 - `onyx.binlog`: ordered committed-effect records with sequence numbers and
   CRC32 checksums.
-- `onyx.binlog.tmp` and `onyx.binlog.previous`: transient crash-recovery files
-  used only while replacing snapshotted binlog history with its live suffix.
+- `onyx.binlog.segment.<sequence>`: immutable generations sealed at snapshot
+  capture and removed only after a covering snapshot is durable.
+- `onyx.binlog.tmp` and `onyx.binlog.previous`: legacy transient rotation files
+  recognized during recovery for upgrade compatibility.
 - `onyx.snapshot`: the current versioned, gzip-compressed snapshot.
 - `onyx.snapshot.previous`: the previous snapshot retained across replacement.
 - `onyx.replica`: durable replica lifecycle and synchronization identity.
@@ -148,9 +150,10 @@ operating system after userspace flush.
 Recovery installs a snapshot and replays only binlog sequences after the
 snapshot watermark. A recognizable incomplete final record may be truncated;
 complete corrupted records, sequence gaps, and ambiguous legacy data fail
-startup rather than being skipped. Compaction installs and synchronizes the new
-snapshot while commits continue, then crash-safely replaces snapshotted binlog
-history with the post-snapshot suffix under the commit boundary.
+startup rather than being skipped. Compaction seals the current binlog
+generation under the commit boundary, then installs and synchronizes the new
+snapshot while commits continue in a new active generation. Snapshot-covered
+segments are cleaned outside the commit path.
 
 ## Replication
 

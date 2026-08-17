@@ -13,13 +13,14 @@ use onyxdb::engine::DataEntry;
 use onyxdb::store::{ShardedStore, is_expired};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader as StdBufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 pub(crate) const SNAPSHOT_MAGIC: &str = "ONYXSNAP";
 pub(crate) const SNAPSHOT_VERSION: u8 = 2;
 pub(crate) const MAX_SNAPSHOT_METADATA_SIZE: usize = 4096;
 pub(crate) const MAX_SNAPSHOT_LINE_SIZE: usize = 512 * 1024 * 1024 + 1024;
+const MAX_BINLOG_SEGMENTS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SnapshotFormat {
@@ -41,6 +42,13 @@ pub(crate) struct BinlogInspection {
 pub(crate) struct RecoveryState {
     pub(crate) last_sequence: u64,
     pub(crate) snapshot_watermark: u64,
+}
+
+#[derive(Debug)]
+struct InspectedBinlogFile {
+    path: PathBuf,
+    declared_end_sequence: Option<u64>,
+    inspection: BinlogInspection,
 }
 
 fn read_bounded_utf8_line(
@@ -317,8 +325,11 @@ pub(crate) fn load_data_from_paths(
             "Unsupported unsafe legacy snapshot format; create a verified versioned snapshot before upgrading",
         ));
     }
-    let binlog = inspect_binlog(&paths.binlog)?;
-    if binlog.contains_checksumless_records {
+    let history = inspect_binlog_history(paths)?;
+    if history
+        .iter()
+        .any(|file| file.inspection.contains_checksumless_records)
+    {
         warn!(
             "Recovery accepted structurally valid checksumless ONX3 records; compact the dataset to replace this legacy recovery history"
         );
@@ -328,7 +339,8 @@ pub(crate) fn load_data_from_paths(
         SnapshotFormat::Missing => 0,
         SnapshotFormat::Legacy => unreachable!(),
     };
-    if let Some(first_sequence) = binlog.min_sequence
+    let first_sequence = history.iter().find_map(|file| file.inspection.min_sequence);
+    if let Some(first_sequence) = first_sequence
         && first_sequence > snapshot_watermark.saturating_add(1)
     {
         return Err(PersistenceError::new(
@@ -341,36 +353,218 @@ pub(crate) fn load_data_from_paths(
     info!("Snapshot loaded: {} active entries", snapshot_count);
 
     let mut replayed = 0usize;
-    for_each_binlog_record(&paths.binlog, |record| {
-        let DecodedBinlogRecord::Versioned {
-            sequence, effects, ..
-        } = decode_binlog_record(record)?;
-        if sequence <= snapshot_watermark {
-            return Ok(());
-        }
-        let batch = decode_committed_batch(effects)?;
-        apply_committed_batch(&staging, &batch);
-        replayed += 1;
-        Ok(())
-    })?;
+    let mut expected_sequence = snapshot_watermark.checked_add(1);
+    for file in &history {
+        for_each_binlog_record(&file.path, |record| {
+            let DecodedBinlogRecord::Versioned {
+                sequence, effects, ..
+            } = decode_binlog_record(record)?;
+            if sequence <= snapshot_watermark {
+                return Ok(());
+            }
+            if expected_sequence != Some(sequence) {
+                return Err(PersistenceError::new(format!(
+                    "Non-contiguous binlog replay sequence: expected {}, found {}",
+                    expected_sequence
+                        .map(|expected| expected.to_string())
+                        .unwrap_or_else(|| "no further sequence".to_string()),
+                    sequence
+                )));
+            }
+            let batch = decode_committed_batch(effects)?;
+            apply_committed_batch(&staging, &batch);
+            expected_sequence = sequence.checked_add(1);
+            replayed += 1;
+            Ok(())
+        })?;
+    }
 
-    if binlog.truncated_tail {
+    if let Some(active) = history
+        .iter()
+        .find(|file| file.declared_end_sequence.is_none())
+        && active.inspection.truncated_tail
+    {
         warn!(
-            "Truncating incomplete binlog tail at byte {}",
-            binlog.valid_len
+            "Truncating incomplete active binlog tail at byte {}",
+            active.inspection.valid_len
         );
-        let file = OpenOptions::new().write(true).open(&paths.binlog)?;
-        file.set_len(binlog.valid_len)?;
+        let file = OpenOptions::new().write(true).open(&active.path)?;
+        file.set_len(active.inspection.valid_len)?;
         file.sync_all()?;
     }
     store.replace_all(staging.raw_entries());
     info!("Binlog replayed: {} commands", replayed);
+    cleanup_snapshot_covered_segments(&history, snapshot_watermark, paths);
     cleanup_redundant_binlog_rotation_files(paths);
 
+    let history_sequence = history
+        .iter()
+        .map(|file| file.inspection.max_sequence)
+        .max()
+        .unwrap_or(0);
+
     Ok(RecoveryState {
-        last_sequence: snapshot_watermark.max(binlog.max_sequence),
+        last_sequence: snapshot_watermark.max(history_sequence),
         snapshot_watermark,
     })
+}
+
+fn inspect_binlog_history(
+    paths: &PersistencePaths,
+) -> Result<Vec<InspectedBinlogFile>, PersistenceError> {
+    let directory = paths
+        .binlog
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut segments = Vec::new();
+    if directory.exists() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(end_sequence) = super::parse_binlog_segment_end_sequence(&file_name)? else {
+                continue;
+            };
+            if segments.len() == MAX_BINLOG_SEGMENTS {
+                return Err(PersistenceError::new(format!(
+                    "Binlog segment count exceeds the {MAX_BINLOG_SEGMENTS} segment limit"
+                )));
+            }
+            let path = entry.path();
+            let inspection = inspect_binlog(&path)?;
+            segments.push(InspectedBinlogFile {
+                path,
+                declared_end_sequence: Some(end_sequence),
+                inspection,
+            });
+        }
+    }
+    segments.sort_by_key(|segment| {
+        segment
+            .declared_end_sequence
+            .expect("discovered segments have declared end sequences")
+    });
+
+    let active_inspection = inspect_binlog(&paths.binlog)?;
+    if let Some(index) = segments
+        .iter()
+        .position(|segment| segment.inspection.truncated_tail)
+    {
+        if index + 1 != segments.len() || active_inspection.min_sequence.is_some() {
+            return Err(PersistenceError::new(format!(
+                "Sealed binlog segment has an incomplete tail before later history: {}",
+                segments[index].path.display()
+            )));
+        }
+        if repair_last_incomplete_segment(paths, &mut segments[index])? {
+            segments.remove(index);
+        }
+    }
+    for segment in &segments {
+        let end_sequence = segment
+            .declared_end_sequence
+            .expect("discovered segments have declared end sequences");
+        if segment.inspection.min_sequence.is_none() {
+            return Err(PersistenceError::new(format!(
+                "Sealed binlog segment is empty: {}",
+                segment.path.display()
+            )));
+        }
+        if segment.inspection.max_sequence != end_sequence {
+            return Err(PersistenceError::new(format!(
+                "Binlog segment {} does not match its final record sequence {}",
+                segment.path.display(),
+                segment.inspection.max_sequence
+            )));
+        }
+    }
+    segments.push(InspectedBinlogFile {
+        path: paths.binlog.clone(),
+        declared_end_sequence: None,
+        inspection: active_inspection,
+    });
+
+    let mut previous_end: Option<u64> = None;
+    for file in &segments {
+        let Some(first_sequence) = file.inspection.min_sequence else {
+            continue;
+        };
+        if let Some(previous_end) = previous_end
+            && previous_end.checked_add(1) != Some(first_sequence)
+        {
+            return Err(PersistenceError::new(format!(
+                "Non-contiguous binlog history: sequence {} follows {}",
+                first_sequence, previous_end
+            )));
+        }
+        previous_end = Some(file.inspection.max_sequence);
+    }
+    Ok(segments)
+}
+
+fn repair_last_incomplete_segment(
+    paths: &PersistencePaths,
+    segment: &mut InspectedBinlogFile,
+) -> Result<bool, PersistenceError> {
+    warn!(
+        "Repairing incomplete final binlog segment tail at byte {}: {}",
+        segment.inspection.valid_len,
+        segment.path.display()
+    );
+    let file = OpenOptions::new().write(true).open(&segment.path)?;
+    file.set_len(segment.inspection.valid_len)?;
+    file.sync_all()?;
+    drop(file);
+
+    if segment.inspection.min_sequence.is_none() {
+        fs::remove_file(&segment.path)?;
+        sync_parent_directory(&paths.binlog)?;
+        return Ok(true);
+    }
+
+    let corrected_end_sequence = segment.inspection.max_sequence;
+    let corrected_path = paths.binlog_segment(corrected_end_sequence);
+    if corrected_path != segment.path {
+        if corrected_path.exists() {
+            return Err(PersistenceError::new(format!(
+                "Cannot repair binlog segment because corrected path already exists: {}",
+                corrected_path.display()
+            )));
+        }
+        durable_rename(&segment.path, &corrected_path)?;
+        sync_parent_directory(&corrected_path)?;
+        segment.path = corrected_path;
+        segment.declared_end_sequence = Some(corrected_end_sequence);
+    }
+    segment.inspection.truncated_tail = false;
+    Ok(false)
+}
+
+fn cleanup_snapshot_covered_segments(
+    history: &[InspectedBinlogFile],
+    snapshot_watermark: u64,
+    paths: &PersistencePaths,
+) {
+    let mut removed = false;
+    for file in history.iter().filter(|file| {
+        file.declared_end_sequence.is_some() && file.inspection.max_sequence <= snapshot_watermark
+    }) {
+        match fs::remove_file(&file.path) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                "Unable to remove snapshot-covered binlog segment {}: {}",
+                file.path.display(),
+                error
+            ),
+        }
+    }
+    if removed && let Err(error) = sync_parent_directory(&paths.binlog) {
+        warn!(
+            "Unable to synchronize snapshot-covered binlog segment cleanup: {}",
+            error
+        );
+    }
 }
 
 fn recover_interrupted_binlog_rotation(paths: &PersistencePaths) -> Result<(), PersistenceError> {
@@ -627,22 +821,33 @@ mod tests {
         )]
     }
 
-    fn write_following_binlog_record(paths: &PersistencePaths) -> Vec<u8> {
+    fn framed_put_record(sequence: u64, value: &'static [u8]) -> Vec<u8> {
         let batch = CommittedBatch::new(vec![CommittedEffect::Put {
             key: Bytes::from_static(b"key"),
             entry: PersistentEntry {
-                value: OnyxValue::Blob(Bytes::from_static(b"new")),
+                value: OnyxValue::Blob(Bytes::from_static(value)),
                 expires_at: None,
             },
         }])
         .unwrap();
         let effect = encode_committed_batch(&batch).unwrap();
-        let record = encode_versioned_binlog_record(2, &effect).unwrap();
+        let record = encode_versioned_binlog_record(sequence, &effect).unwrap();
         let mut framed = Vec::with_capacity(4 + record.len());
         framed.extend_from_slice(&(record.len() as u32).to_be_bytes());
         framed.extend_from_slice(&record);
+        framed
+    }
+
+    fn write_following_binlog_record(paths: &PersistencePaths) -> Vec<u8> {
+        let framed = framed_put_record(2, b"new");
         fs::write(&paths.binlog, &framed).unwrap();
         framed
+    }
+
+    fn segment_path(directory: &TestDirectory, end_sequence: u64) -> PathBuf {
+        directory
+            .0
+            .join(format!("onyx.binlog.segment.{end_sequence:020}"))
     }
 
     fn assert_recovers_new_value(paths: &PersistencePaths) {
@@ -757,5 +962,145 @@ mod tests {
             .to_string();
 
         assert!(error.contains("temporary file exists without an active or backup binlog"));
+    }
+
+    #[test]
+    fn recovery_replays_sealed_segments_before_the_active_binlog() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        write_snapshot_file(snapshot_entries(b"snapshot"), 1, &paths).unwrap();
+        fs::write(segment_path(&directory, 2), framed_put_record(2, b"sealed")).unwrap();
+        fs::write(&paths.binlog, framed_put_record(3, b"active")).unwrap();
+
+        let store = ShardedStore::new();
+        let recovery = load_data_from_paths(&store, &paths).unwrap();
+
+        assert_eq!(recovery.snapshot_watermark, 1);
+        assert_eq!(recovery.last_sequence, 3);
+        assert_eq!(store.get("key"), Ok(Some("active".to_string())));
+    }
+
+    #[test]
+    fn recovery_accepts_a_crash_after_sealing_before_active_creation() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        fs::write(segment_path(&directory, 1), framed_put_record(1, b"sealed")).unwrap();
+
+        let store = ShardedStore::new();
+        let recovery = load_data_from_paths(&store, &paths).unwrap();
+
+        assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(store.get("key"), Ok(Some("sealed".to_string())));
+    }
+
+    #[test]
+    fn recovery_rejects_a_gap_between_a_segment_and_the_active_binlog() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        fs::write(segment_path(&directory, 1), framed_put_record(1, b"sealed")).unwrap();
+        fs::write(&paths.binlog, framed_put_record(3, b"active")).unwrap();
+
+        let error = load_data_from_paths(&ShardedStore::new(), &paths)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Non-contiguous binlog history"));
+    }
+
+    #[test]
+    fn recovery_rejects_a_segment_whose_name_misstates_its_end_sequence() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        fs::write(segment_path(&directory, 7), framed_put_record(1, b"sealed")).unwrap();
+
+        let error = load_data_from_paths(&ShardedStore::new(), &paths)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not match its final record sequence"));
+    }
+
+    #[test]
+    fn recovery_removes_segments_fully_covered_by_the_snapshot() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        write_snapshot_file(snapshot_entries(b"snapshot"), 2, &paths).unwrap();
+        let segment = segment_path(&directory, 2);
+        let mut records = framed_put_record(1, b"old");
+        records.extend_from_slice(&framed_put_record(2, b"snapshot"));
+        fs::write(&segment, records).unwrap();
+        fs::write(&paths.binlog, framed_put_record(3, b"active")).unwrap();
+
+        let store = ShardedStore::new();
+        let recovery = load_data_from_paths(&store, &paths).unwrap();
+
+        assert_eq!(recovery.last_sequence, 3);
+        assert_eq!(store.get("key"), Ok(Some("active".to_string())));
+        assert!(!segment.exists());
+    }
+
+    #[test]
+    fn recovery_repairs_a_recognizable_tail_in_the_last_sealed_segment() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let mut records = framed_put_record(1, b"complete");
+        let second = framed_put_record(2, b"torn");
+        records.extend_from_slice(&second[..8]);
+        let declared_segment = segment_path(&directory, 2);
+        fs::write(&declared_segment, records).unwrap();
+
+        let store = ShardedStore::new();
+        let recovery = load_data_from_paths(&store, &paths).unwrap();
+
+        assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(store.get("key"), Ok(Some("complete".to_string())));
+        assert!(!declared_segment.exists());
+        assert!(segment_path(&directory, 1).exists());
+    }
+
+    #[test]
+    fn recovery_rejects_an_incomplete_segment_before_later_history() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let mut records = framed_put_record(1, b"complete");
+        let second = framed_put_record(2, b"torn");
+        records.extend_from_slice(&second[..8]);
+        fs::write(segment_path(&directory, 2), records).unwrap();
+        fs::write(&paths.binlog, framed_put_record(3, b"later")).unwrap();
+
+        let error = load_data_from_paths(&ShardedStore::new(), &paths)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("incomplete tail before later history"));
+    }
+
+    #[test]
+    fn recovery_rejects_a_malformed_segment_catalog_entry() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        fs::write(directory.0.join("onyx.binlog.segment.1"), b"invalid").unwrap();
+
+        let error = load_data_from_paths(&ShardedStore::new(), &paths)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Malformed binlog segment name"));
+    }
+
+    #[test]
+    fn recovery_rejects_checksum_corruption_inside_a_sealed_segment() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let mut record = framed_put_record(1, b"sealed");
+        let last = record.last_mut().unwrap();
+        *last ^= 0x01;
+        fs::write(segment_path(&directory, 1), record).unwrap();
+
+        let error = load_data_from_paths(&ShardedStore::new(), &paths)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("checksum"));
     }
 }

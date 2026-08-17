@@ -203,19 +203,23 @@ greater than `W`, in contiguous order. Therefore:
 
 Automatic compaction, clean shutdown, and replica full synchronization share a
 baseline-replacement mutex. This prevents two independently valid snapshot and
-binlog transitions from interleaving. Compaction itself has four phases:
+binlog transitions from interleaving. Compaction itself has five phases:
 
-1. Hold the complete write and visibility boundary, issue an ordered binlog
-   checkpoint, capture watermark `W`, and clone the committed store image.
-2. Release the boundary and write, synchronize, and install the snapshot while
-   normal commits continue appending to the original binlog.
-3. Issue another ordered checkpoint and prepare and synchronize the suffix from
-   the capture checkpoint through that later position, still without holding
-   the commit boundary.
-4. Reacquire the complete boundary, append only the records accepted after the
-   preparation checkpoint, and atomically promote the complete suffix.
+1. Without holding the commit boundary, preflush the current active generation
+   through a separate file handle while normal commits continue.
+2. Hold the complete write and visibility boundary, capture watermark `W`,
+   flush and durably rename a non-empty `onyx.binlog` to the immutable
+   `onyx.binlog.segment.<W>` generation, create a new empty active binlog, and
+   clone the committed store image.
+3. Release the boundary and write, synchronize, and install the snapshot while
+   normal commits append only to the new active generation.
+4. Reacquire the complete boundary, issue an ordered checkpoint on the active
+   generation, and update durable replica identity when applicable.
    Concurrently accepted write counts are retained for the next automatic
    compaction.
+5. Release the commit boundary and remove immutable segments whose declared end
+   sequence is covered by the installed snapshot. Cleanup failure is observable
+   but does not invalidate the snapshot or the still-recoverable segments.
 
 After a successful automatic attempt, ownership is atomically rearmed when the
 retained write count already exceeds the next threshold. This closes the race
@@ -224,45 +228,55 @@ slow compaction from leaving an over-threshold suffix indefinitely quiescent.
 Failures are not retried in a tight loop; the next accepted write may schedule
 the retry.
 
-The checkpoint flushes prior userspace writes but does not strengthen the
-configured `appendfsync` policy. Snapshot serialization is cancellation-safe:
+The concurrent preflush drains most dirty predecessor pages before generation
+sealing. Sealing still flushes and synchronizes the complete predecessor under
+the commit boundary before a new active file can accept commits. The final sync
+covers every write accepted during the preflush and prevents a later generation
+from becoming durable without its required prefix under `everysec` or `no`.
+This strengthens durability at compaction boundaries but does not change the
+normal per-append acknowledgement policy. Snapshot serialization is cancellation-safe:
 an owned supervisor completes or fail-stops finalization even if the initiating
 task disconnects or is cancelled. Both short boundary phases use the visibility
-gate as well as the write gate, so compaction cannot capture or install a
+gate as well as the write gate, so compaction cannot capture or finalize a
 tentative mutation after an indeterminate commit has established fail-stop.
 
-Suffix replacement first writes and synchronizes `onyx.binlog.tmp`, renames the
-full active history to `onyx.binlog.previous`, then durably promotes the suffix
-to `onyx.binlog`. Recovery follows these rules:
+Immutable segment filenames use a fixed-width final sequence. Recovery sorts
+them, inspects their ONX4 records, verifies each declared final sequence, and
+then validates one contiguous history across every segment and the active file.
+The file catalog is self-validating; no separately mutable manifest is trusted.
+Recovery follows these rules:
 
 | On-disk state | Recovery decision |
 | --- | --- |
-| Active binlog exists | Validate and use the active file; stale rotation files are removed only after successful recovery |
-| Active missing, previous exists | Restore the previous full history and validate it |
-| Only temporary suffix exists | Fail closed because no authoritative predecessor can prove its boundary |
+| Segments plus active | Validate segments in declared order, then validate and replay the active generation |
+| Segments with no active | Accept the crash point after sealing; startup creates a new active file after recovery |
+| Snapshot covers one or more segments | Validate and skip their records, then remove those redundant segments after successful recovery |
+| Incomplete last segment with no later valid history | Truncate its recognizable ONX4 tail and correct its declared final sequence |
+| Incomplete interior segment, range gap, duplicate range, checksum failure, or false filename boundary | Fail closed |
+| Legacy active missing with `onyx.binlog.previous` present | Restore and validate the previous full history for upgrade compatibility |
+| Only legacy `onyx.binlog.tmp` exists | Fail closed because no predecessor proves its boundary |
 
-Until the synchronized suffix becomes active, the full pre-compaction binlog is
-the recovery authority. Once it becomes active, the installed snapshot is the
-authority through `W` and the suffix contains every sequence after `W`. A
-failed snapshot installation never authorizes suffix replacement. An
-indeterminate replacement outcome enters fail-stop; restart recovery selects a
-single discoverable authority rather than attempting to merge files.
+If snapshot installation fails after sealing, the old committed history remains
+in immutable segments and later commits remain in the active file. Repeated
+failures may create multiple segments; a successful later snapshot covers and
+cleans all of them. Once snapshot `W` is installed, either presence or absence
+of any segment ending at or before `W` is safe. An indeterminate sealing outcome
+enters fail-stop, and restart recovery derives authority from the discoverable
+ordered files.
 
-The alternatives were holding the commit boundary for the entire snapshot,
-rotating to a permanent second log generation at capture time, and adopting a
-segmented log catalog. The first caused dataset-sized pauses. The latter two
-would eliminate the final suffix delta but add permanent generation metadata
-and recovery states. Snapshot-first prepared-suffix replacement was selected
-because it removes compression, snapshot I/O, and the bulk suffix copy from the
-commit path while retaining the existing single-binlog recovery model. The
-suffix-preparation, retained-byte, and write-pause metrics make the remaining
-delta cost explicit; a generation design should be reconsidered if that delta
-becomes dominant.
+The alternatives were a checksummed mutable manifest, a fixed active/previous
+pair, retaining snapshot-first suffix copying, and holding the commit boundary
+for the entire snapshot. A manifest creates another authority that must be
+coordinated with two file transitions. A fixed pair cannot represent repeated
+interrupted snapshots. Suffix copying preserved a workload-dependent final
+pause and duplicate physical I/O. Full-boundary snapshot creation caused
+dataset-sized pauses. The complete decision is recorded in
+`docs/adr/0001-generational-binlog.md`.
 
-Recovery may truncate only a recognizable incomplete final record after a valid
-history. Complete corruption and ambiguous framing fail startup. Recovery is
-staged and replaces live state only after the entire snapshot and binlog have
-validated.
+Recovery may truncate only a recognizable incomplete record at the end of the
+complete physical history. Complete corruption, ambiguous framing, and an
+incomplete interior segment fail startup. Recovery is staged and replaces live
+state only after the snapshot and complete segment history have validated.
 
 ### Durability policy
 

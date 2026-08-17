@@ -67,11 +67,13 @@ cargo run --release --locked --bin onyx-bench -- \
 
 Report commit latency percentiles together with compaction count, total and
 maximum duration, serialization wait, checkpoint, snapshot-capture,
-snapshot-write, rotation, total/maximum write pause, and retained suffix bytes.
+snapshot-write, generation preflush, generation sealing, segment cleanup,
+total/maximum write pause, sealed bytes, and retained active-generation bytes.
 Dataset cardinality materially changes snapshot capture and serialization cost;
-mutation rate during snapshot writing changes the suffix-copy cost. A useful
-long-running comparison therefore keeps both cardinality and offered write load
-constant and reports p99.9 rather than relying on throughput alone.
+mutation rate during snapshot writing changes the retained active-generation
+size. A useful long-running comparison therefore keeps both cardinality and
+offered write load constant and reports p99.9 rather than relying on throughput
+alone.
 
 ## Workloads
 

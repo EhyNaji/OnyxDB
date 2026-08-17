@@ -2093,14 +2093,26 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
             seconds(compaction.serialization_wait_nanoseconds_max),
         ),
         (
+            "onyxdb_compaction_generation_preflush_seconds_total",
+            "Cumulative active-generation preflush time outside the commit boundary",
+            "counter",
+            seconds(compaction.generation_preflush_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_generation_preflush_seconds_max",
+            "Longest observed active-generation preflush outside the commit boundary",
+            "gauge",
+            seconds(compaction.generation_preflush_nanoseconds_max),
+        ),
+        (
             "onyxdb_compaction_write_pause_seconds_total",
-            "Cumulative time authoritative commits were paused for compaction capture or rotation",
+            "Cumulative time authoritative commits were paused for generation sealing, snapshot capture, or final checkpointing",
             "counter",
             seconds(compaction.write_pause_nanoseconds_total),
         ),
         (
             "onyxdb_compaction_write_pause_seconds_max",
-            "Longest observed individual compaction capture or rotation pause",
+            "Longest observed individual compaction commit-path pause",
             "gauge",
             seconds(compaction.write_pause_nanoseconds_max),
         ),
@@ -2153,32 +2165,60 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
             seconds(compaction.snapshot_write_nanoseconds_max),
         ),
         (
-            "onyxdb_compaction_suffix_prepare_seconds_total",
-            "Cumulative post-watermark binlog suffix preparation time outside the commit boundary",
+            "onyxdb_compaction_segment_cleanup_seconds_total",
+            "Cumulative snapshot-covered binlog segment cleanup time outside the commit boundary",
             "counter",
-            seconds(compaction.suffix_prepare_nanoseconds_total),
+            seconds(compaction.segment_cleanup_nanoseconds_total),
         ),
         (
-            "onyxdb_compaction_suffix_prepare_seconds_max",
-            "Longest observed post-watermark binlog suffix preparation",
+            "onyxdb_compaction_segment_cleanup_seconds_max",
+            "Longest observed snapshot-covered binlog segment cleanup",
             "gauge",
-            seconds(compaction.suffix_prepare_nanoseconds_max),
+            seconds(compaction.segment_cleanup_nanoseconds_max),
         ),
         (
             "onyxdb_compaction_rotation_seconds_total",
-            "Cumulative replica-state update and binlog rotation time",
+            "Cumulative active binlog generation sealing time",
             "counter",
             seconds(compaction.rotation_nanoseconds_total),
         ),
         (
             "onyxdb_compaction_rotation_seconds_max",
-            "Longest observed replica-state update and binlog rotation",
+            "Longest observed active binlog generation sealing",
             "gauge",
             seconds(compaction.rotation_nanoseconds_max),
         ),
     ] {
         push_metric(&mut output, name, help, metric_type, value);
     }
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_preflushed_binlog_bytes_total",
+        "Active binlog bytes covered by preflush attempts before generation sealing",
+        "counter",
+        compaction.preflushed_bytes_total,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_preflushed_binlog_bytes_max",
+        "Largest active binlog generation covered by one compaction preflush",
+        "gauge",
+        compaction.preflushed_bytes_max,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_sealed_binlog_bytes_total",
+        "Active binlog bytes moved into immutable segments across compactions",
+        "counter",
+        compaction.sealed_bytes_total,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_sealed_binlog_bytes_max",
+        "Largest active binlog generation sealed by one compaction",
+        "gauge",
+        compaction.sealed_bytes_max,
+    );
     push_metric(
         &mut output,
         "onyxdb_compaction_retained_binlog_bytes_total",
@@ -2192,6 +2232,27 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
         "Largest post-watermark binlog suffix retained by one compaction",
         "gauge",
         compaction.retained_bytes_max,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_cleaned_segments_total",
+        "Snapshot-covered binlog segment files removed after compaction",
+        "counter",
+        compaction.cleanup_files_total,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_cleaned_segment_bytes_total",
+        "Snapshot-covered binlog segment bytes removed after compaction",
+        "counter",
+        compaction.cleanup_bytes_total,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_segment_cleanup_failures_total",
+        "Binlog segment files or directory synchronizations that could not be cleaned",
+        "counter",
+        compaction.cleanup_failures_total,
     );
 
     output
@@ -4607,7 +4668,7 @@ mod tests {
                 LogMessage::Checkpoint { completion } => {
                     let _ = completion.send(Ok(0));
                 }
-                LogMessage::CompactSuffix { completion, .. } => {
+                LogMessage::SealActive { completion, .. } => {
                     let _ = completion.send(Ok(0));
                 }
             }
@@ -4628,6 +4689,10 @@ mod tests {
         assert!(body.contains("onyxdb_commit_queue_depth 0\n"));
         assert!(body.contains("onyxdb_binlog_append_attempts_total 0\n"));
         assert!(body.contains("onyxdb_compaction_completed_total 0\n"));
+        assert!(body.contains("onyxdb_compaction_preflushed_binlog_bytes_total 0\n"));
+        assert!(body.contains("onyxdb_compaction_sealed_binlog_bytes_total 0\n"));
+        assert!(body.contains("onyxdb_compaction_cleaned_segments_total 0\n"));
+        assert!(!body.contains("onyxdb_compaction_suffix_prepare_seconds"));
 
         let help_count = body
             .lines()
@@ -4757,7 +4822,7 @@ mod tests {
                     LogMessage::Checkpoint { completion } => {
                         let _ = completion.send(Ok(0));
                     }
-                    LogMessage::CompactSuffix { completion, .. } => {
+                    LogMessage::SealActive { completion, .. } => {
                         let _ = completion.send(Ok(0));
                     }
                 }
@@ -5423,7 +5488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_snapshot_creation_does_not_request_suffix_replacement() {
+    async fn failed_snapshot_creation_preserves_previous_snapshot_and_recovery_history() {
         let directory = TestPersistenceDirectory::new();
         let previous_store = ShardedStore::new();
         previous_store.set("safe".to_string(), "old".to_string());
@@ -5434,8 +5499,8 @@ mod tests {
         let mut failing_paths = directory.paths.clone();
         failing_paths.snapshot_temp = directory.root.join("missing").join("snapshot.tmp");
         let (log_tx, mut receiver) = mpsc::channel(8);
-        let suffix_replacement_requested = Arc::new(AtomicBool::new(false));
-        let suffix_replacement_observer = Arc::clone(&suffix_replacement_requested);
+        let generation_seal_requested = Arc::new(AtomicBool::new(false));
+        let generation_seal_observer = Arc::clone(&generation_seal_requested);
         let worker = tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 match message {
@@ -5443,14 +5508,13 @@ mod tests {
                         let _ = completion.send(Ok(()));
                     }
                     LogMessage::Truncate { completion } => {
-                        suffix_replacement_observer.store(true, Ordering::SeqCst);
                         let _ = completion.send(Ok(()));
                     }
                     LogMessage::Checkpoint { completion } => {
                         let _ = completion.send(Ok(0));
                     }
-                    LogMessage::CompactSuffix { completion, .. } => {
-                        suffix_replacement_observer.store(true, Ordering::SeqCst);
+                    LogMessage::SealActive { completion, .. } => {
+                        generation_seal_observer.store(true, Ordering::SeqCst);
                         let _ = completion.send(Ok(0));
                     }
                     LogMessage::Append { completion, .. } => {
@@ -5467,7 +5531,7 @@ mod tests {
         store.set("safe".to_string(), "new".to_string());
 
         assert!(compact_store(&store, &persistence).await.is_err());
-        assert!(!suffix_replacement_requested.load(Ordering::SeqCst));
+        assert!(generation_seal_requested.load(Ordering::SeqCst));
         assert_eq!(
             fs::read(&directory.paths.snapshot).unwrap(),
             previous_snapshot
@@ -5482,7 +5546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_is_installed_before_a_failed_binlog_rotation() {
+    async fn definitive_generation_seal_failure_preserves_the_original_history() {
         let directory = TestPersistenceDirectory::new();
         append_test_binlog_record(&directory.paths, 1, &["SET", "safe", "old"]);
         let (log_tx, mut receiver) = mpsc::channel(8);
@@ -5499,7 +5563,7 @@ mod tests {
                     LogMessage::Checkpoint { completion } => {
                         let _ = completion.send(Ok(0));
                     }
-                    LogMessage::CompactSuffix { completion, .. } => {
+                    LogMessage::SealActive { completion, .. } => {
                         let _ = completion
                             .send(Err(StorageFailure::rejected("injected rotation failure")));
                     }
@@ -5512,24 +5576,24 @@ mod tests {
                 }
             }
         });
-        let persistence = test_persistence(directory.paths.clone(), log_tx, 7);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 1);
         let store = Arc::new(ShardedStore::new());
         store.set("safe".to_string(), "new".to_string());
 
         assert!(compact_store(&store, &persistence).await.is_err());
-        assert!(directory.paths.snapshot.exists());
+        assert!(!directory.paths.snapshot.exists());
         assert!(fs::metadata(&directory.paths.binlog).unwrap().len() > 0);
         drop(persistence);
         worker.await.unwrap();
 
         let recovered = ShardedStore::new();
         let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
-        assert_eq!(state.snapshot_watermark, 7);
-        assert_eq!(recovered.get("safe"), Ok(Some("new".to_string())));
+        assert_eq!(state.snapshot_watermark, 0);
+        assert_eq!(recovered.get("safe"), Ok(Some("old".to_string())));
     }
 
     #[tokio::test]
-    async fn indeterminate_binlog_rotation_enters_fail_stop_after_snapshot_installation() {
+    async fn indeterminate_generation_seal_enters_fail_stop_before_snapshot_installation() {
         let directory = TestPersistenceDirectory::new();
         append_test_binlog_record(&directory.paths, 1, &["SET", "safe", "old"]);
         let (log_tx, mut receiver) = mpsc::channel(8);
@@ -5544,7 +5608,7 @@ mod tests {
                     LogMessage::Checkpoint { completion } => {
                         let _ = completion.send(Ok(0));
                     }
-                    LogMessage::CompactSuffix { completion, .. } => {
+                    LogMessage::SealActive { completion, .. } => {
                         let _ = completion.send(Err(StorageFailure::indeterminate(
                             "injected ambiguous rotation failure",
                         )));
@@ -5557,7 +5621,7 @@ mod tests {
                 }
             }
         });
-        let persistence = test_persistence(directory.paths.clone(), log_tx, 7);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 1);
         let store = Arc::new(ShardedStore::new());
         store.set("safe".to_string(), "new".to_string());
 
@@ -5565,7 +5629,7 @@ mod tests {
 
         assert!(error.is_indeterminate());
         assert!(persistence.is_fail_stopped());
-        assert!(directory.paths.snapshot.exists());
+        assert!(!directory.paths.snapshot.exists());
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(50),
@@ -5579,8 +5643,8 @@ mod tests {
 
         let recovered = ShardedStore::new();
         let state = load_data_from_paths(&recovered, &directory.paths).unwrap();
-        assert_eq!(state.snapshot_watermark, 7);
-        assert_eq!(recovered.get("safe"), Ok(Some("new".to_string())));
+        assert_eq!(state.snapshot_watermark, 0);
+        assert_eq!(recovered.get("safe"), Ok(Some("old".to_string())));
     }
 
     #[tokio::test]
@@ -5896,6 +5960,28 @@ mod tests {
             OnyxValue::Blob(Bytes::from_static(b"must disappear")),
             None,
         );
+        let stale_history = CommittedBatch::new(vec![CommittedEffect::Put {
+            key: Bytes::from_static(b"stale-history"),
+            entry: PersistentEntry {
+                value: OnyxValue::Blob(Bytes::from_static(b"must not replay")),
+                expires_at: None,
+            },
+        }])
+        .unwrap();
+        persistence
+            .binlog
+            .append_batch(1, &stale_history)
+            .await
+            .unwrap();
+        persistence.binlog.seal_active(1).await.unwrap();
+        assert!(directory.paths.binlog_segment(1).exists());
+        persistence
+            .binlog
+            .append_batch(2, &stale_history)
+            .await
+            .unwrap();
+        persistence.binlog.seal_active(2).await.unwrap();
+        assert!(directory.paths.binlog_segment(2).exists());
 
         let staging = ShardedStore::new();
         staging.set_value(
@@ -5926,6 +6012,8 @@ mod tests {
         );
         drop(baseline_guard);
         install.await.unwrap().unwrap();
+        assert!(!directory.paths.binlog_segment(1).exists());
+        assert!(!directory.paths.binlog_segment(2).exists());
         assert!(store.get_entry(&Bytes::from_static(b"stale")).is_none());
         let binary = store
             .get_entry(&Bytes::from_static(b"binary\0\xff"))
@@ -6519,7 +6607,7 @@ mod tests {
                     LogMessage::Checkpoint { completion } => {
                         let _ = completion.send(Ok(0));
                     }
-                    LogMessage::CompactSuffix { completion, .. } => {
+                    LogMessage::SealActive { completion, .. } => {
                         let _ = completion.send(Ok(0));
                     }
                 }
@@ -7625,7 +7713,7 @@ mod tests {
                     LogMessage::Checkpoint { completion } => {
                         let _ = completion.send(Ok(0));
                     }
-                    LogMessage::CompactSuffix { completion, .. } => {
+                    LogMessage::SealActive { completion, .. } => {
                         let _ = completion.send(Ok(0));
                     }
                 }
@@ -7704,7 +7792,7 @@ mod tests {
                     LogMessage::Checkpoint { completion } => {
                         let _ = completion.send(Ok(0));
                     }
-                    LogMessage::CompactSuffix { completion, .. } => {
+                    LogMessage::SealActive { completion, .. } => {
                         let _ = completion.send(Ok(0));
                     }
                 }
@@ -7772,7 +7860,7 @@ mod tests {
                     LogMessage::Checkpoint { completion } => {
                         let _ = completion.send(Ok(0));
                     }
-                    LogMessage::CompactSuffix { completion, .. } => {
+                    LogMessage::SealActive { completion, .. } => {
                         let _ = completion.send(Ok(0));
                     }
                 }
@@ -8031,7 +8119,7 @@ mod tests {
                     LogMessage::Checkpoint { completion } => {
                         let _ = completion.send(Ok(0));
                     }
-                    LogMessage::CompactSuffix { completion, .. } => {
+                    LogMessage::SealActive { completion, .. } => {
                         let _ = completion.send(Ok(0));
                     }
                 }
@@ -9222,7 +9310,7 @@ mod tests {
                     LogMessage::Checkpoint { completion } => {
                         let _ = completion.send(Ok(0));
                     }
-                    LogMessage::CompactSuffix { completion, .. } => {
+                    LogMessage::SealActive { completion, .. } => {
                         let _ = completion.send(Ok(0));
                     }
                 }
@@ -9329,7 +9417,7 @@ mod tests {
                     LogMessage::Checkpoint { completion } => {
                         let _ = completion.send(Ok(0));
                     }
-                    LogMessage::CompactSuffix { completion, .. } => {
+                    LogMessage::SealActive { completion, .. } => {
                         let _ = completion.send(Ok(0));
                     }
                 }

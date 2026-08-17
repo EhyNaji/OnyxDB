@@ -797,7 +797,7 @@ fn report_human(config: &BenchmarkConfig, authenticated: bool, results: &[RunRes
         );
         if let Some(metrics) = &result.server_metrics {
             println!(
-                "  Server metrics: groups {:.0} | logical batches {:.0} | binlog appends {:.0} | records/append {:.2} | compactions {:.0} | compaction {:.3} s | compaction max {:.3} s | suffix prepare {:.3} s | write pause {:.3} s | write pause max {:.3} s | retained binlog {:.0} bytes | queue wait {:.3} s | queue max {:.0} | metrics settle {:.3} s",
+                "  Server metrics: groups {:.0} | logical batches {:.0} | binlog appends {:.0} | records/append {:.2} | compactions {:.0} | compaction {:.3} s | compaction max {:.3} s | generation preflush {:.3} s | generation seal {:.3} s | segment cleanup {:.3} s | write pause {:.3} s | write pause max {:.3} s | sealed binlog {:.0} bytes | retained binlog {:.0} bytes | queue wait {:.3} s | queue max {:.0} | metrics settle {:.3} s",
                 metrics.delta("onyxdb_commit_groups_total"),
                 metrics.delta("onyxdb_commit_logical_batches_total"),
                 metrics.delta("onyxdb_binlog_append_accepted_total"),
@@ -812,9 +812,12 @@ fn report_human(config: &BenchmarkConfig, authenticated: bool, results: &[RunRes
                 metrics.delta("onyxdb_compaction_completed_total"),
                 metrics.delta("onyxdb_compaction_duration_seconds_total"),
                 metrics.after("onyxdb_compaction_duration_seconds_max"),
-                metrics.delta("onyxdb_compaction_suffix_prepare_seconds_total"),
+                metrics.delta("onyxdb_compaction_generation_preflush_seconds_total"),
+                metrics.delta("onyxdb_compaction_rotation_seconds_total"),
+                metrics.delta("onyxdb_compaction_segment_cleanup_seconds_total"),
                 metrics.delta("onyxdb_compaction_write_pause_seconds_total"),
                 metrics.after("onyxdb_compaction_write_pause_seconds_max"),
+                metrics.delta("onyxdb_compaction_sealed_binlog_bytes_total"),
                 metrics.delta("onyxdb_compaction_retained_binlog_bytes_total"),
                 metrics.delta("onyxdb_commit_queue_wait_seconds_total"),
                 metrics.after("onyxdb_commit_queue_depth_max"),

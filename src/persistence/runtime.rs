@@ -6,12 +6,13 @@ use super::{
 use crate::config::FsyncPolicy;
 use onyxdb::store::ShardedStore;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StorageFailureDisposition {
@@ -165,6 +166,8 @@ pub(crate) struct CompactionMetricsSnapshot {
     pub(crate) gate_wait_nanoseconds_max: u64,
     pub(crate) serialization_wait_nanoseconds_total: u64,
     pub(crate) serialization_wait_nanoseconds_max: u64,
+    pub(crate) generation_preflush_nanoseconds_total: u64,
+    pub(crate) generation_preflush_nanoseconds_max: u64,
     pub(crate) write_pause_nanoseconds_total: u64,
     pub(crate) write_pause_nanoseconds_max: u64,
     pub(crate) checkpoint_nanoseconds_total: u64,
@@ -173,12 +176,19 @@ pub(crate) struct CompactionMetricsSnapshot {
     pub(crate) snapshot_capture_nanoseconds_max: u64,
     pub(crate) snapshot_write_nanoseconds_total: u64,
     pub(crate) snapshot_write_nanoseconds_max: u64,
-    pub(crate) suffix_prepare_nanoseconds_total: u64,
-    pub(crate) suffix_prepare_nanoseconds_max: u64,
     pub(crate) rotation_nanoseconds_total: u64,
     pub(crate) rotation_nanoseconds_max: u64,
+    pub(crate) segment_cleanup_nanoseconds_total: u64,
+    pub(crate) segment_cleanup_nanoseconds_max: u64,
+    pub(crate) sealed_bytes_total: u64,
+    pub(crate) sealed_bytes_max: u64,
+    pub(crate) preflushed_bytes_total: u64,
+    pub(crate) preflushed_bytes_max: u64,
     pub(crate) retained_bytes_total: u64,
     pub(crate) retained_bytes_max: u64,
+    pub(crate) cleanup_files_total: u64,
+    pub(crate) cleanup_bytes_total: u64,
+    pub(crate) cleanup_failures_total: u64,
 }
 
 #[derive(Default)]
@@ -206,14 +216,22 @@ struct CompactionMetrics {
     duration: DurationMetric,
     gate_wait: DurationMetric,
     serialization_wait: DurationMetric,
+    generation_preflush: DurationMetric,
     write_pause: DurationMetric,
     checkpoint: DurationMetric,
     snapshot_capture: DurationMetric,
     snapshot_write: DurationMetric,
-    suffix_prepare: DurationMetric,
     rotation: DurationMetric,
+    segment_cleanup: DurationMetric,
+    sealed_bytes_total: AtomicU64,
+    sealed_bytes_max: AtomicU64,
+    preflushed_bytes_total: AtomicU64,
+    preflushed_bytes_max: AtomicU64,
     retained_bytes_total: AtomicU64,
     retained_bytes_max: AtomicU64,
+    cleanup_files_total: AtomicU64,
+    cleanup_bytes_total: AtomicU64,
+    cleanup_failures_total: AtomicU64,
 }
 
 impl CompactionMetrics {
@@ -233,6 +251,14 @@ impl CompactionMetrics {
                 .total
                 .load(Ordering::Relaxed),
             serialization_wait_nanoseconds_max: self.serialization_wait.max.load(Ordering::Relaxed),
+            generation_preflush_nanoseconds_total: self
+                .generation_preflush
+                .total
+                .load(Ordering::Relaxed),
+            generation_preflush_nanoseconds_max: self
+                .generation_preflush
+                .max
+                .load(Ordering::Relaxed),
             write_pause_nanoseconds_total: self.write_pause.total.load(Ordering::Relaxed),
             write_pause_nanoseconds_max: self.write_pause.max.load(Ordering::Relaxed),
             checkpoint_nanoseconds_total: self.checkpoint.total.load(Ordering::Relaxed),
@@ -241,19 +267,49 @@ impl CompactionMetrics {
             snapshot_capture_nanoseconds_max: self.snapshot_capture.max.load(Ordering::Relaxed),
             snapshot_write_nanoseconds_total: self.snapshot_write.total.load(Ordering::Relaxed),
             snapshot_write_nanoseconds_max: self.snapshot_write.max.load(Ordering::Relaxed),
-            suffix_prepare_nanoseconds_total: self.suffix_prepare.total.load(Ordering::Relaxed),
-            suffix_prepare_nanoseconds_max: self.suffix_prepare.max.load(Ordering::Relaxed),
             rotation_nanoseconds_total: self.rotation.total.load(Ordering::Relaxed),
             rotation_nanoseconds_max: self.rotation.max.load(Ordering::Relaxed),
+            segment_cleanup_nanoseconds_total: self.segment_cleanup.total.load(Ordering::Relaxed),
+            segment_cleanup_nanoseconds_max: self.segment_cleanup.max.load(Ordering::Relaxed),
+            sealed_bytes_total: self.sealed_bytes_total.load(Ordering::Relaxed),
+            sealed_bytes_max: self.sealed_bytes_max.load(Ordering::Relaxed),
+            preflushed_bytes_total: self.preflushed_bytes_total.load(Ordering::Relaxed),
+            preflushed_bytes_max: self.preflushed_bytes_max.load(Ordering::Relaxed),
             retained_bytes_total: self.retained_bytes_total.load(Ordering::Relaxed),
             retained_bytes_max: self.retained_bytes_max.load(Ordering::Relaxed),
+            cleanup_files_total: self.cleanup_files_total.load(Ordering::Relaxed),
+            cleanup_bytes_total: self.cleanup_bytes_total.load(Ordering::Relaxed),
+            cleanup_failures_total: self.cleanup_failures_total.load(Ordering::Relaxed),
         }
+    }
+
+    fn observe_sealed_bytes(&self, sealed_bytes: u64) {
+        self.sealed_bytes_total
+            .fetch_add(sealed_bytes, Ordering::Relaxed);
+        observe_max(&self.sealed_bytes_max, sealed_bytes);
+    }
+
+    fn observe_preflush(&self, preflushed_bytes: u64, elapsed: Duration) {
+        self.generation_preflush.observe(elapsed);
+        self.preflushed_bytes_total
+            .fetch_add(preflushed_bytes, Ordering::Relaxed);
+        observe_max(&self.preflushed_bytes_max, preflushed_bytes);
     }
 
     fn observe_retained_bytes(&self, retained_bytes: u64) {
         self.retained_bytes_total
             .fetch_add(retained_bytes, Ordering::Relaxed);
         observe_max(&self.retained_bytes_max, retained_bytes);
+    }
+
+    fn observe_cleanup(&self, cleanup: BinlogSegmentCleanup, elapsed: Duration) {
+        self.segment_cleanup.observe(elapsed);
+        self.cleanup_files_total
+            .fetch_add(cleanup.removed_files, Ordering::Relaxed);
+        self.cleanup_bytes_total
+            .fetch_add(cleanup.removed_bytes, Ordering::Relaxed);
+        self.cleanup_failures_total
+            .fetch_add(cleanup.failed_files, Ordering::Relaxed);
     }
 }
 
@@ -309,10 +365,6 @@ type SnapshotWriteOperation = Box<
         + 'static,
 >;
 
-type SuffixPrepareOperation = Box<
-    dyn FnOnce(super::PersistencePaths, u64, u64) -> Result<(), PersistenceError> + Send + 'static,
->;
-
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum TruncateError {
@@ -322,7 +374,7 @@ pub(crate) enum TruncateError {
 
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) enum BinlogCompactionError {
+pub(crate) enum BinlogRotationError {
     Unchanged(std::io::Error),
     Indeterminate(std::io::Error),
 }
@@ -331,14 +383,10 @@ pub(crate) trait BinlogIo: Write + Seek + Send + 'static {
     fn sync_data(&mut self) -> std::io::Result<()>;
     fn sync_all(&mut self) -> std::io::Result<()>;
     fn truncate(&mut self, length: u64) -> Result<(), TruncateError>;
-    fn compact_suffix(
-        &mut self,
-        _retained_from: u64,
-        _prepared_through: u64,
-    ) -> Result<u64, BinlogCompactionError> {
-        Err(BinlogCompactionError::Unchanged(std::io::Error::new(
+    fn seal_active(&mut self, _end_sequence: u64) -> Result<u64, BinlogRotationError> {
+        Err(BinlogRotationError::Unchanged(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "Binlog suffix compaction is unsupported by this storage backend",
+            "Binlog generation sealing is unsupported by this storage backend",
         )))
     }
 }
@@ -357,12 +405,13 @@ impl BinlogIo for File {
     }
 }
 
-/// Owns the active binlog handle and its crash-recoverable replacement paths.
+/// Owns the active binlog handle and its immutable sealed generations.
 ///
-/// Suffix replacement is only requested while the authoritative commit
-/// boundary is held. The old active file is renamed to the backup before the
-/// synchronized temporary suffix becomes active, so every crash point leaves
-/// either the original history or the replacement discoverable by recovery.
+/// Generation sealing is only requested while the authoritative commit
+/// boundary is held. A non-empty active file is durably renamed to a path that
+/// declares its final committed sequence before a new active file is created.
+/// Recovery can therefore order and validate every crash state without a
+/// separate mutable manifest.
 pub(crate) struct ManagedBinlogFile {
     file: Option<File>,
     paths: super::PersistencePaths,
@@ -394,80 +443,132 @@ impl ManagedBinlogFile {
         Ok(())
     }
 
-    fn restore_backup_after_failed_rotation(
+    fn restore_segment_after_failed_seal(
         &mut self,
+        segment: &Path,
         original_error: std::io::Error,
-    ) -> Result<u64, BinlogCompactionError> {
+    ) -> Result<u64, BinlogRotationError> {
+        if self.paths.binlog.exists() {
+            return Err(BinlogRotationError::Indeterminate(std::io::Error::other(
+                format!(
+                    "Binlog generation sealing failed ({original_error}) after a new active path became visible"
+                ),
+            )));
+        }
         let restoration = (|| -> std::io::Result<()> {
-            durable_rename(&self.paths.binlog_backup, &self.paths.binlog)?;
+            durable_rename(segment, &self.paths.binlog)?;
             sync_parent_directory(&self.paths.binlog)?;
             self.reopen_active()
         })();
         match restoration {
-            Ok(()) => Err(BinlogCompactionError::Unchanged(original_error)),
-            Err(restoration_error) => Err(BinlogCompactionError::Indeterminate(
+            Ok(()) => Err(BinlogRotationError::Unchanged(original_error)),
+            Err(restoration_error) => Err(BinlogRotationError::Indeterminate(
                 std::io::Error::other(format!(
-                    "Binlog rotation failed ({original_error}) and the original active file could not be restored ({restoration_error})"
+                    "Binlog generation sealing failed ({original_error}) and the original active file could not be restored ({restoration_error})"
                 )),
             )),
         }
     }
-
-    fn remove_rotation_backup(&self) {
-        match fs::remove_file(&self.paths.binlog_backup) {
-            Ok(()) => {
-                if let Err(error) = sync_parent_directory(&self.paths.binlog) {
-                    tracing::warn!(
-                        "Unable to synchronize redundant binlog backup cleanup: {}",
-                        error
-                    );
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::warn!(
-                "Unable to remove redundant binlog backup {}: {}",
-                self.paths.binlog_backup.display(),
-                error
-            ),
-        }
-    }
 }
 
-fn prepare_binlog_suffix(
-    paths: &super::PersistencePaths,
-    retained_from: u64,
-    prepared_through: u64,
-) -> Result<(), PersistenceError> {
-    let retained_length = prepared_through.checked_sub(retained_from).ok_or_else(|| {
-        PersistenceError::new(format!(
-            "Binlog suffix preparation boundary {prepared_through} precedes checkpoint {retained_from}"
-        ))
-    })?;
-    let mut active = OpenOptions::new().read(true).open(&paths.binlog)?;
-    let active_length = active.metadata()?.len();
-    if active_length < prepared_through {
-        return Err(PersistenceError::new(format!(
-            "Binlog suffix preparation boundary {prepared_through} exceeds active length {active_length}"
-        )));
+fn list_binlog_segments(paths: &super::PersistencePaths) -> std::io::Result<Vec<(u64, PathBuf)>> {
+    let directory = paths
+        .binlog
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut segments = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let end_sequence =
+            super::parse_binlog_segment_end_sequence(&entry.file_name()).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?;
+        if let Some(end_sequence) = end_sequence {
+            segments.push((end_sequence, entry.path()));
+        }
     }
-    let mut temporary = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+    segments.sort_by_key(|(end_sequence, _)| *end_sequence);
+    Ok(segments)
+}
+
+fn remove_all_binlog_segments(paths: &super::PersistencePaths) -> std::io::Result<()> {
+    let mut removed = false;
+    for (_, path) in list_binlog_segments(paths)? {
+        match fs::remove_file(path) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if removed {
+        sync_parent_directory(&paths.binlog)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BinlogSegmentCleanup {
+    removed_files: u64,
+    removed_bytes: u64,
+    failed_files: u64,
+}
+
+fn cleanup_binlog_segments_through(
+    paths: &super::PersistencePaths,
+    watermark: u64,
+) -> BinlogSegmentCleanup {
+    let mut cleanup = BinlogSegmentCleanup::default();
+    let segments = match list_binlog_segments(paths) {
+        Ok(segments) => segments,
+        Err(error) => {
+            warn!("Unable to enumerate snapshot-covered binlog segments: {error}");
+            cleanup.failed_files = 1;
+            return cleanup;
+        }
+    };
+    for (end_sequence, path) in segments {
+        if end_sequence > watermark {
+            continue;
+        }
+        let length = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                cleanup.removed_files += 1;
+                cleanup.removed_bytes = cleanup.removed_bytes.saturating_add(length);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                cleanup.failed_files += 1;
+                warn!(
+                    "Unable to remove snapshot-covered binlog segment {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
+    }
+    if cleanup.removed_files > 0
+        && let Err(error) = sync_parent_directory(&paths.binlog)
+    {
+        cleanup.failed_files += 1;
+        warn!("Unable to synchronize binlog segment cleanup: {error}");
+    }
+    cleanup
+}
+
+fn preflush_active_generation(paths: &super::PersistencePaths) -> Result<u64, PersistenceError> {
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&paths.binlog_temp)?;
-    active.seek(SeekFrom::Start(retained_from))?;
-    let copied = std::io::copy(&mut active.take(retained_length), &mut temporary)?;
-    if copied != retained_length {
-        return Err(PersistenceError::new(format!(
-            "Binlog suffix preparation copied {copied} bytes instead of {retained_length}"
-        )));
+        .open(&paths.binlog)?;
+    let length = file.metadata()?.len();
+    if length > 0 {
+        file.sync_data()?;
     }
-    temporary.flush()?;
-    temporary.sync_all()?;
-    drop(temporary);
-    sync_parent_directory(&paths.binlog_temp)?;
-    Ok(())
+    Ok(length)
 }
 
 impl Write for ManagedBinlogFile {
@@ -496,111 +597,92 @@ impl BinlogIo for ManagedBinlogFile {
     }
 
     fn truncate(&mut self, length: u64) -> Result<(), TruncateError> {
-        self.file_mut()
+        let file = self
+            .file_mut()
             .map_err(TruncateError::Indeterminate)?
             .set_len(length)
-            .map_err(TruncateError::Indeterminate)
+            .map_err(TruncateError::Indeterminate);
+        file?;
+        self.file_mut()
+            .map_err(TruncateError::Indeterminate)?
+            .seek(SeekFrom::Start(length))
+            .map_err(TruncateError::Indeterminate)?;
+        if length == 0 {
+            remove_all_binlog_segments(&self.paths).map_err(TruncateError::Indeterminate)?;
+        }
+        Ok(())
     }
 
-    fn compact_suffix(
-        &mut self,
-        retained_from: u64,
-        prepared_through: u64,
-    ) -> Result<u64, BinlogCompactionError> {
+    fn seal_active(&mut self, end_sequence: u64) -> Result<u64, BinlogRotationError> {
         let active_length = self
             .file_mut()
-            .map_err(BinlogCompactionError::Indeterminate)?
+            .map_err(BinlogRotationError::Indeterminate)?
             .metadata()
-            .map_err(BinlogCompactionError::Unchanged)?
+            .map_err(BinlogRotationError::Unchanged)?
             .len();
-        let retained_bytes = active_length.checked_sub(retained_from).ok_or_else(|| {
-            BinlogCompactionError::Unchanged(std::io::Error::new(
+        if active_length == 0 {
+            return Ok(0);
+        }
+        if end_sequence == 0 {
+            return Err(BinlogRotationError::Unchanged(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Binlog checkpoint {retained_from} exceeds active length {active_length}"),
-            ))
-        })?;
-        let prepared_bytes = prepared_through.checked_sub(retained_from).ok_or_else(|| {
-            BinlogCompactionError::Unchanged(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "Binlog prepared boundary {prepared_through} precedes checkpoint {retained_from}"
-                ),
-            ))
-        })?;
-        if prepared_through > active_length {
-            return Err(BinlogCompactionError::Unchanged(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "Binlog prepared boundary {prepared_through} exceeds active length {active_length}"
-                ),
+                "A non-empty binlog cannot be sealed at sequence zero",
             )));
         }
-
-        let temporary_result = (|| -> std::io::Result<()> {
-            let mut temporary = OpenOptions::new()
-                .create(false)
-                .append(true)
-                .read(true)
-                .open(&self.paths.binlog_temp)?;
-            let temporary_length = temporary.metadata()?.len();
-            if temporary_length != prepared_bytes {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Prepared binlog suffix contains {temporary_length} bytes instead of {prepared_bytes}"
-                    ),
-                ));
-            }
-            let active = self.file_mut()?;
-            active.seek(SeekFrom::Start(prepared_through))?;
-            let remaining_bytes = active_length - prepared_through;
-            let copied = std::io::copy(&mut active.take(remaining_bytes), &mut temporary)?;
-            if copied != remaining_bytes {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "Binlog suffix finalization copied {copied} bytes instead of {remaining_bytes}"
-                    ),
-                ));
-            }
-            temporary.flush()?;
-            temporary.sync_all()?;
-            drop(temporary);
-            sync_parent_directory(&self.paths.binlog_temp)?;
-            Ok(())
-        })();
-        if let Err(error) = temporary_result {
-            if let Ok(active) = self.file_mut() {
-                let _ = active.seek(SeekFrom::End(0));
-            }
-            return Err(BinlogCompactionError::Unchanged(error));
+        let segment = self.paths.binlog_segment(end_sequence);
+        if segment.exists() {
+            return Err(BinlogRotationError::Unchanged(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("Binlog segment already exists: {}", segment.display()),
+            )));
         }
-
+        self.file_mut()
+            .map_err(BinlogRotationError::Indeterminate)?
+            .flush()
+            .map_err(BinlogRotationError::Indeterminate)?;
+        // Once commits can enter a different file, the previous generation
+        // must be durable first. Otherwise a system crash could persist the new
+        // active generation while losing its required predecessor.
+        self.file_mut()
+            .map_err(BinlogRotationError::Indeterminate)?
+            .sync_all()
+            .map_err(BinlogRotationError::Indeterminate)?;
         drop(self.file.take());
-        if let Err(error) = durable_rename(&self.paths.binlog, &self.paths.binlog_backup) {
+        if let Err(error) = durable_rename(&self.paths.binlog, &segment) {
             return match self.reopen_active() {
-                Ok(()) => Err(BinlogCompactionError::Unchanged(error)),
-                Err(reopen_error) => Err(BinlogCompactionError::Indeterminate(
+                Ok(()) => Err(BinlogRotationError::Unchanged(error)),
+                Err(reopen_error) => Err(BinlogRotationError::Indeterminate(
                     std::io::Error::other(format!(
-                        "Binlog backup rename failed ({error}) and the active file could not be reopened ({reopen_error})"
+                        "Binlog generation rename failed ({error}) and the active file could not be reopened ({reopen_error})"
                     )),
                 )),
             };
         }
-        if let Err(error) = sync_parent_directory(&self.paths.binlog_backup) {
-            return self.restore_backup_after_failed_rotation(error);
+        if let Err(error) = sync_parent_directory(&segment) {
+            return self.restore_segment_after_failed_seal(&segment, error);
         }
-        if let Err(error) = durable_rename(&self.paths.binlog_temp, &self.paths.binlog) {
-            return self.restore_backup_after_failed_rotation(error);
+        let mut active = match OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&self.paths.binlog)
+        {
+            Ok(active) => active,
+            Err(error) => return self.restore_segment_after_failed_seal(&segment, error),
+        };
+        if let Err(error) = active.sync_all() {
+            self.file = Some(active);
+            return Err(BinlogRotationError::Indeterminate(error));
         }
         if let Err(error) = sync_parent_directory(&self.paths.binlog) {
-            let _ = self.reopen_active();
-            return Err(BinlogCompactionError::Indeterminate(error));
+            self.file = Some(active);
+            return Err(BinlogRotationError::Indeterminate(error));
         }
-        self.reopen_active()
-            .map_err(BinlogCompactionError::Indeterminate)?;
-        self.remove_rotation_backup();
-        Ok(retained_bytes)
+        active
+            .seek(SeekFrom::End(0))
+            .map_err(BinlogRotationError::Indeterminate)?;
+        self.file = Some(active);
+        Ok(active_length)
     }
 }
 
@@ -863,31 +945,13 @@ impl CommitRuntime {
         upstream_replid: Arc<AtomicU64>,
         snapshot_writer: SnapshotWriteOperation,
     ) -> Result<u64, PersistenceError> {
-        self.compact_with_operations(
-            store,
-            upstream_replid,
-            snapshot_writer,
-            Box::new(|paths, retained_from, prepared_through| {
-                prepare_binlog_suffix(&paths, retained_from, prepared_through)
-            }),
-        )
-        .await
-    }
-
-    async fn compact_with_operations(
-        self: &Arc<Self>,
-        store: Arc<ShardedStore>,
-        upstream_replid: Arc<AtomicU64>,
-        snapshot_writer: SnapshotWriteOperation,
-        suffix_preparer: SuffixPrepareOperation,
-    ) -> Result<u64, PersistenceError> {
         let (completion_tx, completion_rx) = oneshot::channel();
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             let worker_runtime = Arc::clone(&runtime);
             let worker = tokio::spawn(async move {
                 worker_runtime
-                    .compact_owned(store, upstream_replid, snapshot_writer, suffix_preparer)
+                    .compact_owned(store, upstream_replid, snapshot_writer)
                     .await
             });
             let result = match worker.await {
@@ -924,7 +988,6 @@ impl CommitRuntime {
         store: Arc<ShardedStore>,
         upstream_replid: Arc<AtomicU64>,
         snapshot_writer: SnapshotWriteOperation,
-        suffix_preparer: SuffixPrepareOperation,
     ) -> Result<u64, PersistenceError> {
         let measurement = CompactionMeasurement::start(&self.compaction_metrics);
         let serialization_started = Instant::now();
@@ -933,35 +996,66 @@ impl CommitRuntime {
             .serialization_wait
             .observe(serialization_started.elapsed());
 
+        let preflush_started = Instant::now();
+        let preflush_paths = self.paths.clone();
+        let preflushed_bytes =
+            match tokio::task::spawn_blocking(move || preflush_active_generation(&preflush_paths))
+                .await
+            {
+                Ok(Ok(preflushed_bytes)) => preflushed_bytes,
+                Ok(Err(error)) => {
+                    self.compaction_metrics
+                        .observe_preflush(0, preflush_started.elapsed());
+                    measurement.finish(false);
+                    return Err(error_with_context(
+                        error,
+                        "Active binlog generation preflush failed",
+                    ));
+                }
+                Err(error) => {
+                    self.compaction_metrics
+                        .observe_preflush(0, preflush_started.elapsed());
+                    measurement.finish(false);
+                    return Err(PersistenceError::new(format!(
+                        "Active binlog generation preflush task failed: {error}"
+                    )));
+                }
+            };
+        self.compaction_metrics
+            .observe_preflush(preflushed_bytes, preflush_started.elapsed());
+
         let gate_started = Instant::now();
         let boundary = self.acquire_commit_boundary().await;
         self.compaction_metrics
             .gate_wait
             .observe(gate_started.elapsed());
         let capture_pause_started = Instant::now();
-        let checkpoint_started = Instant::now();
-        let checkpoint = match self.binlog.checkpoint().await {
-            Ok(checkpoint) => checkpoint,
+        let watermark = self.sequence();
+        let rotation_started = Instant::now();
+        let sealed_bytes = match self.binlog.seal_active(watermark).await {
+            Ok(sealed_bytes) => sealed_bytes,
             Err(error) => {
                 self.compaction_metrics
-                    .checkpoint
-                    .observe(checkpoint_started.elapsed());
+                    .rotation
+                    .observe(rotation_started.elapsed());
                 self.compaction_metrics
                     .write_pause
                     .observe(capture_pause_started.elapsed());
-                let error = error_with_context(error, "Binlog compaction checkpoint failed");
+                let error = error_with_context(error, "Binlog generation sealing failed");
                 if error.is_indeterminate() {
                     self.enter_fail_stop_with_boundary(boundary, error.to_string());
+                } else {
+                    drop(boundary);
                 }
                 measurement.finish(false);
                 return Err(error);
             }
         };
         self.compaction_metrics
-            .checkpoint
-            .observe(checkpoint_started.elapsed());
+            .rotation
+            .observe(rotation_started.elapsed());
+        self.compaction_metrics.observe_sealed_bytes(sealed_bytes);
 
-        let watermark = self.sequence();
         let compacted_write_count = self.write_count.load(Ordering::SeqCst);
         let capture_started = Instant::now();
         let entries = store.raw_entries();
@@ -995,17 +1089,27 @@ impl CommitRuntime {
             return Err(error);
         }
 
-        let prepare_checkpoint_started = Instant::now();
-        let prepared_through = match self.binlog.checkpoint().await {
-            Ok(checkpoint) => checkpoint,
+        let final_gate_started = Instant::now();
+        let boundary = self.acquire_commit_boundary().await;
+        self.compaction_metrics
+            .gate_wait
+            .observe(final_gate_started.elapsed());
+        let final_pause_started = Instant::now();
+        let checkpoint_started = Instant::now();
+        let retained_bytes = match self.binlog.checkpoint().await {
+            Ok(retained_bytes) => retained_bytes,
             Err(error) => {
                 self.compaction_metrics
                     .checkpoint
-                    .observe(prepare_checkpoint_started.elapsed());
-                let error =
-                    error_with_context(error, "Binlog suffix preparation checkpoint failed");
-                if error.is_indeterminate() && !self.is_fail_stopped() {
-                    self.enter_fail_stop(error.to_string()).await;
+                    .observe(checkpoint_started.elapsed());
+                self.compaction_metrics
+                    .write_pause
+                    .observe(final_pause_started.elapsed());
+                let error = error_with_context(error, "Post-snapshot binlog checkpoint failed");
+                if error.is_indeterminate() {
+                    self.enter_fail_stop_with_boundary(boundary, error.to_string());
+                } else {
+                    drop(boundary);
                 }
                 measurement.finish(false);
                 return Err(error);
@@ -1013,40 +1117,7 @@ impl CommitRuntime {
         };
         self.compaction_metrics
             .checkpoint
-            .observe(prepare_checkpoint_started.elapsed());
-        let suffix_prepare_started = Instant::now();
-        let prepare_paths = self.paths.clone();
-        let suffix_prepare_result = tokio::task::spawn_blocking(move || {
-            suffix_preparer(prepare_paths, checkpoint, prepared_through)
-        })
-        .await;
-        self.compaction_metrics
-            .suffix_prepare
-            .observe(suffix_prepare_started.elapsed());
-        match suffix_prepare_result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                measurement.finish(false);
-                return Err(error_with_context(
-                    error,
-                    "Binlog suffix preparation failed",
-                ));
-            }
-            Err(error) => {
-                measurement.finish(false);
-                return Err(PersistenceError::new(format!(
-                    "Binlog suffix preparation task failed: {error}"
-                )));
-            }
-        }
-
-        let final_gate_started = Instant::now();
-        let boundary = self.acquire_commit_boundary().await;
-        self.compaction_metrics
-            .gate_wait
-            .observe(final_gate_started.elapsed());
-        let rotation_pause_started = Instant::now();
-        let rotation_started = Instant::now();
+            .observe(checkpoint_started.elapsed());
         let replid = upstream_replid.load(Ordering::SeqCst);
         if replid != 0
             && let Err(error) = write_replica_identity(
@@ -1058,43 +1129,14 @@ impl CommitRuntime {
             )
         {
             self.compaction_metrics
-                .rotation
-                .observe(rotation_started.elapsed());
-            self.compaction_metrics
                 .write_pause
-                .observe(rotation_pause_started.elapsed());
+                .observe(final_pause_started.elapsed());
             drop(boundary);
             measurement.finish(false);
             return Err(error);
         }
-        let retained_bytes = match self
-            .binlog
-            .compact_suffix(checkpoint, prepared_through)
-            .await
-        {
-            Ok(retained_bytes) => retained_bytes,
-            Err(error) => {
-                let error = error_with_context(error, "Binlog suffix replacement failed");
-                self.compaction_metrics
-                    .rotation
-                    .observe(rotation_started.elapsed());
-                self.compaction_metrics
-                    .write_pause
-                    .observe(rotation_pause_started.elapsed());
-                if error.is_indeterminate() {
-                    self.enter_fail_stop_with_boundary(boundary, error.to_string());
-                } else {
-                    drop(boundary);
-                }
-                measurement.finish(false);
-                return Err(error);
-            }
-        };
         self.compaction_metrics
             .observe_retained_bytes(retained_bytes);
-        self.compaction_metrics
-            .rotation
-            .observe(rotation_started.elapsed());
         self.write_count
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 Some(count.saturating_sub(compacted_write_count))
@@ -1102,11 +1144,27 @@ impl CommitRuntime {
             .expect("compaction write-count update cannot fail");
         self.compaction_metrics
             .write_pause
-            .observe(rotation_pause_started.elapsed());
+            .observe(final_pause_started.elapsed());
         drop(boundary);
+
+        let cleanup_started = Instant::now();
+        let cleanup_paths = self.paths.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            cleanup_binlog_segments_through(&cleanup_paths, watermark)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            warn!("Binlog segment cleanup task failed: {error}");
+            BinlogSegmentCleanup {
+                failed_files: 1,
+                ..BinlogSegmentCleanup::default()
+            }
+        });
+        self.compaction_metrics
+            .observe_cleanup(cleanup, cleanup_started.elapsed());
         info!(
-            "Compaction complete at sequence {}: snapshot installed and {} post-boundary binlog bytes retained",
-            watermark, retained_bytes
+            "Compaction complete at sequence {}: {} bytes sealed, {} post-boundary bytes retained, {} covered segment(s) removed",
+            watermark, sealed_bytes, retained_bytes, cleanup.removed_files
         );
         measurement.finish(true);
         Ok(watermark)
@@ -1130,9 +1188,8 @@ pub(crate) enum LogMessage {
     Checkpoint {
         completion: oneshot::Sender<StoragePositionResult>,
     },
-    CompactSuffix {
-        retained_from: u64,
-        prepared_through: u64,
+    SealActive {
+        end_sequence: u64,
         completion: oneshot::Sender<StoragePositionResult>,
     },
     Flush {
@@ -1289,31 +1346,26 @@ impl BinlogHandle {
             .map_err(StorageFailure::into_persistence_error)
     }
 
-    /// Atomically replaces the active binlog with bytes written after the
-    /// supplied checkpoint. The worker retains a crash-recoverable backup until
-    /// the synchronized suffix is active.
-    pub(crate) async fn compact_suffix(
-        &self,
-        retained_from: u64,
-        prepared_through: u64,
-    ) -> Result<u64, PersistenceError> {
+    /// Seals the active generation at the supplied authoritative sequence and
+    /// creates a new empty active binlog. The returned value is the number of
+    /// bytes moved into the immutable segment.
+    pub(crate) async fn seal_active(&self, end_sequence: u64) -> Result<u64, PersistenceError> {
         let (completion_tx, completion_rx) = oneshot::channel();
         self.sender
-            .send(LogMessage::CompactSuffix {
-                retained_from,
-                prepared_through,
+            .send(LogMessage::SealActive {
+                end_sequence,
                 completion: completion_tx,
             })
             .await
             .map_err(|_| {
                 PersistenceError::indeterminate(
-                    "Binlog worker is unavailable during suffix replacement",
+                    "Binlog worker is unavailable during generation sealing",
                 )
             })?;
         completion_rx
             .await
             .map_err(|_| {
-                PersistenceError::indeterminate("Binlog suffix replacement completion was dropped")
+                PersistenceError::indeterminate("Binlog generation sealing completion was dropped")
             })?
             .map_err(StorageFailure::into_persistence_error)
     }
@@ -1518,28 +1570,26 @@ pub(crate) async fn run_binlog_worker<T: BinlogIo>(
                 })();
                 let _ = completion.send(result);
             }
-            LogMessage::CompactSuffix {
-                retained_from,
-                prepared_through,
+            LogMessage::SealActive {
+                end_sequence,
                 completion,
             } => {
                 let result = binlog
                     .lock()
                     .map_err(|_| StorageFailure::indeterminate("Binlog file lock is poisoned"))
                     .and_then(|mut file| {
-                        file.compact_suffix(retained_from, prepared_through)
-                            .map_err(|error| match error {
-                                BinlogCompactionError::Unchanged(error) => StorageFailure::rejected(
-                                    format!(
-                                        "Binlog suffix replacement did not modify history: {error}"
-                                    ),
-                                ),
-                                BinlogCompactionError::Indeterminate(error) => {
-                                    StorageFailure::indeterminate(format!(
-                                        "Binlog suffix replacement outcome is indeterminate: {error}"
-                                    ))
-                                }
-                            })
+                        file.seal_active(end_sequence).map_err(|error| match error {
+                            BinlogRotationError::Unchanged(error) => {
+                                StorageFailure::rejected(format!(
+                                    "Binlog generation sealing did not modify history: {error}"
+                                ))
+                            }
+                            BinlogRotationError::Indeterminate(error) => {
+                                StorageFailure::indeterminate(format!(
+                                    "Binlog generation sealing outcome is indeterminate: {error}"
+                                ))
+                            }
+                        })
                     });
                 let _ = completion.send(result);
             }
@@ -1693,7 +1743,7 @@ mod tests {
         sync_data_error_on_call: Option<usize>,
         sync_all_error_on_call: Option<usize>,
         truncate_error_on_call: Option<(usize, InjectedTruncateFailure)>,
-        compact_error_on_call: Option<(usize, InjectedTruncateFailure)>,
+        seal_error_on_call: Option<(usize, InjectedTruncateFailure)>,
     }
 
     struct FaultInjectingFile {
@@ -1704,7 +1754,7 @@ mod tests {
         sync_data_calls: usize,
         sync_all_calls: usize,
         truncate_calls: usize,
-        compact_calls: usize,
+        seal_calls: usize,
     }
 
     impl FaultInjectingFile {
@@ -1724,7 +1774,7 @@ mod tests {
                 sync_data_calls: 0,
                 sync_all_calls: 0,
                 truncate_calls: 0,
-                compact_calls: 0,
+                seal_calls: 0,
             }
         }
 
@@ -1800,46 +1850,29 @@ mod tests {
                 .map_err(TruncateError::Indeterminate)
         }
 
-        fn compact_suffix(
-            &mut self,
-            retained_from: u64,
-            _prepared_through: u64,
-        ) -> Result<u64, BinlogCompactionError> {
-            self.compact_calls += 1;
-            if let Some((call, disposition)) = self.plan.compact_error_on_call
-                && call == self.compact_calls
+        fn seal_active(&mut self, _end_sequence: u64) -> Result<u64, BinlogRotationError> {
+            self.seal_calls += 1;
+            if let Some((call, disposition)) = self.plan.seal_error_on_call
+                && call == self.seal_calls
             {
-                let error = Self::injected_error("compact");
+                let error = Self::injected_error("seal");
                 return Err(match disposition {
-                    InjectedTruncateFailure::Unchanged => BinlogCompactionError::Unchanged(error),
+                    InjectedTruncateFailure::Unchanged => BinlogRotationError::Unchanged(error),
                     InjectedTruncateFailure::Indeterminate => {
-                        BinlogCompactionError::Indeterminate(error)
+                        BinlogRotationError::Indeterminate(error)
                     }
                     InjectedTruncateFailure::PartiallyApplied => {
                         let current_length = self.file.metadata().unwrap().len();
                         self.file.set_len(current_length / 2).unwrap();
-                        BinlogCompactionError::Indeterminate(error)
+                        BinlogRotationError::Indeterminate(error)
                     }
                 });
             }
-
             let active_length = self.file.metadata().unwrap().len();
-            let retained_bytes = active_length.checked_sub(retained_from).ok_or_else(|| {
-                BinlogCompactionError::Unchanged(Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "checkpoint exceeds test binlog length",
-                ))
-            })?;
-            self.file.seek(SeekFrom::Start(retained_from)).unwrap();
-            let mut suffix = Vec::new();
-            std::io::Read::read_to_end(&mut self.file, &mut suffix).unwrap();
-            self.file.set_len(0).unwrap();
-            self.file.seek(SeekFrom::Start(0)).unwrap();
-            self.file.write_all(&suffix).unwrap();
-            self.flush().map_err(BinlogCompactionError::Indeterminate)?;
+            self.flush().map_err(BinlogRotationError::Indeterminate)?;
             self.sync_all()
-                .map_err(BinlogCompactionError::Indeterminate)?;
-            Ok(retained_bytes)
+                .map_err(BinlogRotationError::Indeterminate)?;
+            Ok(active_length)
         }
     }
 
@@ -2053,13 +2086,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_suffix_replacement_fail_stops_and_recovers_installed_snapshot() {
+    async fn partially_applied_generation_seal_fail_stops_before_snapshot_installation() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
         let io = Arc::new(std::sync::Mutex::new(FaultInjectingFile::open(
             &paths.binlog,
             FaultPlan {
-                compact_error_on_call: Some((1, InjectedTruncateFailure::PartiallyApplied)),
+                seal_error_on_call: Some((1, InjectedTruncateFailure::PartiallyApplied)),
                 ..FaultPlan::default()
             },
         )));
@@ -2071,7 +2104,7 @@ mod tests {
         ));
         let handle = BinlogHandle::new(sender);
         handle.append_batch(1, &put_batch()).await.unwrap();
-        let runtime = Arc::new(CommitRuntime::new(handle, 7, paths.clone()));
+        let runtime = Arc::new(CommitRuntime::new(handle, 1, paths.clone()));
         let upstream_replid = Arc::new(AtomicU64::new(0));
         let store = Arc::new(ShardedStore::new());
         store.set("key".to_string(), "snapshot".to_string());
@@ -2085,16 +2118,17 @@ mod tests {
         assert_eq!(metrics.completed_total, 0);
         assert_eq!(metrics.failed_total, 1);
         assert_eq!(metrics.in_progress, 0);
-        assert!(metrics.snapshot_write_nanoseconds_total > 0);
+        assert_eq!(metrics.snapshot_write_nanoseconds_total, 0);
         assert!(metrics.rotation_nanoseconds_total > 0);
+        assert!(!paths.snapshot.exists());
         drop(runtime);
         worker.await.unwrap();
         drop(io);
 
         let recovered = ShardedStore::new();
         let state = load_data_from_paths(&recovered, &paths).unwrap();
-        assert_eq!(state.snapshot_watermark, 7);
-        assert_eq!(recovered.get("key"), Ok(Some("snapshot".to_string())));
+        assert_eq!(state.snapshot_watermark, 0);
+        assert_eq!(recovered.get("key"), Ok(None));
     }
 
     #[tokio::test]
@@ -2303,6 +2337,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_sealing_synchronizes_the_predecessor_under_no_fsync_policy() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let io = Arc::new(std::sync::Mutex::new(FaultInjectingFile::open(
+            &paths.binlog,
+            FaultPlan::default(),
+        )));
+        let (sender, receiver) = mpsc::channel(4);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::No,
+        ));
+        let handle = BinlogHandle::new(sender);
+        handle.append_batch(1, &put_batch()).await.unwrap();
+        assert_eq!(io.lock().unwrap().sync_all_calls, 0);
+
+        handle.seal_active(1).await.unwrap();
+
+        assert_eq!(io.lock().unwrap().sync_all_calls, 1);
+        drop(handle);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn successful_compaction_records_phase_metrics() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
@@ -2337,19 +2396,19 @@ mod tests {
             metrics.duration_nanoseconds_max
         );
         assert!(metrics.checkpoint_nanoseconds_total > 0);
+        assert!(metrics.generation_preflush_nanoseconds_total > 0);
         assert!(metrics.snapshot_capture_nanoseconds_total > 0);
         assert!(metrics.snapshot_write_nanoseconds_total > 0);
-        assert!(metrics.suffix_prepare_nanoseconds_total > 0);
         assert!(metrics.rotation_nanoseconds_total > 0);
         assert!(metrics.write_pause_nanoseconds_total > 0);
         assert_eq!(metrics.retained_bytes_total, 0);
         {
             let io = io.lock().unwrap();
-            assert_eq!(io.flush_calls, 3);
+            assert_eq!(io.flush_calls, 2);
             assert_eq!(io.sync_data_calls, 0);
             assert_eq!(io.sync_all_calls, 1);
             assert_eq!(io.truncate_calls, 0);
-            assert_eq!(io.compact_calls, 1);
+            assert_eq!(io.seal_calls, 1);
         }
 
         drop(runtime);
@@ -2362,7 +2421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_suffix_replacement_retains_only_post_checkpoint_history() {
+    async fn managed_generation_seal_moves_history_and_reopens_the_active_binlog() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
         let file = OpenOptions::new()
@@ -2387,25 +2446,20 @@ mod tests {
             .append_batch(1, &put_batch_for(b"key", b"first"))
             .await
             .unwrap();
-        let checkpoint = handle.checkpoint().await.unwrap();
+        let sealed_bytes = handle.seal_active(1).await.unwrap();
+        assert!(sealed_bytes > 0);
+        let segment = paths.binlog_segment(1);
+        let sealed = crate::persistence::inspect_binlog(&segment).unwrap();
+        assert_eq!(sealed.min_sequence, Some(1));
+        assert_eq!(sealed.max_sequence, 1);
+        assert_eq!(std::fs::metadata(&paths.binlog).unwrap().len(), 0);
         handle
             .append_batch(2, &put_batch_for(b"key", b"second"))
             .await
             .unwrap();
-        let prepared_through = handle.checkpoint().await.unwrap();
-        prepare_binlog_suffix(&paths, checkpoint, prepared_through).unwrap();
-
-        let retained_bytes = handle
-            .compact_suffix(checkpoint, prepared_through)
-            .await
-            .unwrap();
-
-        assert!(retained_bytes > 0);
         let inspection = crate::persistence::inspect_binlog(&paths.binlog).unwrap();
         assert_eq!(inspection.min_sequence, Some(2));
         assert_eq!(inspection.max_sequence, 2);
-        assert!(!paths.binlog_temp.exists());
-        assert!(!paths.binlog_backup.exists());
 
         let snapshot = ShardedStore::new();
         snapshot.set("key".to_string(), "first".to_string());
@@ -2422,7 +2476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mismatched_prepared_suffix_does_not_replace_full_history() {
+    async fn an_existing_generation_path_rejects_sealing_without_modifying_history() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
         let file = OpenOptions::new()
@@ -2447,42 +2501,29 @@ mod tests {
             .append_batch(1, &put_batch_for(b"key", b"first"))
             .await
             .unwrap();
-        let checkpoint = handle.checkpoint().await.unwrap();
-        handle
-            .append_batch(2, &put_batch_for(b"key", b"second"))
-            .await
-            .unwrap();
-        let prepared_through = handle.checkpoint().await.unwrap();
-        prepare_binlog_suffix(&paths, checkpoint, prepared_through).unwrap();
-        OpenOptions::new()
-            .write(true)
-            .open(&paths.binlog_temp)
-            .unwrap()
-            .set_len(0)
-            .unwrap();
+        let segment = paths.binlog_segment(1);
+        std::fs::write(&segment, b"occupied").unwrap();
 
-        let error = handle
-            .compact_suffix(checkpoint, prepared_through)
-            .await
-            .unwrap_err();
+        let error = handle.seal_active(1).await.unwrap_err();
 
         assert!(!error.is_indeterminate());
         let inspection = crate::persistence::inspect_binlog(&paths.binlog).unwrap();
         assert_eq!(inspection.min_sequence, Some(1));
-        assert_eq!(inspection.max_sequence, 2);
-        assert!(!paths.binlog_backup.exists());
+        assert_eq!(inspection.max_sequence, 1);
+        assert_eq!(std::fs::read(&segment).unwrap(), b"occupied");
+        std::fs::remove_file(segment).unwrap();
         drop(handle);
         worker.await.unwrap();
         drop(io);
 
         let recovered = ShardedStore::new();
         let state = load_data_from_paths(&recovered, &paths).unwrap();
-        assert_eq!(state.last_sequence, 2);
-        assert_eq!(recovered.get("key"), Ok(Some("second".to_string())));
+        assert_eq!(state.last_sequence, 1);
+        assert_eq!(recovered.get("key"), Ok(Some("first".to_string())));
     }
 
     #[tokio::test]
-    async fn snapshot_and_suffix_preparation_release_commits_and_retain_live_writes() {
+    async fn snapshot_writing_releases_commits_into_the_new_active_generation() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
         let file = OpenOptions::new()
@@ -2514,25 +2555,18 @@ mod tests {
         let upstream_replid = Arc::new(AtomicU64::new(0));
         let (snapshot_started_tx, snapshot_started_rx) = oneshot::channel();
         let (release_snapshot_tx, release_snapshot_rx) = std::sync::mpsc::channel();
-        let (suffix_prepare_started_tx, suffix_prepare_started_rx) = oneshot::channel();
-        let (release_suffix_prepare_tx, release_suffix_prepare_rx) = std::sync::mpsc::channel();
         let compact_runtime = Arc::clone(&runtime);
         let compact_store = Arc::clone(&store);
         let compact_replid = Arc::clone(&upstream_replid);
         let compact = tokio::spawn(async move {
             compact_runtime
-                .compact_with_operations(
+                .compact_with_writer(
                     compact_store,
                     compact_replid,
                     Box::new(move |entries, watermark, paths| {
                         let _ = snapshot_started_tx.send(());
                         release_snapshot_rx.recv().unwrap();
                         write_snapshot_file(entries, watermark, &paths)
-                    }),
-                    Box::new(move |paths, retained_from, prepared_through| {
-                        let _ = suffix_prepare_started_tx.send(());
-                        release_suffix_prepare_rx.recv().unwrap();
-                        prepare_binlog_suffix(&paths, retained_from, prepared_through)
                     }),
                 )
                 .await
@@ -2556,29 +2590,35 @@ mod tests {
             .await
             .unwrap();
         drop(boundary);
-        release_snapshot_tx.send(()).unwrap();
-
-        suffix_prepare_started_rx.await.unwrap();
         let boundary =
             tokio::time::timeout(Duration::from_secs(1), runtime.acquire_commit_boundary())
                 .await
-                .expect("suffix preparation retained the authoritative commit boundary");
+                .expect("snapshot writing retained the authoritative commit boundary");
         store.set("key".to_string(), "third".to_string());
         runtime
             .accept_next_batch(3, &put_batch_for(b"key", b"third"), 1_000)
             .await
             .unwrap();
         drop(boundary);
-        release_suffix_prepare_tx.send(()).unwrap();
+        release_snapshot_tx.send(()).unwrap();
 
         assert_eq!(compact.await.unwrap().unwrap(), 1);
         assert_eq!(runtime.sequence(), 3);
         assert_eq!(runtime.write_count.load(Ordering::SeqCst), 2);
         let metrics = runtime.compaction_metrics();
         assert_eq!(metrics.completed_total, 1);
+        assert!(metrics.preflushed_bytes_total > 0);
+        assert!(metrics.sealed_bytes_total > 0);
         assert!(metrics.retained_bytes_total > 0);
-        assert!(metrics.suffix_prepare_nanoseconds_total > 0);
+        assert_eq!(metrics.cleanup_files_total, 1);
+        assert_eq!(metrics.cleanup_bytes_total, metrics.sealed_bytes_total);
+        assert_eq!(metrics.cleanup_failures_total, 0);
+        assert!(metrics.segment_cleanup_nanoseconds_total > 0);
         assert!(metrics.write_pause_nanoseconds_total < metrics.duration_nanoseconds_total);
+        assert!(!paths.binlog_segment(1).exists());
+        let active = crate::persistence::inspect_binlog(&paths.binlog).unwrap();
+        assert_eq!(active.min_sequence, Some(2));
+        assert_eq!(active.max_sequence, 3);
 
         drop(runtime);
         worker.await.unwrap();
@@ -2722,12 +2762,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_suffix_preparation_keeps_the_snapshot_and_full_binlog_recoverable() {
+    async fn failed_snapshot_after_sealing_keeps_segmented_history_recoverable() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
-        let io = Arc::new(std::sync::Mutex::new(FaultInjectingFile::open(
-            &paths.binlog,
-            FaultPlan::default(),
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.binlog)
+            .unwrap();
+        let io = Arc::new(std::sync::Mutex::new(ManagedBinlogFile::new(
+            file,
+            paths.clone(),
         )));
         let (sender, receiver) = mpsc::channel(4);
         let worker = tokio::spawn(run_binlog_worker(
@@ -2743,15 +2790,12 @@ mod tests {
         let upstream_replid = Arc::new(AtomicU64::new(0));
 
         let error = runtime
-            .compact_with_operations(
+            .compact_with_writer(
                 Arc::clone(&store),
                 upstream_replid,
-                Box::new(|entries, watermark, paths| {
-                    write_snapshot_file(entries, watermark, &paths)
-                }),
                 Box::new(|_, _, _| {
                     Err(PersistenceError::new(
-                        "Injected binlog suffix preparation failure",
+                        "Injected snapshot installation failure",
                     ))
                 }),
             )
@@ -2759,22 +2803,92 @@ mod tests {
             .unwrap_err();
 
         assert!(!error.is_indeterminate());
-        assert!(paths.snapshot.exists());
+        assert!(!paths.snapshot.exists());
         assert!(!runtime.is_fail_stopped());
-        assert_eq!(io.lock().unwrap().compact_calls, 0);
+        assert!(paths.binlog_segment(1).exists());
+        assert_eq!(std::fs::metadata(&paths.binlog).unwrap().len(), 0);
         drop(runtime);
         worker.await.unwrap();
         drop(io);
 
         let recovered = ShardedStore::new();
         let state = load_data_from_paths(&recovered, &paths).unwrap();
-        assert_eq!(state.snapshot_watermark, 1);
+        assert_eq!(state.snapshot_watermark, 0);
         assert_eq!(state.last_sequence, 1);
         assert_eq!(recovered.get("key"), Ok(Some("accepted".to_string())));
     }
 
     #[tokio::test]
-    async fn failed_compaction_checkpoint_fail_stops_without_installing_a_snapshot() {
+    async fn repeated_failed_snapshots_leave_an_ordered_recoverable_segment_history() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.binlog)
+            .unwrap();
+        let io = Arc::new(std::sync::Mutex::new(ManagedBinlogFile::new(
+            file,
+            paths.clone(),
+        )));
+        let (sender, receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::Always,
+        ));
+        let handle = BinlogHandle::new(sender);
+        handle
+            .append_batch(1, &put_batch_for(b"key", b"first"))
+            .await
+            .unwrap();
+        let runtime = Arc::new(CommitRuntime::new(handle, 1, paths.clone()));
+        let store = Arc::new(ShardedStore::new());
+        store.set("key".to_string(), "first".to_string());
+        let upstream_replid = Arc::new(AtomicU64::new(0));
+
+        for expected_segment in 1..=2 {
+            let error = runtime
+                .compact_with_writer(
+                    Arc::clone(&store),
+                    Arc::clone(&upstream_replid),
+                    Box::new(|_, _, _| {
+                        Err(PersistenceError::new(
+                            "Injected snapshot installation failure",
+                        ))
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(!error.is_indeterminate());
+            assert!(paths.binlog_segment(expected_segment).exists());
+            if expected_segment == 1 {
+                let boundary = runtime.acquire_commit_boundary().await;
+                store.set("key".to_string(), "second".to_string());
+                runtime
+                    .accept_next_batch(2, &put_batch_for(b"key", b"second"), 1_000)
+                    .await
+                    .unwrap();
+                drop(boundary);
+            }
+        }
+
+        assert!(!runtime.is_fail_stopped());
+        drop(runtime);
+        worker.await.unwrap();
+        drop(io);
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &paths).unwrap();
+        assert_eq!(recovery.snapshot_watermark, 0);
+        assert_eq!(recovery.last_sequence, 2);
+        assert_eq!(recovered.get("key"), Ok(Some("second".to_string())));
+    }
+
+    #[tokio::test]
+    async fn failed_generation_seal_fail_stops_without_installing_a_snapshot() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
         let io = Arc::new(std::sync::Mutex::new(FaultInjectingFile::open(
@@ -2809,9 +2923,50 @@ mod tests {
         assert_eq!(metrics.completed_total, 0);
         assert_eq!(metrics.failed_total, 1);
         assert_eq!(metrics.in_progress, 0);
-        assert!(metrics.checkpoint_nanoseconds_total > 0);
+        assert_eq!(metrics.checkpoint_nanoseconds_total, 0);
+        assert!(metrics.rotation_nanoseconds_total > 0);
         assert_eq!(metrics.snapshot_write_nanoseconds_total, 0);
         assert_eq!(io.lock().unwrap().truncate_calls, 0);
+
+        drop(runtime);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_generation_preflush_does_not_seal_or_install_a_snapshot() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let io = Arc::new(std::sync::Mutex::new(FaultInjectingFile::open(
+            &paths.binlog,
+            FaultPlan::default(),
+        )));
+        let (sender, receiver) = mpsc::channel(4);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::No,
+        ));
+        let mut unavailable_paths = paths.clone();
+        unavailable_paths.binlog = directory.path.join("missing").join("onyx.binlog");
+        let runtime = Arc::new(CommitRuntime::new(
+            BinlogHandle::new(sender),
+            0,
+            unavailable_paths,
+        ));
+
+        let error = runtime
+            .compact(&Arc::new(ShardedStore::new()), &Arc::new(AtomicU64::new(0)))
+            .await
+            .unwrap_err();
+
+        assert!(!error.is_indeterminate());
+        assert!(error.to_string().contains("generation preflush failed"));
+        assert!(!runtime.is_fail_stopped());
+        assert_eq!(io.lock().unwrap().seal_calls, 0);
+        assert!(!paths.snapshot.exists());
+        let metrics = runtime.compaction_metrics();
+        assert_eq!(metrics.failed_total, 1);
+        assert!(metrics.generation_preflush_nanoseconds_total > 0);
 
         drop(runtime);
         worker.await.unwrap();

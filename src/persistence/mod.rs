@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 mod codec;
@@ -15,6 +16,8 @@ const SNAPSHOT_PATH: &str = "onyx.snapshot";
 const BINLOG_PATH: &str = "onyx.binlog";
 const BINLOG_TEMP_PATH: &str = "onyx.binlog.tmp";
 const BINLOG_BACKUP_PATH: &str = "onyx.binlog.previous";
+const BINLOG_SEGMENT_PREFIX: &str = "onyx.binlog.segment.";
+const BINLOG_SEGMENT_SEQUENCE_WIDTH: usize = 20;
 const REPLICA_STATE_PATH: &str = "onyx.replica";
 
 #[derive(Clone, Debug)]
@@ -42,6 +45,39 @@ impl PersistencePaths {
             replica_state_temp: directory.join(format!("{}.tmp", REPLICA_STATE_PATH)),
         }
     }
+
+    pub(crate) fn binlog_segment(&self, end_sequence: u64) -> PathBuf {
+        self.binlog.with_file_name(format!(
+            "{BINLOG_SEGMENT_PREFIX}{end_sequence:0BINLOG_SEGMENT_SEQUENCE_WIDTH$}"
+        ))
+    }
+}
+
+pub(crate) fn parse_binlog_segment_end_sequence(
+    file_name: &OsStr,
+) -> Result<Option<u64>, PersistenceError> {
+    let Some(file_name) = file_name.to_str() else {
+        return Ok(None);
+    };
+    let Some(encoded_sequence) = file_name.strip_prefix(BINLOG_SEGMENT_PREFIX) else {
+        return Ok(None);
+    };
+    if encoded_sequence.len() != BINLOG_SEGMENT_SEQUENCE_WIDTH
+        || !encoded_sequence.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(PersistenceError::new(format!(
+            "Malformed binlog segment name: {file_name}"
+        )));
+    }
+    let end_sequence = encoded_sequence.parse::<u64>().map_err(|_| {
+        PersistenceError::new(format!("Invalid binlog segment sequence: {file_name}"))
+    })?;
+    if end_sequence == 0 {
+        return Err(PersistenceError::new(
+            "Binlog segment end sequence must be non-zero",
+        ));
+    }
+    Ok(Some(end_sequence))
 }
 
 #[derive(Debug)]
