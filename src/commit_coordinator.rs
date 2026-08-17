@@ -35,8 +35,15 @@ enum MasterCommitOperation {
     Command(Vec<String>),
     CommandGroup(Vec<Vec<String>>),
     Transaction(Vec<Vec<String>>),
-    ObpSet { key: Bytes, value: Bytes },
-    ObpDelete { key: Bytes },
+    ObpSet {
+        key: Bytes,
+        value: Bytes,
+    },
+    ObpDelete {
+        key: Bytes,
+    },
+    #[cfg(test)]
+    PanicForTest,
 }
 
 impl MasterCommitOperation {
@@ -58,6 +65,8 @@ impl MasterCommitOperation {
                 .saturating_add(key.len())
                 .saturating_add(value.len()),
             Self::ObpDelete { key } => 64usize.saturating_add(key.len()),
+            #[cfg(test)]
+            Self::PanicForTest => 64,
         }
     }
 }
@@ -325,6 +334,14 @@ impl MasterCommitCoordinator {
     #[cfg(test)]
     pub(super) fn pending_requests(&self) -> usize {
         self.sender.max_capacity() - self.sender.capacity()
+    }
+
+    #[cfg(test)]
+    pub(super) async fn panic_worker_for_test(&self) -> PersistenceError {
+        match self.submit(MasterCommitOperation::PanicForTest).await {
+            Err(error) => error,
+            Ok(_) => panic!("an injected coordinator panic cannot return a response"),
+        }
     }
 }
 
@@ -604,6 +621,8 @@ fn prepare_request(store: &ShardedStore, mut request: MasterCommitRequest) -> Pr
         }
         MasterCommitOperation::ObpSet { key, value } => prepare_obp_set(store, request, key, value),
         MasterCommitOperation::ObpDelete { key } => Ok(prepare_obp_delete(store, request, key)),
+        #[cfg(test)]
+        MasterCommitOperation::PanicForTest => panic!("injected master commit coordinator panic"),
     }
 }
 

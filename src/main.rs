@@ -6626,6 +6626,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_panic_is_supervised_and_retains_the_fail_stop_boundary() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, _receiver) = mpsc::channel(1);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+        let coordinator = persistence.master_commit.get().unwrap().clone();
+
+        let error = coordinator.panic_worker_for_test().await;
+        assert!(error.is_indeterminate());
+        let reason = tokio::time::timeout(Duration::from_secs(1), persistence.wait_for_fail_stop())
+            .await
+            .expect("the coordinator panic was not fail-stopped");
+
+        assert!(reason.contains("Master commit coordinator group"));
+        assert!(persistence.is_fail_stopped());
+        assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
+        assert!(persistence.visibility_gate.try_read().is_err());
+
+        let outcome = execute_ordered_command(
+            &store,
+            &persistence,
+            &[
+                "SET".to_string(),
+                "after-panic".to_string(),
+                "value".to_string(),
+            ],
+        )
+        .await;
+        assert!(matches!(
+            outcome.response,
+            RESPValue::Error(message) if message.starts_with("MISCONF")
+        ));
+        assert_eq!(store.get("after-panic"), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn binlog_worker_panic_makes_the_group_indeterminate_and_fail_stops() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, mut receiver) = mpsc::channel(1);
+        let storage_worker = tokio::spawn(async move {
+            let message = receiver.recv().await.expect("append request missing");
+            assert!(matches!(message, LogMessage::Append { .. }));
+            panic!("injected binlog worker panic");
+        });
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let outcome = execute_ordered_command(
+            &store,
+            &persistence,
+            &[
+                "SET".to_string(),
+                "key".to_string(),
+                "tentative".to_string(),
+            ],
+        )
+        .await;
+        let worker_error = storage_worker.await.unwrap_err();
+
+        assert!(worker_error.is_panic());
+        assert!(matches!(
+            outcome.response,
+            RESPValue::Error(message) if message.starts_with("MISCONF")
+        ));
+        assert!(persistence.is_fail_stopped());
+        assert!(!persistence.accepting_writes.load(Ordering::SeqCst));
+        assert!(persistence.visibility_gate.try_read().is_err());
+        assert_eq!(store.get("key"), Ok(Some("tentative".to_string())));
+        assert_eq!(persistence.sequence(), 0);
+        assert!(persistence.backlog.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn coordinator_client_cancellation_does_not_cancel_an_owned_commit() {
         let directory = TestPersistenceDirectory::new();
         let (log_tx, mut receiver) = mpsc::channel(8);
