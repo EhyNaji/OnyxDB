@@ -10,6 +10,7 @@
 //! cancels the mutation or changes its authoritative order.
 
 use super::*;
+use std::time::Instant;
 
 // Count and memory budgets jointly bound queued decoded protocol data. A group
 // has smaller execution limits so one busy cohort cannot monopolize visibility.
@@ -20,10 +21,231 @@ const MAX_COMMIT_GROUP_REQUESTS: usize = 64;
 const MAX_COMMIT_GROUP_LOGICAL_MUTATIONS: usize = 256;
 const MAX_COMMIT_GROUP_INPUT_BYTES: usize = 8 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CommitCoordinatorMetricsSnapshot {
+    pub(super) requests_total: u64,
+    pub(super) queue_depth: u64,
+    pub(super) queue_depth_max: u64,
+    pub(super) queue_wait_nanoseconds_total: u64,
+    pub(super) queue_wait_nanoseconds_max: u64,
+    pub(super) groups_total: u64,
+    pub(super) groups_completed_total: u64,
+    pub(super) groups_rejected_total: u64,
+    pub(super) groups_indeterminate_total: u64,
+    pub(super) groups_interrupted_total: u64,
+    pub(super) groups_in_progress: u64,
+    pub(super) group_requests_total: u64,
+    pub(super) group_requests_max: u64,
+    pub(super) group_input_bytes_total: u64,
+    pub(super) group_input_bytes_max: u64,
+    pub(super) logical_batches_total: u64,
+    pub(super) group_duration_nanoseconds_total: u64,
+    pub(super) group_duration_nanoseconds_max: u64,
+    pub(super) storage_duration_nanoseconds_total: u64,
+    pub(super) storage_duration_nanoseconds_max: u64,
+}
+
+#[derive(Default)]
+struct CommitCoordinatorMetrics {
+    requests_total: AtomicU64,
+    queue_depth: AtomicU64,
+    queue_depth_max: AtomicU64,
+    queue_wait_nanoseconds_total: AtomicU64,
+    queue_wait_nanoseconds_max: AtomicU64,
+    groups_total: AtomicU64,
+    groups_completed_total: AtomicU64,
+    groups_rejected_total: AtomicU64,
+    groups_indeterminate_total: AtomicU64,
+    groups_interrupted_total: AtomicU64,
+    groups_in_progress: AtomicU64,
+    group_requests_total: AtomicU64,
+    group_requests_max: AtomicU64,
+    group_input_bytes_total: AtomicU64,
+    group_input_bytes_max: AtomicU64,
+    logical_batches_total: AtomicU64,
+    group_duration_nanoseconds_total: AtomicU64,
+    group_duration_nanoseconds_max: AtomicU64,
+    storage_duration_nanoseconds_total: AtomicU64,
+    storage_duration_nanoseconds_max: AtomicU64,
+}
+
+fn duration_nanoseconds(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn observe_max(metric: &AtomicU64, value: u64) {
+    let mut current = metric.load(Ordering::Relaxed);
+    while value > current {
+        match metric.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+impl CommitCoordinatorMetrics {
+    fn enter_queue(&self) {
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        observe_max(&self.queue_depth_max, depth);
+    }
+
+    fn leave_queue(&self, wait: std::time::Duration) {
+        self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        let wait = duration_nanoseconds(wait);
+        self.queue_wait_nanoseconds_total
+            .fetch_add(wait, Ordering::Relaxed);
+        observe_max(&self.queue_wait_nanoseconds_max, wait);
+    }
+
+    fn snapshot(&self) -> CommitCoordinatorMetricsSnapshot {
+        CommitCoordinatorMetricsSnapshot {
+            requests_total: self.requests_total.load(Ordering::Relaxed),
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            queue_depth_max: self.queue_depth_max.load(Ordering::Relaxed),
+            queue_wait_nanoseconds_total: self.queue_wait_nanoseconds_total.load(Ordering::Relaxed),
+            queue_wait_nanoseconds_max: self.queue_wait_nanoseconds_max.load(Ordering::Relaxed),
+            groups_total: self.groups_total.load(Ordering::Relaxed),
+            groups_completed_total: self.groups_completed_total.load(Ordering::Relaxed),
+            groups_rejected_total: self.groups_rejected_total.load(Ordering::Relaxed),
+            groups_indeterminate_total: self.groups_indeterminate_total.load(Ordering::Relaxed),
+            groups_interrupted_total: self.groups_interrupted_total.load(Ordering::Relaxed),
+            groups_in_progress: self.groups_in_progress.load(Ordering::Relaxed),
+            group_requests_total: self.group_requests_total.load(Ordering::Relaxed),
+            group_requests_max: self.group_requests_max.load(Ordering::Relaxed),
+            group_input_bytes_total: self.group_input_bytes_total.load(Ordering::Relaxed),
+            group_input_bytes_max: self.group_input_bytes_max.load(Ordering::Relaxed),
+            logical_batches_total: self.logical_batches_total.load(Ordering::Relaxed),
+            group_duration_nanoseconds_total: self
+                .group_duration_nanoseconds_total
+                .load(Ordering::Relaxed),
+            group_duration_nanoseconds_max: self
+                .group_duration_nanoseconds_max
+                .load(Ordering::Relaxed),
+            storage_duration_nanoseconds_total: self
+                .storage_duration_nanoseconds_total
+                .load(Ordering::Relaxed),
+            storage_duration_nanoseconds_max: self
+                .storage_duration_nanoseconds_max
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct QueueMeasurement {
+    metrics: Arc<CommitCoordinatorMetrics>,
+    enqueued_at: Instant,
+    queued: bool,
+}
+
+impl QueueMeasurement {
+    fn new(metrics: Arc<CommitCoordinatorMetrics>) -> Self {
+        metrics.enter_queue();
+        Self {
+            metrics,
+            enqueued_at: Instant::now(),
+            queued: true,
+        }
+    }
+
+    fn leave_queue(&mut self) {
+        if self.queued {
+            self.queued = false;
+            self.metrics.leave_queue(self.enqueued_at.elapsed());
+        }
+    }
+}
+
+impl Drop for QueueMeasurement {
+    fn drop(&mut self) {
+        self.leave_queue();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CommitGroupResult {
+    Completed,
+    Rejected,
+    Indeterminate,
+}
+
+struct CommitGroupMeasurement {
+    metrics: Arc<CommitCoordinatorMetrics>,
+    started_at: Instant,
+    finished: bool,
+}
+
+impl CommitGroupMeasurement {
+    fn start(metrics: Arc<CommitCoordinatorMetrics>, requests: usize, input_bytes: usize) -> Self {
+        let requests = u64::try_from(requests).unwrap_or(u64::MAX);
+        let input_bytes = u64::try_from(input_bytes).unwrap_or(u64::MAX);
+        metrics.groups_total.fetch_add(1, Ordering::Relaxed);
+        metrics.groups_in_progress.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .group_requests_total
+            .fetch_add(requests, Ordering::Relaxed);
+        observe_max(&metrics.group_requests_max, requests);
+        metrics
+            .group_input_bytes_total
+            .fetch_add(input_bytes, Ordering::Relaxed);
+        observe_max(&metrics.group_input_bytes_max, input_bytes);
+        Self {
+            metrics,
+            started_at: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn observe_storage(&self, duration: std::time::Duration) {
+        let duration = duration_nanoseconds(duration);
+        self.metrics
+            .storage_duration_nanoseconds_total
+            .fetch_add(duration, Ordering::Relaxed);
+        observe_max(&self.metrics.storage_duration_nanoseconds_max, duration);
+    }
+
+    fn finish(mut self, result: CommitGroupResult, logical_batches: usize) {
+        self.finished = true;
+        self.metrics.logical_batches_total.fetch_add(
+            u64::try_from(logical_batches).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        match result {
+            CommitGroupResult::Completed => &self.metrics.groups_completed_total,
+            CommitGroupResult::Rejected => &self.metrics.groups_rejected_total,
+            CommitGroupResult::Indeterminate => &self.metrics.groups_indeterminate_total,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        self.record_end();
+    }
+
+    fn record_end(&self) {
+        self.metrics
+            .groups_in_progress
+            .fetch_sub(1, Ordering::Relaxed);
+        let duration = duration_nanoseconds(self.started_at.elapsed());
+        self.metrics
+            .group_duration_nanoseconds_total
+            .fetch_add(duration, Ordering::Relaxed);
+        observe_max(&self.metrics.group_duration_nanoseconds_max, duration);
+    }
+}
+
+impl Drop for CommitGroupMeasurement {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.metrics
+                .groups_interrupted_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.record_end();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct MasterCommitCoordinator {
     sender: mpsc::Sender<MasterCommitRequest>,
     memory: Arc<tokio::sync::Semaphore>,
+    metrics: Arc<CommitCoordinatorMetrics>,
 }
 
 pub(super) enum ObpMutationResult {
@@ -96,9 +318,14 @@ struct MasterCommitRequest {
     operation: Option<MasterCommitOperation>,
     completion: tokio::sync::oneshot::Sender<Result<MasterCommitResponse, PersistenceError>>,
     _memory: tokio::sync::OwnedSemaphorePermit,
+    queue_measurement: QueueMeasurement,
 }
 
 impl MasterCommitRequest {
+    fn leave_queue(&mut self) {
+        self.queue_measurement.leave_queue();
+    }
+
     fn estimated_bytes(&self) -> usize {
         self.operation
             .as_ref()
@@ -188,12 +415,14 @@ impl MasterCommitCoordinator {
         let (sender, receiver) = mpsc::channel(COMMIT_QUEUE_CAPACITY);
         let memory_units = COMMIT_QUEUE_MEMORY_BYTES / COMMIT_QUEUE_MEMORY_UNIT_BYTES;
         let memory = Arc::new(tokio::sync::Semaphore::new(memory_units));
+        let metrics = Arc::new(CommitCoordinatorMetrics::default());
         let persistence_weak = Arc::downgrade(persistence);
         let supervisor_persistence = persistence_weak.clone();
         let worker = tokio::spawn(run_master_commit_coordinator(
             store,
             persistence_weak,
             receiver,
+            Arc::clone(&metrics),
         ));
         tokio::spawn(async move {
             let outcome = worker.await;
@@ -211,7 +440,11 @@ impl MasterCommitCoordinator {
             enter_persistence_fail_stop(&persistence, detail).await;
         });
 
-        Self { sender, memory }
+        Self {
+            sender,
+            memory,
+            metrics,
+        }
     }
 
     async fn submit(
@@ -242,14 +475,17 @@ impl MasterCommitCoordinator {
             .await
             .map_err(|_| PersistenceError::new("Master commit coordinator is unavailable"))?;
         let (completion, response) = tokio::sync::oneshot::channel();
+        let queue_measurement = QueueMeasurement::new(Arc::clone(&self.metrics));
         self.sender
             .send(MasterCommitRequest {
                 operation: Some(operation),
                 completion,
                 _memory: memory,
+                queue_measurement,
             })
             .await
             .map_err(|_| PersistenceError::new("Master commit coordinator is unavailable"))?;
+        self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         response.await.map_err(|_| {
             PersistenceError::indeterminate("Master commit coordinator dropped the outcome")
         })?
@@ -334,6 +570,10 @@ impl MasterCommitCoordinator {
     #[cfg(test)]
     pub(super) fn pending_requests(&self) -> usize {
         self.sender.max_capacity() - self.sender.capacity()
+    }
+
+    pub(super) fn metrics_snapshot(&self) -> CommitCoordinatorMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     #[cfg(test)]
@@ -659,10 +899,16 @@ async fn process_commit_group(
     store: &Arc<ShardedStore>,
     persistence: &Arc<Persistence>,
     requests: Vec<MasterCommitRequest>,
+    metrics: Arc<CommitCoordinatorMetrics>,
 ) {
+    let input_bytes = requests.iter().fold(0usize, |total, request| {
+        total.saturating_add(request.estimated_bytes())
+    });
+    let measurement = CommitGroupMeasurement::start(metrics, requests.len(), input_bytes);
     if persistence.is_fail_stopped() || !persistence.accepting_writes.load(Ordering::SeqCst) {
         let error = PersistenceError::new(persistence_unavailable_message(persistence));
         reject_requests(requests, &error);
+        measurement.finish(CommitGroupResult::Rejected, 0);
         return;
     }
 
@@ -671,6 +917,7 @@ async fn process_commit_group(
         drop(boundary);
         let error = PersistenceError::new(persistence_unavailable_message(persistence));
         reject_requests(requests, &error);
+        measurement.finish(CommitGroupResult::Rejected, 0);
         return;
     }
     let commit_guard = PersistenceCommitGuard::new(
@@ -696,6 +943,7 @@ async fn process_commit_group(
                 let mut rejected = vec![failed_request];
                 rejected.extend(requests);
                 reject_requests(rejected, &error);
+                measurement.finish(CommitGroupResult::Rejected, 0);
                 return;
             }
         }
@@ -711,6 +959,7 @@ async fn process_commit_group(
                 mark_persistence_failed(persistence, error.to_string());
                 commit_guard.release();
                 fail_prepared(prepared, &error);
+                measurement.finish(CommitGroupResult::Rejected, 0);
                 return;
             };
             next_sequence = sequence;
@@ -721,6 +970,7 @@ async fn process_commit_group(
     if batches.is_empty() {
         commit_guard.release();
         complete_prepared(prepared);
+        measurement.finish(CommitGroupResult::Completed, 0);
         return;
     }
 
@@ -729,11 +979,15 @@ async fn process_commit_group(
         .last()
         .expect("a non-empty commit group has a last batch")
         .0;
-    match persist_and_publish_master_batches(persistence, &batches).await {
+    let storage_started = Instant::now();
+    let persistence_result = persist_and_publish_master_batches(persistence, &batches).await;
+    measurement.observe_storage(storage_started.elapsed());
+    match persistence_result {
         Ok(should_compact) => {
             commit_guard.release();
             complete_prepared(prepared);
             schedule_compaction(store, persistence, should_compact);
+            measurement.finish(CommitGroupResult::Completed, batches.len());
         }
         Err(error) if error.is_indeterminate() => {
             commit_guard.fail_stop(format!(
@@ -741,6 +995,7 @@ async fn process_commit_group(
                 first_sequence, last_sequence, error
             ));
             fail_prepared(prepared, &error);
+            measurement.finish(CommitGroupResult::Indeterminate, batches.len());
         }
         Err(error) => {
             rollback_prepared(store, &prepared);
@@ -753,6 +1008,7 @@ async fn process_commit_group(
             );
             commit_guard.release();
             fail_prepared(prepared, &error);
+            measurement.finish(CommitGroupResult::Rejected, batches.len());
         }
     }
 }
@@ -761,24 +1017,26 @@ async fn run_master_commit_coordinator(
     store: Arc<ShardedStore>,
     persistence: std::sync::Weak<Persistence>,
     mut receiver: mpsc::Receiver<MasterCommitRequest>,
+    metrics: Arc<CommitCoordinatorMetrics>,
 ) {
     let mut requests = Vec::with_capacity(MAX_COMMIT_GROUP_REQUESTS);
     let mut deferred = None;
     loop {
         requests.clear();
-        let first = match deferred.take() {
+        let mut first = match deferred.take() {
             Some(request) => request,
             None => match receiver.recv().await {
                 Some(request) => request,
                 None => return,
             },
         };
+        first.leave_queue();
         let mut logical_mutations = first.logical_mutation_upper_bound();
         let mut input_bytes = first.estimated_bytes();
         requests.push(first);
         tokio::task::yield_now().await;
         while requests.len() < MAX_COMMIT_GROUP_REQUESTS {
-            let Ok(request) = receiver.try_recv() else {
+            let Ok(mut request) = receiver.try_recv() else {
                 break;
             };
             let projected_mutations =
@@ -792,6 +1050,7 @@ async fn run_master_commit_coordinator(
             }
             logical_mutations = projected_mutations;
             input_bytes = projected_bytes;
+            request.leave_queue();
             requests.push(request);
         }
         let Some(persistence) = persistence.upgrade() else {
@@ -799,6 +1058,12 @@ async fn run_master_commit_coordinator(
             reject_requests(std::mem::take(&mut requests), &error);
             return;
         };
-        process_commit_group(&store, &persistence, std::mem::take(&mut requests)).await;
+        process_commit_group(
+            &store,
+            &persistence,
+            std::mem::take(&mut requests),
+            Arc::clone(&metrics),
+        )
+        .await;
     }
 }

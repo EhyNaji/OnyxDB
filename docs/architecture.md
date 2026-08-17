@@ -91,6 +91,12 @@ continue to use owned commit finalizers because their upstream sequence is
 already assigned. Shutdown, compaction, replica reconnect, and promotion all
 wait for the same write boundary before proceeding.
 
+Coordinator, binlog, and compaction paths expose cumulative Prometheus metrics
+for queue depth and wait, group composition and duration, logical batches per
+physical append, accepted ONX4 bytes, append acknowledgement time, and
+compaction phase duration. Metrics use relaxed atomics and never participate in
+correctness decisions. Scraping cannot change commit ordering or durability.
+
 ### Mutation invariant
 
 For every acknowledged state-changing batch, the in-memory state, binlog,
@@ -192,10 +198,14 @@ greater than `W`, in contiguous order. Therefore:
 - post-boundary mutations remain recoverable;
 - a binlog that begins after `W + 1` is rejected as a history gap.
 
-Compaction holds the write gate, flushes the binlog, writes and synchronizes a
-temporary snapshot, durably replaces the current snapshot while retaining a
-previous snapshot, and only then truncates and synchronizes the binlog. A failed
-snapshot installation never authorizes binlog truncation.
+Compaction holds the write gate and sends an ordered binlog barrier that waits
+for every preceding worker operation without strengthening the configured
+fsync policy. It then writes and synchronizes a temporary snapshot, durably
+replaces the current snapshot while retaining a previous snapshot, and only
+then truncates and synchronizes the binlog. The newly installed snapshot is the
+durable replacement for pre-watermark history. A failed snapshot installation
+never authorizes binlog truncation, while shutdown, promotion, and explicit
+durable flushes retain their stronger synchronization behavior.
 
 Recovery may truncate only a recognizable incomplete final record after a valid
 history. Complete corruption and ambiguous framing fail startup. Recovery is

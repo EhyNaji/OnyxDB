@@ -162,6 +162,19 @@ pub(crate) fn encode_versioned_binlog_record(
     Ok(record)
 }
 
+pub(crate) fn framed_versioned_binlog_record_length(
+    effect_record_length: usize,
+) -> Result<usize, PersistenceError> {
+    BINLOG_RECORD_MAGIC
+        .len()
+        .checked_add(BINLOG_RECORD_LENGTH_SIZE)
+        .and_then(|length| length.checked_add(8))
+        .and_then(|length| length.checked_add(effect_record_length))
+        .and_then(|length| length.checked_add(BINLOG_CHECKSUM_SIZE))
+        .and_then(|length| length.checked_add(BINLOG_RECORD_LENGTH_SIZE))
+        .ok_or_else(|| PersistenceError::new("Framed binlog record length overflow"))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BinlogRecordIntegrity {
     Checksummed,

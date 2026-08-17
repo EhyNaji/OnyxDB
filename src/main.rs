@@ -1716,52 +1716,423 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
         .unwrap_or(0);
     drop(statuses);
 
-    format!(
-        "# HELP onyxdb_uptime_seconds Server uptime in seconds\n\
-         # TYPE onyxdb_uptime_seconds counter\n\
-         onyxdb_uptime_seconds {}\n\
-         # HELP onyxdb_keys_total Number of currently present keys\n\
-        TYPE onyxdb_keys_total gauge\n\
-         onyxdb_keys_total {}\n\
-         # HELP onyxdb_active_connections Number of active client connections\n\
-         # TYPE onyxdb_active_connections gauge\n\
-         onyxdb_active_connections {}\n\
-         # HELP onyxdb_commands_total Total number of executed commands\n\
-         # TYPE onyxdb_commands_total counter\n\
-         onyxdb_commands_total {}\n\
-         # HELP onyxdb_cache_hits_total Number of successful key reads\n\
-         # TYPE onyxdb_cache_hits_total counter\n\
-         onyxdb_cache_hits_total {}\n\
-         # HELP onyxdb_cache_misses_total Number of reads for missing keys\n\
-         # TYPE onyxdb_cache_misses_total counter\n\
-         onyxdb_cache_misses_total {}\n\
-         # HELP onyxdb_is_master 1 when this instance is a master, 0 when it is a replica\n\
-         # TYPE onyxdb_is_master gauge\n\
-         onyxdb_is_master {}\n\
-         # HELP onyxdb_replication_offset Current committed replication sequence\n\
-         # TYPE onyxdb_replication_offset counter\n\
-         onyxdb_replication_offset {}\n\
-         # HELP onyxdb_connected_replicas Number of currently connected replicas\n\
-         # TYPE onyxdb_connected_replicas gauge\n\
-         onyxdb_connected_replicas {}\n\
-         # HELP onyxdb_max_replica_lag Largest connected-replica sequence lag\n\
-         # TYPE onyxdb_max_replica_lag gauge\n\
-         onyxdb_max_replica_lag {}\n\
-         # HELP onyxdb_memory_bytes Approximate logical dataset bytes\n\
-         # TYPE onyxdb_memory_bytes gauge\n\
-         onyxdb_memory_bytes {}\n",
+    fn push_metric(
+        output: &mut String,
+        name: &str,
+        help: &str,
+        metric_type: &str,
+        value: impl std::fmt::Display,
+    ) {
+        use std::fmt::Write as _;
+        writeln!(output, "# HELP {name} {help}").expect("writing metrics to a string cannot fail");
+        writeln!(output, "# TYPE {name} {metric_type}")
+            .expect("writing metrics to a string cannot fail");
+        writeln!(output, "{name} {value}").expect("writing metrics to a string cannot fail");
+    }
+
+    fn seconds(nanoseconds: u64) -> f64 {
+        nanoseconds as f64 / 1_000_000_000.0
+    }
+
+    let mut output = String::with_capacity(12 * 1024);
+    push_metric(
+        &mut output,
+        "onyxdb_uptime_seconds",
+        "Server uptime in seconds",
+        "counter",
         uptime,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_keys_total",
+        "Number of currently present keys",
+        "gauge",
         num_keys,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_active_connections",
+        "Number of active client connections",
+        "gauge",
         active_conns,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_commands_total",
+        "Total number of executed commands",
+        "counter",
         total_cmds,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_cache_hits_total",
+        "Number of successful key reads",
+        "counter",
         hits,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_cache_misses_total",
+        "Number of reads for missing keys",
+        "counter",
         misses,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_is_master",
+        "1 when this instance is a master, 0 when it is a replica",
+        "gauge",
         role_value,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_replication_offset",
+        "Current committed replication sequence",
+        "counter",
         repl_offset,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_connected_replicas",
+        "Number of currently connected replicas",
+        "gauge",
         connected_replicas,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_max_replica_lag",
+        "Largest connected-replica sequence lag",
+        "gauge",
         max_lag,
-        store.used_memory_bytes()
-    )
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_memory_bytes",
+        "Approximate logical dataset bytes",
+        "gauge",
+        store.used_memory_bytes(),
+    );
+
+    if let Some(coordinator) = persistence.master_commit.get() {
+        let metrics = coordinator.metrics_snapshot();
+        for (name, help, metric_type, value) in [
+            (
+                "onyxdb_commit_requests_total",
+                "Commit requests admitted to the coordinator",
+                "counter",
+                metrics.requests_total,
+            ),
+            (
+                "onyxdb_commit_queue_depth",
+                "Commit requests currently waiting for coordinator execution",
+                "gauge",
+                metrics.queue_depth,
+            ),
+            (
+                "onyxdb_commit_queue_depth_max",
+                "Highest observed commit coordinator queue depth",
+                "gauge",
+                metrics.queue_depth_max,
+            ),
+            (
+                "onyxdb_commit_groups_total",
+                "Physical coordinator execution groups started",
+                "counter",
+                metrics.groups_total,
+            ),
+            (
+                "onyxdb_commit_groups_completed_total",
+                "Coordinator groups completed authoritatively",
+                "counter",
+                metrics.groups_completed_total,
+            ),
+            (
+                "onyxdb_commit_groups_rejected_total",
+                "Coordinator groups definitively rejected",
+                "counter",
+                metrics.groups_rejected_total,
+            ),
+            (
+                "onyxdb_commit_groups_indeterminate_total",
+                "Coordinator groups with indeterminate persistence outcomes",
+                "counter",
+                metrics.groups_indeterminate_total,
+            ),
+            (
+                "onyxdb_commit_groups_interrupted_total",
+                "Coordinator groups interrupted before an authoritative outcome",
+                "counter",
+                metrics.groups_interrupted_total,
+            ),
+            (
+                "onyxdb_commit_groups_in_progress",
+                "Coordinator groups currently in progress",
+                "gauge",
+                metrics.groups_in_progress,
+            ),
+            (
+                "onyxdb_commit_group_requests_total",
+                "Requests included across all coordinator groups",
+                "counter",
+                metrics.group_requests_total,
+            ),
+            (
+                "onyxdb_commit_group_requests_max",
+                "Largest observed coordinator group by request count",
+                "gauge",
+                metrics.group_requests_max,
+            ),
+            (
+                "onyxdb_commit_group_input_bytes_total",
+                "Estimated decoded input bytes included across coordinator groups",
+                "counter",
+                metrics.group_input_bytes_total,
+            ),
+            (
+                "onyxdb_commit_group_input_bytes_max",
+                "Largest observed coordinator group by estimated decoded input bytes",
+                "gauge",
+                metrics.group_input_bytes_max,
+            ),
+            (
+                "onyxdb_commit_logical_batches_total",
+                "Logical committed batches processed by the coordinator",
+                "counter",
+                metrics.logical_batches_total,
+            ),
+        ] {
+            push_metric(&mut output, name, help, metric_type, value);
+        }
+        for (name, help, metric_type, value) in [
+            (
+                "onyxdb_commit_queue_wait_seconds_total",
+                "Cumulative time requests spent waiting in the coordinator queue",
+                "counter",
+                seconds(metrics.queue_wait_nanoseconds_total),
+            ),
+            (
+                "onyxdb_commit_queue_wait_seconds_max",
+                "Longest observed coordinator queue wait",
+                "gauge",
+                seconds(metrics.queue_wait_nanoseconds_max),
+            ),
+            (
+                "onyxdb_commit_group_duration_seconds_total",
+                "Cumulative coordinator group execution time",
+                "counter",
+                seconds(metrics.group_duration_nanoseconds_total),
+            ),
+            (
+                "onyxdb_commit_group_duration_seconds_max",
+                "Longest observed coordinator group execution time",
+                "gauge",
+                seconds(metrics.group_duration_nanoseconds_max),
+            ),
+            (
+                "onyxdb_commit_storage_duration_seconds_total",
+                "Cumulative grouped persistence and publication wait time",
+                "counter",
+                seconds(metrics.storage_duration_nanoseconds_total),
+            ),
+            (
+                "onyxdb_commit_storage_duration_seconds_max",
+                "Longest observed grouped persistence and publication wait",
+                "gauge",
+                seconds(metrics.storage_duration_nanoseconds_max),
+            ),
+        ] {
+            push_metric(&mut output, name, help, metric_type, value);
+        }
+    }
+
+    let binlog = persistence.commit_runtime.binlog_metrics();
+    for (name, help, metric_type, value) in [
+        (
+            "onyxdb_binlog_append_attempts_total",
+            "Binlog append operations attempted",
+            "counter",
+            binlog.append_attempts_total,
+        ),
+        (
+            "onyxdb_binlog_append_accepted_total",
+            "Binlog append operations accepted",
+            "counter",
+            binlog.append_accepted_total,
+        ),
+        (
+            "onyxdb_binlog_append_rejected_total",
+            "Binlog append operations definitively rejected",
+            "counter",
+            binlog.append_rejected_total,
+        ),
+        (
+            "onyxdb_binlog_append_indeterminate_total",
+            "Binlog append operations with indeterminate outcomes",
+            "counter",
+            binlog.append_indeterminate_total,
+        ),
+        (
+            "onyxdb_binlog_records_accepted_total",
+            "Logical ONX4 records accepted by binlog append operations",
+            "counter",
+            binlog.records_accepted_total,
+        ),
+        (
+            "onyxdb_binlog_bytes_accepted_total",
+            "Framed ONX4 bytes accepted by binlog append operations",
+            "counter",
+            binlog.bytes_accepted_total,
+        ),
+        (
+            "onyxdb_binlog_records_per_append_max",
+            "Largest accepted binlog append by record count",
+            "gauge",
+            binlog.records_per_append_max,
+        ),
+        (
+            "onyxdb_binlog_bytes_per_append_max",
+            "Largest accepted binlog append by framed bytes",
+            "gauge",
+            binlog.bytes_per_append_max,
+        ),
+    ] {
+        push_metric(&mut output, name, help, metric_type, value);
+    }
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_append_ack_seconds_total",
+        "Cumulative binlog append submission-to-acknowledgement time",
+        "counter",
+        seconds(binlog.append_ack_nanoseconds_total),
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_append_ack_seconds_max",
+        "Longest observed binlog append submission-to-acknowledgement time",
+        "gauge",
+        seconds(binlog.append_ack_nanoseconds_max),
+    );
+
+    let compaction = persistence.commit_runtime.compaction_metrics();
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_pending",
+        "1 when automatic compaction is scheduled or active",
+        "gauge",
+        u8::from(persistence.compaction_pending.load(Ordering::Relaxed)),
+    );
+    for (name, help, metric_type, value) in [
+        (
+            "onyxdb_compaction_attempts_total",
+            "Snapshot compaction attempts started",
+            "counter",
+            compaction.attempts_total,
+        ),
+        (
+            "onyxdb_compaction_completed_total",
+            "Snapshot compactions completed",
+            "counter",
+            compaction.completed_total,
+        ),
+        (
+            "onyxdb_compaction_failed_total",
+            "Snapshot compactions that failed or were interrupted",
+            "counter",
+            compaction.failed_total,
+        ),
+        (
+            "onyxdb_compaction_in_progress",
+            "Snapshot compaction attempts currently active or waiting for the write gate",
+            "gauge",
+            compaction.in_progress,
+        ),
+    ] {
+        push_metric(&mut output, name, help, metric_type, value);
+    }
+    for (name, help, metric_type, value) in [
+        (
+            "onyxdb_compaction_duration_seconds_total",
+            "Cumulative snapshot compaction duration",
+            "counter",
+            seconds(compaction.duration_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_duration_seconds_last",
+            "Duration of the most recently completed compaction attempt",
+            "gauge",
+            seconds(compaction.duration_nanoseconds_last),
+        ),
+        (
+            "onyxdb_compaction_duration_seconds_max",
+            "Longest observed compaction attempt",
+            "gauge",
+            seconds(compaction.duration_nanoseconds_max),
+        ),
+        (
+            "onyxdb_compaction_gate_wait_seconds_total",
+            "Cumulative time compaction attempts waited for the write gate",
+            "counter",
+            seconds(compaction.gate_wait_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_gate_wait_seconds_max",
+            "Longest observed compaction write-gate wait",
+            "gauge",
+            seconds(compaction.gate_wait_nanoseconds_max),
+        ),
+        (
+            "onyxdb_compaction_barrier_seconds_total",
+            "Cumulative pre-snapshot ordered binlog barrier time",
+            "counter",
+            seconds(compaction.barrier_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_barrier_seconds_max",
+            "Longest observed pre-snapshot ordered binlog barrier",
+            "gauge",
+            seconds(compaction.barrier_nanoseconds_max),
+        ),
+        (
+            "onyxdb_compaction_snapshot_capture_seconds_total",
+            "Cumulative in-memory snapshot capture time",
+            "counter",
+            seconds(compaction.snapshot_capture_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_snapshot_capture_seconds_max",
+            "Longest observed in-memory snapshot capture",
+            "gauge",
+            seconds(compaction.snapshot_capture_nanoseconds_max),
+        ),
+        (
+            "onyxdb_compaction_snapshot_write_seconds_total",
+            "Cumulative snapshot encoding and durable installation time",
+            "counter",
+            seconds(compaction.snapshot_write_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_snapshot_write_seconds_max",
+            "Longest observed snapshot encoding and durable installation",
+            "gauge",
+            seconds(compaction.snapshot_write_nanoseconds_max),
+        ),
+        (
+            "onyxdb_compaction_rotation_seconds_total",
+            "Cumulative replica-state update and binlog rotation time",
+            "counter",
+            seconds(compaction.rotation_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_rotation_seconds_max",
+            "Longest observed replica-state update and binlog rotation",
+            "gauge",
+            seconds(compaction.rotation_nanoseconds_max),
+        ),
+    ] {
+        push_metric(&mut output, name, help, metric_type, value);
+    }
+
+    output
 }
 
 async fn run_metrics_server(
@@ -4160,12 +4531,51 @@ mod tests {
                     records,
                     completion,
                 } => return (records, completion),
-                LogMessage::Flush { completion }
+                LogMessage::Barrier { completion }
+                | LogMessage::Flush { completion }
                 | LogMessage::SyncData { completion }
                 | LogMessage::Truncate { completion } => {
                     let _ = completion.send(Ok(()));
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn prometheus_metrics_include_valid_commit_and_compaction_observability() {
+        let directory = TestPersistenceDirectory::new();
+        let (log_tx, _receiver) = mpsc::channel(1);
+        let persistence = test_persistence(directory.paths.clone(), log_tx, 0);
+        let store = Arc::new(ShardedStore::new());
+        enable_master_commit_coordinator(&store, &persistence);
+
+        let body = format_prometheus_metrics(&store, &persistence);
+        assert!(!body.lines().any(|line| line.starts_with("TYPE ")));
+        assert!(body.contains("# TYPE onyxdb_keys_total gauge\n"));
+        assert!(body.contains("onyxdb_commit_queue_depth 0\n"));
+        assert!(body.contains("onyxdb_binlog_append_attempts_total 0\n"));
+        assert!(body.contains("onyxdb_compaction_completed_total 0\n"));
+
+        let help_count = body
+            .lines()
+            .filter(|line| line.starts_with("# HELP "))
+            .count();
+        let type_count = body
+            .lines()
+            .filter(|line| line.starts_with("# TYPE "))
+            .count();
+        let samples = body
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<Vec<_>>();
+        assert_eq!(help_count, samples.len());
+        assert_eq!(type_count, samples.len());
+        for sample in samples {
+            let fields = sample.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(fields.len(), 2, "invalid Prometheus sample: {sample}");
+            fields[1]
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("invalid Prometheus value: {sample}"));
         }
     }
 
@@ -4265,7 +4675,8 @@ mod tests {
                         let _ = completion.send(Ok(()));
                         completed_tx.take().unwrap().send(()).unwrap();
                     }
-                    LogMessage::Flush { completion }
+                    LogMessage::Barrier { completion }
+                    | LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
@@ -4949,7 +5360,7 @@ mod tests {
         let worker = tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 match message {
-                    LogMessage::Flush { completion } => {
+                    LogMessage::Barrier { completion } | LogMessage::Flush { completion } => {
                         let _ = completion.send(Ok(()));
                     }
                     LogMessage::Truncate { completion } => {
@@ -4992,7 +5403,7 @@ mod tests {
         let worker = tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 match message {
-                    LogMessage::Flush { completion } => {
+                    LogMessage::Barrier { completion } | LogMessage::Flush { completion } => {
                         let _ = completion.send(Ok(()));
                     }
                     LogMessage::Truncate { completion } => {
@@ -5038,6 +5449,7 @@ mod tests {
                         )));
                     }
                     LogMessage::Append { completion, .. }
+                    | LogMessage::Barrier { completion }
                     | LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion } => {
                         let _ = completion.send(Ok(()));
@@ -5986,7 +6398,8 @@ mod tests {
                             "injected replica append failure",
                         )));
                     }
-                    LogMessage::Flush { completion }
+                    LogMessage::Barrier { completion }
+                    | LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
@@ -6331,6 +6744,25 @@ mod tests {
                 Ok(Some(format!("value-{index}")))
             );
         }
+        let metrics = persistence
+            .master_commit
+            .get()
+            .expect("coordinator must be installed")
+            .metrics_snapshot();
+        assert_eq!(metrics.requests_total, 4);
+        assert_eq!(metrics.queue_depth, 0);
+        assert!(metrics.queue_depth_max >= 3);
+        assert_eq!(metrics.groups_total, 2);
+        assert_eq!(metrics.groups_completed_total, 2);
+        assert_eq!(metrics.groups_rejected_total, 0);
+        assert_eq!(metrics.groups_indeterminate_total, 0);
+        assert_eq!(metrics.groups_interrupted_total, 0);
+        assert_eq!(metrics.groups_in_progress, 0);
+        assert_eq!(metrics.group_requests_total, 4);
+        assert_eq!(metrics.group_requests_max, 3);
+        assert_eq!(metrics.logical_batches_total, 4);
+        assert!(metrics.group_duration_nanoseconds_total > 0);
+        assert!(metrics.storage_duration_nanoseconds_total > 0);
     }
 
     #[tokio::test]
@@ -7067,7 +7499,8 @@ mod tests {
                         }
                         let _ = completion.send(Ok(()));
                     }
-                    LogMessage::Flush { completion }
+                    LogMessage::Barrier { completion }
+                    | LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
@@ -7140,7 +7573,8 @@ mod tests {
                             "injected transaction failure",
                         )));
                     }
-                    LogMessage::Flush { completion }
+                    LogMessage::Barrier { completion }
+                    | LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
@@ -7202,7 +7636,8 @@ mod tests {
                             "injected transaction failure",
                         )));
                     }
-                    LogMessage::Flush { completion }
+                    LogMessage::Barrier { completion }
+                    | LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
@@ -7455,7 +7890,8 @@ mod tests {
                         let _ = completion
                             .send(Err(StorageFailure::rejected("injected append failure")));
                     }
-                    LogMessage::Flush { completion }
+                    LogMessage::Barrier { completion }
+                    | LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
@@ -8641,6 +9077,7 @@ mod tests {
                             .send(Err(StorageFailure::indeterminate("injected sync failure")));
                     }
                     LogMessage::Append { completion, .. }
+                    | LogMessage::Barrier { completion }
                     | LogMessage::Flush { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));
@@ -8741,7 +9178,8 @@ mod tests {
                             "injected ambiguous completion after durable write",
                         )));
                     }
-                    LogMessage::Flush { completion }
+                    LogMessage::Barrier { completion }
+                    | LogMessage::Flush { completion }
                     | LogMessage::SyncData { completion }
                     | LogMessage::Truncate { completion } => {
                         let _ = completion.send(Ok(()));

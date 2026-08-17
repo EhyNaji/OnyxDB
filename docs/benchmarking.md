@@ -13,6 +13,7 @@ cargo build --release --locked
 cargo run --release --locked -- --port 6380 --appendfsync everysec
 cargo run --release --locked --bin onyx-bench -- \
   --address 127.0.0.1:6380 \
+  --metrics-address 127.0.0.1:7380 \
   --label onyxdb \
   --workload mixed \
   --requests 1000000 \
@@ -26,6 +27,46 @@ cargo run --release --locked --bin onyx-bench -- \
 
 Run `onyx-bench --help` for the complete option list. Use `--output json` for a
 machine-readable report.
+
+## Server observability
+
+Pass `--metrics-address` to capture the OnyxDB Prometheus endpoint immediately
+before each measured run and again after the commit coordinator and automatic
+compaction become quiescent. Metrics sampling and the bounded quiescence wait
+are outside the measured elapsed time. Human reports summarize commit groups,
+logical batches, physical binlog appends, records per append, compaction time,
+queue wait, and queue high-water. JSON methodology version 2 includes complete
+`before`, `after`, and monotonic-counter `delta` maps for deeper analysis.
+
+The option is deliberately explicit. A benchmark without `--metrics-address`
+does not contact a metrics endpoint and retains the same traffic shape as the
+original methodology. OnyxDB exposes metrics without authentication, so only
+target a trusted interface.
+
+### Compaction workload
+
+Use enough committed mutations to cross the 100,000-record automatic
+compaction threshold. Keep short and long cases separate so normal commit-path
+latency is not confused with snapshot pauses. For example:
+
+```bash
+cargo run --release --locked --bin onyx-bench -- \
+  --address 127.0.0.1:6380 \
+  --metrics-address 127.0.0.1:7380 \
+  --label onyxdb-compaction \
+  --workload set \
+  --requests 600000 \
+  --warmup 100000 \
+  --concurrency 20 \
+  --pipeline 32 \
+  --keyspace 100000 \
+  --payload-size 64 \
+  --repeats 3
+```
+
+Report commit latency percentiles together with compaction count, total and
+maximum duration, and the barrier, snapshot-capture, snapshot-write, and
+rotation phase counters. Dataset cardinality materially changes snapshot cost.
 
 ## Workloads
 
@@ -58,7 +99,10 @@ The benchmark performs these stages:
 6. For each repeat, establish fresh worker connections, start the timer, submit
    the requested operations, consume every response, and stop the timer after
    all workers complete.
-7. Delete the benchmark keyspace outside the measurement.
+7. When server metrics are enabled, wait for coordinator and automatic
+   compaction quiescence and capture the second metrics sample outside the
+   measurement.
+8. Delete the benchmark keyspace outside the measurement.
 
 Throughput is completed responses divided by measured wall-clock time. A run is
 unsuccessful when a response has the wrong type, the server returns an error, a

@@ -1,9 +1,12 @@
 use onyxdb::client::{MAX_PIPELINE_BYTES, MAX_PIPELINE_COMMANDS, RESPResponse, RespClient};
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 const DEFAULT_REQUESTS: usize = 100_000;
 const DEFAULT_WARMUP_REQUESTS: usize = 10_000;
@@ -18,6 +21,8 @@ const MAX_KEYSPACE: usize = 1_000_000;
 const MAX_PAYLOAD_SIZE: usize = 8 * 1024 * 1024 - 1024;
 const MAX_REPEATS: usize = 100;
 const SETUP_PIPELINE: usize = 256;
+const MAX_METRICS_RESPONSE_BYTES: u64 = 1024 * 1024;
+const METRICS_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Workload {
@@ -86,6 +91,7 @@ struct BenchmarkConfig {
     output: OutputFormat,
     key_prefix: String,
     keep_data: bool,
+    metrics_address: Option<String>,
 }
 
 impl Default for BenchmarkConfig {
@@ -108,6 +114,7 @@ impl Default for BenchmarkConfig {
             output: OutputFormat::Human,
             key_prefix: format!("onyxbench:{}:{timestamp}", std::process::id()),
             keep_data: false,
+            metrics_address: None,
         }
     }
 }
@@ -146,6 +153,7 @@ impl BenchmarkConfig {
                     };
                 }
                 "--key-prefix" => config.key_prefix = value()?.clone(),
+                "--metrics-address" => config.metrics_address = Some(value()?.clone()),
                 "--keep-data" => {
                     config.keep_data = true;
                     index += 1;
@@ -181,6 +189,13 @@ impl BenchmarkConfig {
         }
         if self.address.len() > 1024 {
             return Err("address must not exceed 1024 bytes".into());
+        }
+        if self
+            .metrics_address
+            .as_ref()
+            .is_some_and(|address| address.is_empty() || address.len() > 1024)
+        {
+            return Err("metrics-address must contain between 1 and 1024 bytes".into());
         }
         if self.key_prefix.is_empty() {
             return Err("key-prefix must not be empty".into());
@@ -242,6 +257,153 @@ fn authentication_from_environment() -> Result<Option<Authentication>, String> {
         (username, Some(password)) => Ok(Some(Authentication { username, password })),
         (None, None) => Ok(None),
     }
+}
+
+#[derive(Clone, Debug)]
+struct ServerMetricsWindow {
+    before: BTreeMap<String, f64>,
+    after: BTreeMap<String, f64>,
+    delta: BTreeMap<String, f64>,
+    quiescence_wait: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct ServerMetricsSnapshot {
+    samples: BTreeMap<String, f64>,
+    counters: BTreeSet<String>,
+}
+
+impl ServerMetricsWindow {
+    fn new(
+        before: ServerMetricsSnapshot,
+        after: ServerMetricsSnapshot,
+        quiescence_wait: Duration,
+    ) -> Self {
+        let delta = after
+            .samples
+            .iter()
+            .filter_map(|(name, after_value)| {
+                if !after.counters.contains(name) {
+                    return None;
+                }
+                before
+                    .samples
+                    .get(name)
+                    .filter(|before_value| after_value >= *before_value)
+                    .map(|before_value| (name.clone(), after_value - before_value))
+            })
+            .collect();
+        Self {
+            before: before.samples,
+            after: after.samples,
+            delta,
+            quiescence_wait,
+        }
+    }
+
+    fn delta(&self, name: &str) -> f64 {
+        self.delta.get(name).copied().unwrap_or(0.0)
+    }
+
+    fn after(&self, name: &str) -> f64 {
+        self.after.get(name).copied().unwrap_or(0.0)
+    }
+}
+
+async fn fetch_server_metrics(
+    address: &str,
+) -> Result<ServerMetricsSnapshot, Box<dyn Error + Send + Sync>> {
+    let mut stream = TcpStream::connect(address).await?;
+    stream
+        .write_all(
+            format!("GET /metrics HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+    stream.flush().await?;
+    let mut response = Vec::new();
+    stream
+        .take(MAX_METRICS_RESPONSE_BYTES + 1)
+        .read_to_end(&mut response)
+        .await?;
+    if response.len() as u64 > MAX_METRICS_RESPONSE_BYTES {
+        return Err("metrics response exceeds the benchmark safety limit".into());
+    }
+    let response = std::str::from_utf8(&response)?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or("metrics response is missing the HTTP header boundary")?;
+    if !headers.starts_with("HTTP/1.1 200 ") {
+        return Err(format!(
+            "metrics endpoint returned an unsuccessful response: {}",
+            headers.lines().next().unwrap_or("missing status line")
+        )
+        .into());
+    }
+
+    let mut metrics = BTreeMap::new();
+    let mut counters = BTreeSet::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(declaration) = line.strip_prefix("# TYPE ") {
+            let mut fields = declaration.split_whitespace();
+            let name = fields.next().ok_or("metrics type is missing its name")?;
+            let metric_type = fields.next().ok_or("metrics type is missing its value")?;
+            if fields.next().is_some() {
+                return Err(format!("invalid metrics type declaration: {line}").into());
+            }
+            if metric_type == "counter" {
+                counters.insert(name.to_string());
+            }
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let name = fields.next().ok_or("metrics sample is missing its name")?;
+        let value = fields.next().ok_or("metrics sample is missing its value")?;
+        if fields.next().is_some() {
+            return Err(format!("unsupported metrics sample: {line}").into());
+        }
+        metrics.insert(name.to_string(), value.parse::<f64>()?);
+    }
+    if metrics.is_empty() {
+        return Err("metrics endpoint returned no samples".into());
+    }
+    Ok(ServerMetricsSnapshot {
+        samples: metrics,
+        counters,
+    })
+}
+
+async fn fetch_quiescent_server_metrics(
+    address: &str,
+) -> Result<(ServerMetricsSnapshot, Duration), Box<dyn Error + Send + Sync>> {
+    let started_at = Instant::now();
+    tokio::time::timeout(METRICS_QUIESCENCE_TIMEOUT, async {
+        loop {
+            let metrics = fetch_server_metrics(address).await?;
+            if server_metrics_are_quiescent(&metrics) {
+                return Ok(metrics);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| "server metrics did not become quiescent before the timeout")?
+    .map(|metrics| (metrics, started_at.elapsed()))
+}
+
+fn server_metrics_are_quiescent(metrics: &ServerMetricsSnapshot) -> bool {
+    [
+        "onyxdb_commit_queue_depth",
+        "onyxdb_commit_groups_in_progress",
+        "onyxdb_compaction_pending",
+        "onyxdb_compaction_in_progress",
+    ]
+    .iter()
+    .all(|name| metrics.samples.get(*name).copied().unwrap_or(0.0) == 0.0)
 }
 
 async fn connect_client(
@@ -482,6 +644,7 @@ struct RunResult {
     errors: usize,
     transport_errors: usize,
     latency_nanoseconds: Vec<u64>,
+    server_metrics: Option<ServerMetricsWindow>,
 }
 
 impl RunResult {
@@ -509,6 +672,7 @@ async fn run_phase(
             errors: 0,
             transport_errors: 0,
             latency_nanoseconds: Vec::new(),
+            server_metrics: None,
         });
     }
     let worker_count = data.config.concurrency.min(requests);
@@ -546,6 +710,7 @@ async fn run_phase(
         } else {
             Vec::new()
         },
+        server_metrics: None,
     };
     for handle in handles {
         let worker = handle.await?;
@@ -585,6 +750,7 @@ fn print_usage() {
          --repeats <count>           Number of measured runs\n\
          --output <human|json>       Report format\n\
          --key-prefix <prefix>       Explicit dataset prefix\n\
+         --metrics-address <host:port> Capture OnyxDB operational metrics per run\n\
          --keep-data                 Do not delete benchmark keys\n\
          \n\
          Authentication uses ONYXDB_BENCH_PASSWORD and optional ONYXDB_BENCH_USER."
@@ -592,7 +758,7 @@ fn print_usage() {
 }
 
 fn report_human(config: &BenchmarkConfig, authenticated: bool, results: &[RunResult]) {
-    println!("OnyxDB benchmark methodology v1");
+    println!("OnyxDB benchmark methodology v2");
     println!("Target: {} ({})", config.server_label, config.address);
     println!(
         "Environment: {} {} | logical CPUs: {} | benchmark version: {}",
@@ -629,6 +795,28 @@ fn report_human(config: &BenchmarkConfig, authenticated: bool, results: &[RunRes
             result.percentile_microseconds(99.0),
             result.percentile_microseconds(99.9),
         );
+        if let Some(metrics) = &result.server_metrics {
+            println!(
+                "  Server metrics: groups {:.0} | logical batches {:.0} | binlog appends {:.0} | records/append {:.2} | compactions {:.0} | compaction {:.3} s | compaction max {:.3} s | queue wait {:.3} s | queue max {:.0} | metrics settle {:.3} s",
+                metrics.delta("onyxdb_commit_groups_total"),
+                metrics.delta("onyxdb_commit_logical_batches_total"),
+                metrics.delta("onyxdb_binlog_append_accepted_total"),
+                {
+                    let appends = metrics.delta("onyxdb_binlog_append_accepted_total");
+                    if appends == 0.0 {
+                        0.0
+                    } else {
+                        metrics.delta("onyxdb_binlog_records_accepted_total") / appends
+                    }
+                },
+                metrics.delta("onyxdb_compaction_completed_total"),
+                metrics.delta("onyxdb_compaction_duration_seconds_total"),
+                metrics.after("onyxdb_compaction_duration_seconds_max"),
+                metrics.delta("onyxdb_commit_queue_wait_seconds_total"),
+                metrics.after("onyxdb_commit_queue_depth_max"),
+                metrics.quiescence_wait.as_secs_f64(),
+            );
+        }
     }
 }
 
@@ -637,6 +825,14 @@ fn report_json(config: &BenchmarkConfig, authenticated: bool, results: &[RunResu
         .iter()
         .enumerate()
         .map(|(index, result)| {
+            let server_metrics = result.server_metrics.as_ref().map(|metrics| {
+                json!({
+                    "before": metrics.before,
+                    "after": metrics.after,
+                    "delta": metrics.delta,
+                    "quiescence_wait_seconds": metrics.quiescence_wait.as_secs_f64(),
+                })
+            });
             json!({
                 "run": index + 1,
                 "elapsed_seconds": result.elapsed.as_secs_f64(),
@@ -650,12 +846,13 @@ fn report_json(config: &BenchmarkConfig, authenticated: bool, results: &[RunResu
                     "p95": result.percentile_microseconds(95.0),
                     "p99": result.percentile_microseconds(99.0),
                     "p99_9": result.percentile_microseconds(99.9),
-                }
+                },
+                "server_metrics": server_metrics,
             })
         })
         .collect::<Vec<_>>();
     let report = json!({
-        "methodology_version": 1,
+        "methodology_version": 2,
         "target": {"label": config.server_label, "address": config.address},
         "environment": {
             "os": std::env::consts::OS,
@@ -676,6 +873,8 @@ fn report_json(config: &BenchmarkConfig, authenticated: bool, results: &[RunResu
             "authenticated": authenticated,
             "key_prefix": config.key_prefix,
             "keep_data": config.keep_data,
+            "metrics_address": config.metrics_address,
+            "metrics_sampling": "before the measured phase and after coordinator/compaction quiescence; sampling and quiescence wait are excluded from measured elapsed time",
             "latency_definition": "client-observed response completion from pipeline batch submission",
         },
         "runs": runs,
@@ -719,16 +918,23 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let mut results = Vec::with_capacity(config.repeats);
     for repeat in 0..config.repeats {
-        results.push(
-            run_phase(
-                &data,
-                authentication.as_ref(),
-                config.requests,
-                repeat.saturating_mul(config.requests),
-                true,
-            )
-            .await?,
-        );
+        let metrics_before = match config.metrics_address.as_deref() {
+            Some(address) => Some(fetch_quiescent_server_metrics(address).await?.0),
+            None => None,
+        };
+        let mut result = run_phase(
+            &data,
+            authentication.as_ref(),
+            config.requests,
+            repeat.saturating_mul(config.requests),
+            true,
+        )
+        .await?;
+        if let (Some(address), Some(before)) = (config.metrics_address.as_deref(), metrics_before) {
+            let (after, quiescence_wait) = fetch_quiescent_server_metrics(address).await?;
+            result.server_metrics = Some(ServerMetricsWindow::new(before, after, quiescence_wait));
+        }
+        results.push(result);
     }
     cleanup_dataset(&data, authentication.as_ref()).await?;
 
@@ -782,6 +988,8 @@ mod tests {
             "json",
             "--key-prefix",
             "controlled",
+            "--metrics-address",
+            "127.0.0.1:7380",
             "--keep-data",
         ]))
         .unwrap();
@@ -789,6 +997,7 @@ mod tests {
         assert_eq!(config.pipeline, 16);
         assert_eq!(config.output, OutputFormat::Json);
         assert!(config.keep_data);
+        assert_eq!(config.metrics_address.as_deref(), Some("127.0.0.1:7380"));
 
         for invalid in [
             arguments(&["onyx-bench", "--requests", "0"]),
@@ -840,6 +1049,28 @@ mod tests {
     }
 
     #[test]
+    fn server_metrics_quiescence_includes_an_active_commit_group() {
+        let mut samples = BTreeMap::from([
+            ("onyxdb_commit_queue_depth".to_string(), 0.0),
+            ("onyxdb_commit_groups_in_progress".to_string(), 1.0),
+            ("onyxdb_compaction_pending".to_string(), 0.0),
+            ("onyxdb_compaction_in_progress".to_string(), 0.0),
+        ]);
+        let metrics = ServerMetricsSnapshot {
+            samples: samples.clone(),
+            counters: BTreeSet::new(),
+        };
+        assert!(!server_metrics_are_quiescent(&metrics));
+
+        samples.insert("onyxdb_commit_groups_in_progress".to_string(), 0.0);
+        let metrics = ServerMetricsSnapshot {
+            samples,
+            counters: BTreeSet::new(),
+        };
+        assert!(server_metrics_are_quiescent(&metrics));
+    }
+
+    #[test]
     fn string_write_workloads_reject_zero_sized_payloads() {
         let error = BenchmarkConfig::parse(&arguments(&[
             "onyx-bench",
@@ -853,5 +1084,29 @@ mod tests {
             error,
             "payload-size must be at least 1 for set and mixed workloads"
         );
+    }
+
+    #[test]
+    fn server_metric_windows_delta_only_monotonic_counters() {
+        let before = ServerMetricsSnapshot {
+            samples: BTreeMap::from([
+                ("counter".to_string(), 4.0),
+                ("keys_total".to_string(), 8.0),
+            ]),
+            counters: BTreeSet::from(["counter".to_string()]),
+        };
+        let after = ServerMetricsSnapshot {
+            samples: BTreeMap::from([
+                ("counter".to_string(), 9.0),
+                ("keys_total".to_string(), 12.0),
+            ]),
+            counters: BTreeSet::from(["counter".to_string()]),
+        };
+
+        let window = ServerMetricsWindow::new(before, after, Duration::from_millis(5));
+
+        assert_eq!(window.delta("counter"), 5.0);
+        assert!(!window.delta.contains_key("keys_total"));
+        assert_eq!(window.after("keys_total"), 12.0);
     }
 }

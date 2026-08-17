@@ -101,6 +101,8 @@ fn benchmark_runs_against_the_real_server_and_emits_machine_readable_results() {
             "json",
             "--key-prefix",
             "tooling-smoke",
+            "--metrics-address",
+            &format!("127.0.0.1:{}", port + 1000),
         ])
         .stdin(Stdio::null())
         .output()
@@ -111,7 +113,7 @@ fn benchmark_runs_against_the_real_server_and_emits_machine_readable_results() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["methodology_version"], 1);
+    assert_eq!(report["methodology_version"], 2);
     assert_eq!(report["configuration"]["workload"], "mixed");
     assert_eq!(report["runs"][0]["requested"], 40);
     assert_eq!(report["runs"][0]["completed"], 40);
@@ -122,5 +124,22 @@ fn benchmark_runs_against_the_real_server_and_emits_machine_readable_results() {
             .as_f64()
             .unwrap()
             > 0.0
+    );
+    assert!(
+        report["runs"][0]["server_metrics"]["delta"]["onyxdb_commit_groups_total"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        report["runs"][0]["server_metrics"]["delta"]["onyxdb_binlog_append_accepted_total"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        report["runs"][0]["server_metrics"]["delta"]
+            .get("onyxdb_keys_total")
+            .is_none()
     );
 }
