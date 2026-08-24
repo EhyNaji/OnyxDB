@@ -111,6 +111,5 @@ tradeoff observable and bounds generation growth.
   large mutation records can still make byte growth outpace the record count.
 - Slow storage can intentionally delay admission after the preflush byte budget
   is exhausted. Metrics distinguish this backpressure from boundary hold time.
-- A future immutable-generation rollover protocol could further reduce final
-  predecessor synchronization, but it must preserve the durable cross-
-  generation prefix and is not implied by this decision.
+- ADR 0003 adds independent byte-triggered generation rollover while preserving
+  the durable cross-generation prefix defined here.

@@ -23,6 +23,10 @@ process memory.
 OnyxDB uses immutable, self-validating binlog segments plus one active
 `onyx.binlog` file.
 
+ADR 0003 later separates generation rollover from full snapshot installation;
+the crash and recovery rules in this decision remain authoritative for both
+paths.
+
 Before acquiring the commit boundary, compaction preflushes the active file
 through a separate handle while commits continue. While holding the complete
 boundary, it flushes and synchronizes the remaining delta, renames a non-empty active file to

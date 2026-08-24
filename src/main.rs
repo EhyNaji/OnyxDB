@@ -2037,6 +2037,55 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
     );
     push_metric(
         &mut output,
+        "onyxdb_binlog_active_generation_bytes",
+        "Framed ONX4 bytes currently retained in the active binlog generation",
+        "gauge",
+        persistence.active_binlog_bytes(),
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_generation_target_bytes",
+        "Active-generation byte threshold for automatic rollover",
+        "gauge",
+        BINLOG_GENERATION_TARGET_BYTES,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_generation_admission_limit_bytes",
+        "Pending-rollover admission limit before one bounded in-flight group overshoot",
+        "gauge",
+        BINLOG_GENERATION_ADMISSION_LIMIT_BYTES,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_rollover_backpressure_active",
+        "1 while commit admission is stopped at the pending-rollover byte limit",
+        "gauge",
+        u8::from(persistence.rollover_backpressure_active()),
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_unsnapshotted_segments",
+        "Immutable binlog segments not yet covered by the installed snapshot",
+        "gauge",
+        persistence.unsnapshotted_segment_count(),
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_unsnapshotted_segment_limit",
+        "Segment-count threshold that forces snapshot compaction before the recovery limit",
+        "gauge",
+        MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_rollover_pending",
+        "1 when automatic active-generation rollover is scheduled or active",
+        "gauge",
+        u8::from(persistence.rollover_pending.load(Ordering::Relaxed)),
+    );
+    push_metric(
+        &mut output,
         "onyxdb_compaction_preflush_write_budget_active",
         "1 while preflush growth is subject to commit-path byte budgeting",
         "gauge",
@@ -2077,6 +2126,48 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
     ] {
         push_metric(&mut output, name, help, metric_type, value);
     }
+    for (name, help, metric_type, value) in [
+        (
+            "onyxdb_binlog_rollover_attempts_total",
+            "Independent active-generation rollover attempts started",
+            "counter",
+            compaction.rollover_attempts_total,
+        ),
+        (
+            "onyxdb_binlog_rollover_completed_total",
+            "Independent active-generation rollovers completed",
+            "counter",
+            compaction.rollover_completed_total,
+        ),
+        (
+            "onyxdb_binlog_rollover_failed_total",
+            "Independent active-generation rollovers that failed or were interrupted",
+            "counter",
+            compaction.rollover_failed_total,
+        ),
+        (
+            "onyxdb_binlog_rollover_in_progress",
+            "Independent active-generation rollover attempts currently active",
+            "gauge",
+            compaction.rollover_in_progress,
+        ),
+    ] {
+        push_metric(&mut output, name, help, metric_type, value);
+    }
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_rollover_duration_seconds_total",
+        "Cumulative independent active-generation rollover duration",
+        "counter",
+        seconds(compaction.rollover_duration_nanoseconds_total),
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_rollover_duration_seconds_max",
+        "Longest independent active-generation rollover attempt",
+        "gauge",
+        seconds(compaction.rollover_duration_nanoseconds_max),
+    );
     for (name, help, metric_type, value) in [
         (
             "onyxdb_compaction_duration_seconds_total",
@@ -2146,7 +2237,7 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
         ),
         (
             "onyxdb_compaction_write_pause_seconds_total",
-            "Cumulative time authoritative commits were paused for generation sealing, snapshot capture, or final checkpointing",
+            "Cumulative time authoritative commits were paused for rollover, snapshot capture, or final checkpointing",
             "counter",
             seconds(compaction.write_pause_nanoseconds_total),
         ),
@@ -2309,7 +2400,7 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
     push_metric(
         &mut output,
         "onyxdb_compaction_sealed_binlog_bytes_total",
-        "Active binlog bytes moved into immutable segments across compactions",
+        "Active binlog bytes moved into immutable segments across rollover and snapshot attempts",
         "counter",
         compaction.sealed_bytes_total,
     );
@@ -2522,8 +2613,8 @@ async fn persist_and_publish_master_batch(
     persistence: &Persistence,
     sequence: u64,
     batch: &CommittedBatch,
-) -> Result<bool, PersistenceError> {
-    let should_compact = persistence
+) -> Result<MaintenanceRequest, PersistenceError> {
+    let maintenance = persistence
         .accept_next_batch(sequence, batch, COMPACTION_THRESHOLD)
         .await?;
     // The exact same committed batch is published to the backlog and live
@@ -2540,7 +2631,7 @@ async fn persist_and_publish_master_batch(
     }
     let _ = persistence.replica_tx.send((sequence, batch.clone()));
 
-    Ok(should_compact)
+    Ok(maintenance)
 }
 
 /// Persists one contiguous group of logical master mutations and publishes
@@ -2548,8 +2639,8 @@ async fn persist_and_publish_master_batch(
 async fn persist_and_publish_master_batches(
     persistence: &Persistence,
     batches: &[(u64, CommittedBatch)],
-) -> Result<bool, PersistenceError> {
-    let should_compact = persistence
+) -> Result<MaintenanceRequest, PersistenceError> {
+    let maintenance = persistence
         .accept_next_batches(batches, COMPACTION_THRESHOLD)
         .await?;
     {
@@ -2567,7 +2658,7 @@ async fn persist_and_publish_master_batches(
     for (sequence, batch) in batches {
         let _ = persistence.replica_tx.send((*sequence, batch.clone()));
     }
-    Ok(should_compact)
+    Ok(maintenance)
 }
 
 struct PersistenceCommitGuard {
@@ -2630,8 +2721,8 @@ async fn finalize_master_commit(
     let commit_guard =
         PersistenceCommitGuard::new(Arc::clone(&persistence), boundary, failure_context);
     let persistence_result = persist_and_publish_master_batch(&persistence, sequence, &batch).await;
-    let should_compact = match persistence_result {
-        Ok(should_compact) => should_compact,
+    let maintenance = match persistence_result {
+        Ok(maintenance) => maintenance,
         Err(error) => {
             if error.is_indeterminate() {
                 commit_guard.fail_stop(format!(
@@ -2651,7 +2742,7 @@ async fn finalize_master_commit(
     };
 
     commit_guard.release();
-    schedule_compaction(&store, &persistence, should_compact);
+    schedule_maintenance(&store, &persistence, maintenance);
     Ok(())
 }
 
@@ -2674,35 +2765,48 @@ async fn await_commit_finalizer(
     }
 }
 
-fn schedule_compaction(
+fn schedule_maintenance(
     store: &Arc<ShardedStore>,
     persistence: &Arc<Persistence>,
-    should_compact: bool,
+    maintenance: MaintenanceRequest,
 ) {
-    if !should_compact {
+    if maintenance.is_empty() {
         return;
     }
 
-    let store = Arc::clone(store);
-    let persistence = Arc::clone(persistence);
-    tokio::spawn(async move {
-        loop {
+    if maintenance.snapshot {
+        let store = Arc::clone(store);
+        let persistence = Arc::clone(persistence);
+        tokio::spawn(async move {
             let succeeded = match compact_store(&store, &persistence).await {
                 Ok(_) => true,
                 Err(error) => {
                     error!("Automatic compaction failed: {}", error);
-                    persistence.write_count.store(
-                        persistence.compaction_record_threshold(COMPACTION_THRESHOLD),
-                        Ordering::SeqCst,
-                    );
                     false
                 }
             };
-            if !persistence.finish_compaction_schedule_and_rearm(COMPACTION_THRESHOLD, succeeded) {
-                break;
-            }
-        }
-    });
+            let next =
+                persistence.finish_compaction_schedule_and_rearm(COMPACTION_THRESHOLD, succeeded);
+            schedule_maintenance(&store, &persistence, next);
+        });
+    }
+
+    if maintenance.rollover {
+        let store = Arc::clone(store);
+        let persistence = Arc::clone(persistence);
+        tokio::spawn(async move {
+            let succeeded = match persistence.commit_runtime.rollover_generation().await {
+                Ok(_) => true,
+                Err(error) => {
+                    error!("Automatic binlog generation rollover failed: {}", error);
+                    false
+                }
+            };
+            let next =
+                persistence.finish_rollover_schedule_and_rearm(COMPACTION_THRESHOLD, succeeded);
+            schedule_maintenance(&store, &persistence, next);
+        });
+    }
 }
 
 async fn persist_and_apply_replica_effect(
@@ -2741,11 +2845,11 @@ async fn persist_and_apply_replica_effect(
             boundary,
             "Replicated effect commit finalizer",
         );
-        let should_compact = match persistence_for_finalizer
+        let maintenance = match persistence_for_finalizer
             .accept_next_batch(sequence, &batch, COMPACTION_THRESHOLD)
             .await
         {
-            Ok(should_compact) => should_compact,
+            Ok(maintenance) => maintenance,
             Err(error) => {
                 if error.is_indeterminate() {
                     commit_guard.fail_stop(format!(
@@ -2767,7 +2871,7 @@ async fn persist_and_apply_replica_effect(
         };
         apply_committed_batch(&store, &batch);
         commit_guard.release();
-        schedule_compaction(&store, &persistence_for_finalizer, should_compact);
+        schedule_maintenance(&store, &persistence_for_finalizer, maintenance);
         Ok(())
     });
     await_commit_finalizer(persistence, finalizer).await
@@ -2815,6 +2919,7 @@ async fn install_full_sync(
         ));
     }
     let _compaction_guard = persistence.compaction_gate.lock().await;
+    let _rotation_guard = persistence.rotation_gate.lock().await;
     let boundary = persistence.acquire_commit_boundary().await;
     if persistence.promote_to_master.load(Ordering::SeqCst)
         || persistence.replica_lifecycle.stop_requested()
@@ -3632,9 +3737,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replication_ready: AtomicBool::new(recovered_replica_identity.is_some()),
         replica_lifecycle,
     });
-    persistence
-        .write_count
-        .store(recovery.replayed_records, Ordering::SeqCst);
+    persistence.restore_maintenance_state(
+        recovery.replayed_records,
+        recovery.active_binlog_bytes,
+        recovery.unsnapshotted_segment_count,
+    );
     persistence.set_compaction_entry_floor(store.stats().total_keys);
 
     persistence
@@ -3665,6 +3772,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let binlog_writer = Arc::clone(&binlog_shared);
     tokio::spawn(run_binlog_worker(rx, binlog_writer, policy));
+    let startup_maintenance = persistence.request_maintenance_if_needed(COMPACTION_THRESHOLD);
+    schedule_maintenance(&store, &persistence, startup_maintenance);
 
     if let Some(addr) = master_addr {
         IS_REPLICA.store(true, Ordering::Relaxed);
@@ -4795,6 +4904,9 @@ mod tests {
         assert!(body.contains("# TYPE onyxdb_keys_total gauge\n"));
         assert!(body.contains("onyxdb_commit_queue_depth 0\n"));
         assert!(body.contains("onyxdb_binlog_append_attempts_total 0\n"));
+        assert!(body.contains("onyxdb_binlog_active_generation_bytes 0\n"));
+        assert!(body.contains("onyxdb_binlog_rollover_completed_total 0\n"));
+        assert!(body.contains("onyxdb_binlog_unsnapshotted_segments 0\n"));
         assert!(body.contains("onyxdb_compaction_completed_total 0\n"));
         assert!(body.contains("onyxdb_compaction_preflushed_binlog_bytes_total 0\n"));
         assert!(body.contains("onyxdb_compaction_preflush_growth_bytes_total 0\n"));
@@ -6121,7 +6233,14 @@ mod tests {
             !install.is_finished(),
             "full synchronization crossed concurrent baseline-replacement ownership"
         );
+        let rotation_guard = persistence.rotation_gate.lock().await;
         drop(baseline_guard);
+        tokio::task::yield_now().await;
+        assert!(
+            !install.is_finished(),
+            "full synchronization crossed concurrent generation-rotation ownership"
+        );
+        drop(rotation_guard);
         install.await.unwrap().unwrap();
         assert!(!directory.paths.binlog_segment(1).exists());
         assert!(!directory.paths.binlog_segment(2).exists());

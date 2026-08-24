@@ -17,7 +17,23 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{error, info, warn};
 
 pub(crate) const COMPACTION_PREFLUSH_WRITE_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const BINLOG_GENERATION_TARGET_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const BINLOG_GENERATION_ADMISSION_LIMIT_BYTES: u64 =
+    BINLOG_GENERATION_TARGET_BYTES + COMPACTION_PREFLUSH_WRITE_BUDGET_BYTES;
+pub(crate) const MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS: usize = 256;
 const WRITE_BUDGET_OPEN: u64 = u64::MAX;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MaintenanceRequest {
+    pub(crate) snapshot: bool,
+    pub(crate) rollover: bool,
+}
+
+impl MaintenanceRequest {
+    pub(crate) fn is_empty(self) -> bool {
+        !self.snapshot && !self.rollover
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StorageFailureDisposition {
@@ -205,6 +221,12 @@ pub(crate) struct CompactionMetricsSnapshot {
     pub(crate) cleanup_files_total: u64,
     pub(crate) cleanup_bytes_total: u64,
     pub(crate) cleanup_failures_total: u64,
+    pub(crate) rollover_attempts_total: u64,
+    pub(crate) rollover_completed_total: u64,
+    pub(crate) rollover_failed_total: u64,
+    pub(crate) rollover_in_progress: u64,
+    pub(crate) rollover_duration_nanoseconds_total: u64,
+    pub(crate) rollover_duration_nanoseconds_max: u64,
 }
 
 #[derive(Default)]
@@ -257,6 +279,11 @@ struct CompactionMetrics {
     cleanup_files_total: AtomicU64,
     cleanup_bytes_total: AtomicU64,
     cleanup_failures_total: AtomicU64,
+    rollover_attempts_total: AtomicU64,
+    rollover_completed_total: AtomicU64,
+    rollover_failed_total: AtomicU64,
+    rollover_in_progress: AtomicU64,
+    rollover_duration: DurationMetric,
 }
 
 impl CompactionMetrics {
@@ -332,6 +359,15 @@ impl CompactionMetrics {
             cleanup_files_total: self.cleanup_files_total.load(Ordering::Relaxed),
             cleanup_bytes_total: self.cleanup_bytes_total.load(Ordering::Relaxed),
             cleanup_failures_total: self.cleanup_failures_total.load(Ordering::Relaxed),
+            rollover_attempts_total: self.rollover_attempts_total.load(Ordering::Relaxed),
+            rollover_completed_total: self.rollover_completed_total.load(Ordering::Relaxed),
+            rollover_failed_total: self.rollover_failed_total.load(Ordering::Relaxed),
+            rollover_in_progress: self.rollover_in_progress.load(Ordering::Relaxed),
+            rollover_duration_nanoseconds_total: self
+                .rollover_duration
+                .total
+                .load(Ordering::Relaxed),
+            rollover_duration_nanoseconds_max: self.rollover_duration.max.load(Ordering::Relaxed),
         }
     }
 
@@ -444,6 +480,60 @@ impl Drop for CompactionMeasurement<'_> {
     fn drop(&mut self) {
         if !self.finished {
             self.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
+            self.record_end();
+        }
+    }
+}
+
+struct RolloverMeasurement<'a> {
+    metrics: &'a CompactionMetrics,
+    started_at: Instant,
+    finished: bool,
+}
+
+impl<'a> RolloverMeasurement<'a> {
+    fn start(metrics: &'a CompactionMetrics) -> Self {
+        metrics
+            .rollover_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+        metrics.rollover_in_progress.fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics,
+            started_at: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, success: bool) {
+        self.finished = true;
+        if success {
+            self.metrics
+                .rollover_completed_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics
+                .rollover_failed_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_end();
+    }
+
+    fn record_end(&self) {
+        self.metrics
+            .rollover_in_progress
+            .fetch_sub(1, Ordering::Relaxed);
+        self.metrics
+            .rollover_duration
+            .observe(self.started_at.elapsed());
+    }
+}
+
+impl Drop for RolloverMeasurement<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.metrics
+                .rollover_failed_total
+                .fetch_add(1, Ordering::Relaxed);
             self.record_end();
         }
     }
@@ -788,10 +878,13 @@ pub(crate) struct CommitRuntime {
     pub(crate) binlog: BinlogHandle,
     pub(crate) write_count: AtomicUsize,
     accepted_binlog_bytes: AtomicU64,
+    active_binlog_bytes: AtomicU64,
+    unsnapshotted_segment_count: AtomicUsize,
     compaction_entry_floor: AtomicUsize,
     compaction_write_budget_limit: AtomicU64,
     compaction_write_budget_notify: Notify,
     pub(crate) compaction_pending: AtomicBool,
+    pub(crate) rollover_pending: AtomicBool,
     pub(crate) accepting_writes: AtomicBool,
     /// Readers hold a shared guard while observing state. Durable mutations and
     /// full-sync installation hold the exclusive guard. When both gates are
@@ -801,6 +894,10 @@ pub(crate) struct CommitRuntime {
     /// Serializes every snapshot/binlog baseline replacement, including
     /// automatic compaction, clean shutdown, and replica full synchronization.
     pub(crate) compaction_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes active-generation sealing and baseline destruction. Baseline
+    /// replacement takes `compaction_gate` before this gate; rollover takes
+    /// only this gate and may proceed while a captured snapshot is written.
+    pub(crate) rotation_gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) paths: super::PersistencePaths,
     /// Last sequence durably accepted and made authoritative in live state.
     repl_offset: AtomicU64,
@@ -850,14 +947,18 @@ impl CommitRuntime {
             binlog,
             write_count: AtomicUsize::new(0),
             accepted_binlog_bytes: AtomicU64::new(0),
+            active_binlog_bytes: AtomicU64::new(0),
+            unsnapshotted_segment_count: AtomicUsize::new(0),
             compaction_entry_floor: AtomicUsize::new(0),
             compaction_write_budget_limit: AtomicU64::new(WRITE_BUDGET_OPEN),
             compaction_write_budget_notify: Notify::new(),
             compaction_pending: AtomicBool::new(false),
+            rollover_pending: AtomicBool::new(false),
             accepting_writes: AtomicBool::new(true),
             visibility_gate: Arc::new(tokio::sync::RwLock::new(())),
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
             compaction_gate: Arc::new(tokio::sync::Mutex::new(())),
+            rotation_gate: Arc::new(tokio::sync::Mutex::new(())),
             paths,
             repl_offset: AtomicU64::new(initial_sequence),
             failure: std::sync::Mutex::new(None),
@@ -869,11 +970,40 @@ impl CommitRuntime {
         }
     }
 
-    fn record_persisted_write(&self, compaction_threshold: usize) -> bool {
-        self.write_count.fetch_add(1, Ordering::SeqCst) + 1
+    fn record_persisted_writes(
+        &self,
+        count: usize,
+        compaction_threshold: usize,
+    ) -> MaintenanceRequest {
+        self.write_count.fetch_add(count, Ordering::SeqCst);
+        self.request_maintenance_if_needed(compaction_threshold)
+    }
+
+    pub(crate) fn request_maintenance_if_needed(
+        &self,
+        compaction_threshold: usize,
+    ) -> MaintenanceRequest {
+        MaintenanceRequest {
+            snapshot: self.request_snapshot_if_needed(compaction_threshold),
+            rollover: self.request_rollover_if_needed(),
+        }
+    }
+
+    fn request_snapshot_if_needed(&self, compaction_threshold: usize) -> bool {
+        (self.write_count.load(Ordering::SeqCst)
             >= self.compaction_record_threshold(compaction_threshold)
+            || self.unsnapshotted_segment_count.load(Ordering::SeqCst)
+                >= MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS)
             && self
                 .compaction_pending
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+    }
+
+    fn request_rollover_if_needed(&self) -> bool {
+        self.active_binlog_bytes.load(Ordering::SeqCst) >= BINLOG_GENERATION_TARGET_BYTES
+            && self
+                .rollover_pending
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
     }
@@ -886,15 +1016,33 @@ impl CommitRuntime {
         &self,
         compaction_threshold: usize,
         retry_immediately: bool,
-    ) -> bool {
-        let compaction_threshold = self.compaction_record_threshold(compaction_threshold);
+    ) -> MaintenanceRequest {
         self.compaction_pending.store(false, Ordering::SeqCst);
-        retry_immediately
-            && self.write_count.load(Ordering::SeqCst) >= compaction_threshold
-            && self
-                .compaction_pending
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
+        if retry_immediately {
+            self.request_maintenance_if_needed(compaction_threshold)
+        } else {
+            MaintenanceRequest {
+                snapshot: false,
+                rollover: self.request_rollover_if_needed(),
+            }
+        }
+    }
+
+    pub(crate) fn finish_rollover_schedule_and_rearm(
+        &self,
+        compaction_threshold: usize,
+        retry_immediately: bool,
+    ) -> MaintenanceRequest {
+        self.rollover_pending.store(false, Ordering::SeqCst);
+        self.compaction_write_budget_notify.notify_waiters();
+        if retry_immediately {
+            self.request_maintenance_if_needed(compaction_threshold)
+        } else {
+            MaintenanceRequest {
+                snapshot: self.request_snapshot_if_needed(compaction_threshold),
+                rollover: false,
+            }
+        }
     }
 
     pub(crate) fn sequence(&self) -> u64 {
@@ -907,6 +1055,32 @@ impl CommitRuntime {
 
     pub(crate) fn compaction_write_budget_active(&self) -> bool {
         self.compaction_write_budget_limit.load(Ordering::SeqCst) != WRITE_BUDGET_OPEN
+    }
+
+    pub(crate) fn active_binlog_bytes(&self) -> u64 {
+        self.active_binlog_bytes.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn rollover_backpressure_active(&self) -> bool {
+        self.rollover_pending.load(Ordering::SeqCst)
+            && self.active_binlog_bytes() >= BINLOG_GENERATION_ADMISSION_LIMIT_BYTES
+    }
+
+    pub(crate) fn unsnapshotted_segment_count(&self) -> usize {
+        self.unsnapshotted_segment_count.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn restore_maintenance_state(
+        &self,
+        replayed_records: usize,
+        active_binlog_bytes: u64,
+        unsnapshotted_segment_count: usize,
+    ) {
+        self.write_count.store(replayed_records, Ordering::SeqCst);
+        self.active_binlog_bytes
+            .store(active_binlog_bytes, Ordering::SeqCst);
+        self.unsnapshotted_segment_count
+            .store(unsnapshotted_segment_count, Ordering::SeqCst);
     }
 
     pub(crate) fn set_compaction_entry_floor(&self, entry_count: usize) {
@@ -925,11 +1099,17 @@ impl CommitRuntime {
                 Some(current.saturating_add(accepted_bytes))
             })
             .expect("accepted binlog byte accounting cannot fail");
+        self.active_binlog_bytes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_add(accepted_bytes))
+            })
+            .expect("active binlog byte accounting cannot fail");
     }
 
     fn compaction_write_budget_allows_progress(&self) -> bool {
         let limit = self.compaction_write_budget_limit.load(Ordering::SeqCst);
-        limit == WRITE_BUDGET_OPEN || self.binlog_accepted_bytes() < limit
+        (limit == WRITE_BUDGET_OPEN || self.binlog_accepted_bytes() < limit)
+            && !self.rollover_backpressure_active()
     }
 
     async fn wait_for_compaction_write_budget(&self) {
@@ -984,7 +1164,7 @@ impl CommitRuntime {
         sequence: u64,
         batch: &CommittedBatch,
         compaction_threshold: usize,
-    ) -> Result<bool, PersistenceError> {
+    ) -> Result<MaintenanceRequest, PersistenceError> {
         let expected = self.next_sequence()?;
         if sequence != expected {
             return Err(PersistenceError::new(format!(
@@ -995,7 +1175,7 @@ impl CommitRuntime {
         let accepted_bytes = self.binlog.append_batch(sequence, batch).await?;
         self.record_accepted_binlog_bytes(accepted_bytes);
         self.repl_offset.store(sequence, Ordering::SeqCst);
-        Ok(self.record_persisted_write(compaction_threshold))
+        Ok(self.record_persisted_writes(1, compaction_threshold))
     }
 
     /// Accepts a contiguous logical sequence group through one storage outcome.
@@ -1005,7 +1185,7 @@ impl CommitRuntime {
         &self,
         batches: &[(u64, CommittedBatch)],
         compaction_threshold: usize,
-    ) -> Result<bool, PersistenceError> {
+    ) -> Result<MaintenanceRequest, PersistenceError> {
         if batches.is_empty() {
             return Err(PersistenceError::new(
                 "A persistence group must contain at least one committed batch",
@@ -1034,17 +1214,15 @@ impl CommitRuntime {
             .0;
         self.repl_offset.store(last_sequence, Ordering::SeqCst);
 
-        let mut should_compact = false;
-        for _ in batches {
-            should_compact |= self.record_persisted_write(compaction_threshold);
-        }
-        Ok(should_compact)
+        Ok(self.record_persisted_writes(batches.len(), compaction_threshold))
     }
 
     pub(crate) fn install_baseline(&self, sequence: u64, entry_count: usize) {
         self.repl_offset.store(sequence, Ordering::SeqCst);
         self.write_count.store(0, Ordering::SeqCst);
         self.accepted_binlog_bytes.store(0, Ordering::SeqCst);
+        self.active_binlog_bytes.store(0, Ordering::SeqCst);
+        self.unsnapshotted_segment_count.store(0, Ordering::SeqCst);
         self.set_compaction_entry_floor(entry_count);
     }
 
@@ -1137,6 +1315,131 @@ impl CommitRuntime {
         }
     }
 
+    pub(crate) async fn rollover_generation(self: &Arc<Self>) -> Result<u64, PersistenceError> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            let worker_runtime = Arc::clone(&runtime);
+            let worker =
+                tokio::spawn(async move { worker_runtime.rollover_generation_owned().await });
+            let result = match worker.await {
+                Ok(result) => result,
+                Err(error) => {
+                    let failure = PersistenceError::indeterminate(format!(
+                        "Binlog generation rollover task was interrupted: {}",
+                        error
+                    ));
+                    if !runtime.is_fail_stopped() {
+                        runtime.enter_fail_stop(failure.to_string()).await;
+                    }
+                    Err(failure)
+                }
+            };
+            let _ = completion_tx.send(result);
+        });
+        match completion_rx.await {
+            Ok(result) => result,
+            Err(_) => {
+                let failure = PersistenceError::indeterminate(
+                    "Binlog generation rollover supervisor dropped the outcome",
+                );
+                if !self.is_fail_stopped() {
+                    self.enter_fail_stop(failure.to_string()).await;
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    async fn rollover_generation_owned(self: Arc<Self>) -> Result<u64, PersistenceError> {
+        let measurement = RolloverMeasurement::start(&self.compaction_metrics);
+        let _rotation_guard = self.rotation_gate.lock().await;
+        if self.active_binlog_bytes() == 0 {
+            let watermark = self.sequence();
+            measurement.finish(true);
+            return Ok(watermark);
+        }
+        let write_budget = self.activate_compaction_write_budget();
+
+        let preflush_started = Instant::now();
+        let preflush_paths = self.paths.clone();
+        let preflushed_bytes =
+            match tokio::task::spawn_blocking(move || preflush_active_generation(&preflush_paths))
+                .await
+            {
+                Ok(Ok(preflushed_bytes)) => preflushed_bytes,
+                Ok(Err(error)) => {
+                    self.compaction_metrics
+                        .observe_preflush(0, preflush_started.elapsed());
+                    measurement.finish(false);
+                    return Err(error_with_context(
+                        error,
+                        "Active binlog generation preflush failed",
+                    ));
+                }
+                Err(error) => {
+                    self.compaction_metrics
+                        .observe_preflush(0, preflush_started.elapsed());
+                    measurement.finish(false);
+                    return Err(PersistenceError::new(format!(
+                        "Active binlog generation preflush task failed: {error}"
+                    )));
+                }
+            };
+        self.compaction_metrics
+            .observe_preflush(preflushed_bytes, preflush_started.elapsed());
+
+        let gate_started = Instant::now();
+        let boundary = self.acquire_compaction_boundary().await;
+        self.compaction_metrics
+            .gate_wait
+            .observe(gate_started.elapsed());
+        let pause_started = Instant::now();
+        let watermark = self.sequence();
+        let rotation_started = Instant::now();
+        let sealed_bytes = match self.binlog.seal_active(watermark).await {
+            Ok(sealed_bytes) => sealed_bytes,
+            Err(error) => {
+                self.compaction_metrics
+                    .rotation
+                    .observe(rotation_started.elapsed());
+                self.compaction_metrics
+                    .write_pause
+                    .observe(pause_started.elapsed());
+                let error = error_with_context(error, "Binlog generation rollover failed");
+                if error.is_indeterminate() {
+                    self.enter_fail_stop_with_boundary(boundary, error.to_string());
+                } else {
+                    drop(boundary);
+                }
+                measurement.finish(false);
+                return Err(error);
+            }
+        };
+        self.compaction_metrics
+            .rotation
+            .observe(rotation_started.elapsed());
+        self.compaction_metrics.observe_sealed_bytes(sealed_bytes);
+        self.compaction_metrics
+            .observe_preflush_growth(sealed_bytes.saturating_sub(preflushed_bytes));
+        self.active_binlog_bytes.store(0, Ordering::SeqCst);
+        if sealed_bytes > 0 {
+            self.unsnapshotted_segment_count
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        self.compaction_metrics
+            .write_pause
+            .observe(pause_started.elapsed());
+        drop(boundary);
+        write_budget.release();
+        info!(
+            "Binlog generation rollover complete at sequence {}: {} bytes sealed",
+            watermark, sealed_bytes
+        );
+        measurement.finish(true);
+        Ok(watermark)
+    }
+
     pub(crate) async fn compact(
         self: &Arc<Self>,
         store: &Arc<ShardedStore>,
@@ -1206,6 +1509,7 @@ impl CommitRuntime {
         self.compaction_metrics
             .serialization_wait
             .observe(serialization_started.elapsed());
+        let _rotation_guard = self.rotation_gate.lock().await;
         let write_budget = self.activate_compaction_write_budget();
 
         let preflush_started = Instant::now();
@@ -1267,16 +1571,23 @@ impl CommitRuntime {
             .rotation
             .observe(rotation_started.elapsed());
         self.compaction_metrics.observe_sealed_bytes(sealed_bytes);
+        self.active_binlog_bytes.store(0, Ordering::SeqCst);
+        if sealed_bytes > 0 {
+            self.unsnapshotted_segment_count
+                .fetch_add(1, Ordering::SeqCst);
+        }
         self.compaction_metrics
             .observe_preflush_growth(sealed_bytes.saturating_sub(preflushed_bytes));
 
         let compacted_write_count = self.write_count.load(Ordering::SeqCst);
+        let compacted_segment_count = self.unsnapshotted_segment_count.load(Ordering::SeqCst);
         let capture_started = Instant::now();
         let snapshot = store.begin_snapshot();
         self.compaction_metrics
             .snapshot_capture
             .observe(capture_started.elapsed());
         drop(boundary);
+        drop(_rotation_guard);
         write_budget.release();
         self.compaction_metrics
             .write_pause
@@ -1374,6 +1685,11 @@ impl CommitRuntime {
                 Some(count.saturating_sub(compacted_write_count))
             })
             .expect("compaction write-count update cannot fail");
+        self.unsnapshotted_segment_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                Some(count.saturating_sub(compacted_segment_count))
+            })
+            .expect("compaction segment-count update cannot fail");
         self.set_compaction_entry_floor(snapshot_entry_count);
         self.compaction_metrics
             .write_pause
@@ -2177,16 +2493,28 @@ mod tests {
         runtime.compaction_pending.store(true, Ordering::SeqCst);
         runtime.write_count.store(11, Ordering::SeqCst);
 
-        assert!(runtime.finish_compaction_schedule_and_rearm(10, true));
+        assert!(
+            runtime
+                .finish_compaction_schedule_and_rearm(10, true)
+                .snapshot
+        );
         assert!(runtime.compaction_pending.load(Ordering::SeqCst));
 
         runtime.write_count.store(9, Ordering::SeqCst);
-        assert!(!runtime.finish_compaction_schedule_and_rearm(10, true));
+        assert!(
+            runtime
+                .finish_compaction_schedule_and_rearm(10, true)
+                .is_empty()
+        );
         assert!(!runtime.compaction_pending.load(Ordering::SeqCst));
 
         runtime.compaction_pending.store(true, Ordering::SeqCst);
         runtime.write_count.store(10, Ordering::SeqCst);
-        assert!(!runtime.finish_compaction_schedule_and_rearm(10, false));
+        assert!(
+            runtime
+                .finish_compaction_schedule_and_rearm(10, false)
+                .is_empty()
+        );
         assert!(!runtime.compaction_pending.load(Ordering::SeqCst));
     }
 
@@ -2198,10 +2526,57 @@ mod tests {
         runtime.set_compaction_entry_floor(250);
 
         for _ in 0..249 {
-            assert!(!runtime.record_persisted_write(100));
+            assert!(runtime.record_persisted_writes(1, 100).is_empty());
         }
-        assert!(runtime.record_persisted_write(100));
+        assert!(runtime.record_persisted_writes(1, 100).snapshot);
         assert_eq!(runtime.compaction_record_threshold(100), 250);
+    }
+
+    #[test]
+    fn physical_binlog_growth_requests_maintenance_before_the_record_threshold() {
+        let directory = TestDirectory::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let runtime = CommitRuntime::new(BinlogHandle::new(sender), 0, directory.paths());
+
+        runtime.record_accepted_binlog_bytes(BINLOG_GENERATION_TARGET_BYTES as usize);
+
+        let request = runtime.record_persisted_writes(1, 100_000);
+        assert!(request.rollover);
+        assert!(!request.snapshot);
+    }
+
+    #[test]
+    fn segment_pressure_requests_a_snapshot_before_the_recovery_catalog_limit() {
+        let directory = TestDirectory::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let runtime = CommitRuntime::new(BinlogHandle::new(sender), 0, directory.paths());
+        runtime.restore_maintenance_state(0, 0, MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS);
+
+        let request = runtime.request_maintenance_if_needed(100_000);
+
+        assert!(request.snapshot);
+        assert!(!request.rollover);
+    }
+
+    #[test]
+    fn rejected_rollover_rearms_snapshot_work_without_retrying_the_rollover() {
+        let directory = TestDirectory::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let runtime = CommitRuntime::new(BinlogHandle::new(sender), 0, directory.paths());
+        runtime.restore_maintenance_state(
+            0,
+            BINLOG_GENERATION_TARGET_BYTES,
+            MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS,
+        );
+        let initial = runtime.request_maintenance_if_needed(100_000);
+        assert!(initial.snapshot);
+        assert!(initial.rollover);
+        runtime.compaction_pending.store(false, Ordering::SeqCst);
+
+        let request = runtime.finish_rollover_schedule_and_rearm(100_000, false);
+
+        assert!(request.snapshot);
+        assert!(!request.rollover);
     }
 
     #[test]
@@ -2272,6 +2647,50 @@ mod tests {
                 .preflush_backpressure_waiters_total,
             1
         );
+        assert_eq!(
+            runtime
+                .compaction_metrics()
+                .preflush_backpressure_waiters_current,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_rollover_bounds_generation_growth_and_failure_releases_admission() {
+        let directory = TestDirectory::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let runtime = Arc::new(CommitRuntime::new(
+            BinlogHandle::new(sender),
+            0,
+            directory.paths(),
+        ));
+        runtime.restore_maintenance_state(1, BINLOG_GENERATION_ADMISSION_LIMIT_BYTES, 0);
+        runtime.rollover_pending.store(true, Ordering::SeqCst);
+
+        let waiting_runtime = Arc::clone(&runtime);
+        let waiter = tokio::spawn(async move { waiting_runtime.acquire_commit_boundary().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime
+                .compaction_metrics()
+                .preflush_backpressure_waiters_current
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("commit admission did not observe the pending-rollover byte bound");
+        assert!(!waiter.is_finished());
+        assert!(runtime.rollover_backpressure_active());
+
+        let next = runtime.finish_rollover_schedule_and_rearm(100_000, false);
+        assert!(next.is_empty());
+        let boundary = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("rejected rollover did not release bounded commit admission")
+            .unwrap();
+        drop(boundary);
+        assert!(!runtime.rollover_backpressure_active());
         assert_eq!(
             runtime
                 .compaction_metrics()
@@ -2919,6 +3338,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn independent_rollover_preserves_snapshot_debt_and_recovery_state() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.binlog)
+            .unwrap();
+        let io = Arc::new(std::sync::Mutex::new(ManagedBinlogFile::new(
+            file,
+            paths.clone(),
+        )));
+        let (sender, receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::Always,
+        ));
+        let runtime = Arc::new(CommitRuntime::new(
+            BinlogHandle::new(sender),
+            0,
+            paths.clone(),
+        ));
+        let first = runtime
+            .accept_next_batch(1, &put_batch_for(b"key", b"first"), 100_000)
+            .await
+            .unwrap();
+        assert!(first.is_empty());
+        assert!(runtime.active_binlog_bytes() > 0);
+        let active_before = runtime.active_binlog_bytes();
+
+        assert_eq!(runtime.rollover_generation().await.unwrap(), 1);
+        assert!(paths.binlog_segment(1).exists());
+        assert_eq!(std::fs::metadata(&paths.binlog).unwrap().len(), 0);
+        assert_eq!(runtime.active_binlog_bytes(), 0);
+        assert_eq!(runtime.write_count.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.unsnapshotted_segment_count(), 1);
+        assert_eq!(
+            runtime.compaction_metrics().sealed_bytes_total,
+            active_before
+        );
+
+        let second = runtime
+            .accept_next_batch(2, &put_batch_for(b"key", b"second"), 100_000)
+            .await
+            .unwrap();
+        assert!(second.is_empty());
+        let active_after = runtime.active_binlog_bytes();
+        assert!(active_after > 0);
+
+        drop(runtime);
+        worker.await.unwrap();
+        drop(io);
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &paths).unwrap();
+        assert_eq!(recovery.last_sequence, 2);
+        assert_eq!(recovery.snapshot_watermark, 0);
+        assert_eq!(recovery.replayed_records, 2);
+        assert_eq!(recovery.active_binlog_bytes, active_after);
+        assert_eq!(recovery.unsnapshotted_segment_count, 1);
+        assert_eq!(recovered.get("key"), Ok(Some("second".to_string())));
+    }
+
+    #[tokio::test]
+    async fn rollover_can_complete_while_a_captured_snapshot_is_written() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.binlog)
+            .unwrap();
+        let io = Arc::new(std::sync::Mutex::new(ManagedBinlogFile::new(
+            file,
+            paths.clone(),
+        )));
+        let (sender, receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::Always,
+        ));
+        let handle = BinlogHandle::new(sender);
+        handle
+            .append_batch(1, &put_batch_for(b"key", b"first"))
+            .await
+            .unwrap();
+        let runtime = Arc::new(CommitRuntime::new(handle, 1, paths.clone()));
+        runtime.restore_maintenance_state(1, std::fs::metadata(&paths.binlog).unwrap().len(), 0);
+        let store = Arc::new(ShardedStore::new());
+        store.set("key".to_string(), "first".to_string());
+        let upstream_replid = Arc::new(AtomicU64::new(0));
+        let (snapshot_started_tx, snapshot_started_rx) = oneshot::channel();
+        let (release_snapshot_tx, release_snapshot_rx) = std::sync::mpsc::channel();
+        let compact_runtime = Arc::clone(&runtime);
+        let compact_store = Arc::clone(&store);
+        let compact_replid = Arc::clone(&upstream_replid);
+        let compact = tokio::spawn(async move {
+            compact_runtime
+                .compact_with_writer(
+                    compact_store,
+                    compact_replid,
+                    Box::new(move |entries, watermark, paths| {
+                        let _ = snapshot_started_tx.send(());
+                        release_snapshot_rx.recv().unwrap();
+                        write_snapshot_file(entries, watermark, &paths)
+                    }),
+                )
+                .await
+        });
+        snapshot_started_rx.await.unwrap();
+
+        let boundary = runtime.acquire_commit_boundary().await;
+        store.set("key".to_string(), "second".to_string());
+        runtime
+            .accept_next_batch(2, &put_batch_for(b"key", b"second"), 100_000)
+            .await
+            .unwrap();
+        drop(boundary);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), runtime.rollover_generation())
+                .await
+                .expect("rollover remained coupled to snapshot installation")
+                .unwrap(),
+            2
+        );
+        assert!(paths.binlog_segment(2).exists());
+        assert!(!compact.is_finished());
+
+        release_snapshot_tx.send(()).unwrap();
+        assert_eq!(compact.await.unwrap().unwrap(), 1);
+        assert!(!paths.binlog_segment(1).exists());
+        assert!(paths.binlog_segment(2).exists());
+        assert_eq!(runtime.unsnapshotted_segment_count(), 1);
+
+        drop(runtime);
+        worker.await.unwrap();
+        drop(io);
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &paths).unwrap();
+        assert_eq!(recovery.snapshot_watermark, 1);
+        assert_eq!(recovery.last_sequence, 2);
+        assert_eq!(recovery.unsnapshotted_segment_count, 1);
+        assert_eq!(recovered.get("key"), Ok(Some("second".to_string())));
+    }
+
+    #[tokio::test]
     async fn snapshot_writing_releases_commits_into_the_new_active_generation() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
@@ -3272,6 +3842,7 @@ mod tests {
         }
 
         assert!(!runtime.is_fail_stopped());
+        assert_eq!(runtime.unsnapshotted_segment_count(), 2);
         drop(runtime);
         worker.await.unwrap();
         drop(io);
@@ -3280,7 +3851,84 @@ mod tests {
         let recovery = load_data_from_paths(&recovered, &paths).unwrap();
         assert_eq!(recovery.snapshot_watermark, 0);
         assert_eq!(recovery.last_sequence, 2);
+        assert_eq!(recovery.unsnapshotted_segment_count, 2);
         assert_eq!(recovered.get("key"), Ok(Some("second".to_string())));
+    }
+
+    #[tokio::test]
+    async fn rejected_independent_rollover_preserves_generation_accounting() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let io = Arc::new(std::sync::Mutex::new(FaultInjectingFile::open(
+            &paths.binlog,
+            FaultPlan {
+                seal_error_on_call: Some((1, InjectedTruncateFailure::Unchanged)),
+                ..FaultPlan::default()
+            },
+        )));
+        let (sender, receiver) = mpsc::channel(4);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::No,
+        ));
+        let runtime = Arc::new(CommitRuntime::new(
+            BinlogHandle::new(sender),
+            1,
+            paths.clone(),
+        ));
+        runtime.restore_maintenance_state(1, 1, 0);
+
+        let error = runtime.rollover_generation().await.unwrap_err();
+
+        assert!(!error.is_indeterminate());
+        assert!(!runtime.is_fail_stopped());
+        assert_eq!(runtime.active_binlog_bytes(), 1);
+        assert_eq!(runtime.unsnapshotted_segment_count(), 0);
+        let metrics = runtime.compaction_metrics();
+        assert_eq!(metrics.rollover_attempts_total, 1);
+        assert_eq!(metrics.rollover_completed_total, 0);
+        assert_eq!(metrics.rollover_failed_total, 1);
+        assert_eq!(metrics.rollover_in_progress, 0);
+
+        drop(runtime);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn indeterminate_independent_rollover_enters_fail_stop() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let io = Arc::new(std::sync::Mutex::new(FaultInjectingFile::open(
+            &paths.binlog,
+            FaultPlan {
+                seal_error_on_call: Some((1, InjectedTruncateFailure::Indeterminate)),
+                ..FaultPlan::default()
+            },
+        )));
+        let (sender, receiver) = mpsc::channel(4);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::No,
+        ));
+        let runtime = Arc::new(CommitRuntime::new(BinlogHandle::new(sender), 1, paths));
+        runtime.restore_maintenance_state(1, 1, 0);
+
+        let error = runtime.rollover_generation().await.unwrap_err();
+
+        assert!(error.is_indeterminate());
+        assert!(runtime.is_fail_stopped());
+        assert!(!runtime.accepting_writes.load(Ordering::SeqCst));
+        assert_eq!(runtime.active_binlog_bytes(), 1);
+        assert_eq!(runtime.unsnapshotted_segment_count(), 0);
+        let metrics = runtime.compaction_metrics();
+        assert_eq!(metrics.rollover_attempts_total, 1);
+        assert_eq!(metrics.rollover_completed_total, 0);
+        assert_eq!(metrics.rollover_failed_total, 1);
+
+        drop(runtime);
+        worker.await.unwrap();
     }
 
     #[tokio::test]

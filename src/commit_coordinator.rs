@@ -983,10 +983,10 @@ async fn process_commit_group(
     let persistence_result = persist_and_publish_master_batches(persistence, &batches).await;
     measurement.observe_storage(storage_started.elapsed());
     match persistence_result {
-        Ok(should_compact) => {
+        Ok(maintenance) => {
             commit_guard.release();
             complete_prepared(prepared);
-            schedule_compaction(store, persistence, should_compact);
+            schedule_maintenance(store, persistence, maintenance);
             measurement.finish(CommitGroupResult::Completed, batches.len());
         }
         Err(error) if error.is_indeterminate() => {

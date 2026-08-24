@@ -205,7 +205,9 @@ greater than `W`, in contiguous order. Therefore:
 
 Automatic compaction, clean shutdown, and replica full synchronization share a
 baseline-replacement mutex. This prevents two independently valid snapshot and
-binlog transitions from interleaving. Compaction itself has five phases:
+binlog transitions from interleaving. Active-generation rollover has a
+separate ownership gate. Operations that need both gates acquire baseline
+ownership first. Compaction itself has five phases:
 
 1. Without holding the commit boundary, preflush the current active generation
    through a separate file handle while normal commits continue.
@@ -218,6 +220,8 @@ binlog transitions from interleaving. Compaction itself has five phases:
 3. Release the boundary, materialize each immutable shard and immediately fold
    its live delta back into the engine, then encode, synchronize, and install
    the snapshot while normal commits append only to the new active generation.
+   Rotation ownership is also released at this point, so a later independent
+   generation rollover may complete while snapshot installation continues.
    Snapshot files retain gzip compatibility but use the fast compression level
    to bound CPU interference with live commits.
 4. Reacquire the complete boundary, issue an ordered checkpoint on the active
@@ -242,6 +246,24 @@ snapshot after every fixed-size mutation interval. Recovery and full
 synchronization seed the same threshold from their installed cardinality;
 recovery also restores the number of post-snapshot records already present in
 the validated history so restart cannot silently defer an overdue compaction.
+
+Framed bytes in the active generation are accounted independently from
+telemetry and reconstructed from the validated active file at startup. At 16
+MiB, the runtime schedules generation rollover without forcing a snapshot.
+Rollover uses the same preflush, bounded growth, complete boundary, predecessor
+synchronization, durable rename, and fail-stop rules as the capture phase, but
+does not materialize or replace the dataset baseline. An already-admitted
+physical group can cross the byte target. Once rollover is pending, normal
+commit admission stops at 24 MiB plus one group that entered below the limit;
+the internal rotation boundary bypasses this limit and cannot deadlock behind
+its own backpressure.
+
+The count of immutable segments newer than the installed snapshot is also
+authoritative and reconstructed during recovery. At 256 segments, snapshot
+compaction is requested independently of record count. A snapshot subtracts
+only the segments captured at its watermark, so rollover concurrent with
+snapshot writing remains represented. This threshold retains headroom below
+the 1,024-segment recovery catalog limit.
 
 The concurrent preflush drains most dirty predecessor pages before generation
 sealing. Sealing still flushes and synchronizes the complete predecessor under
@@ -299,6 +321,8 @@ dataset-sized pauses. The complete decision is recorded in
 `docs/adr/0001-generational-binlog.md`.
 The in-memory capture refinement and its bounded preflush admission rule are
 recorded in `docs/adr/0002-bounded-snapshot-capture.md`.
+Independent byte rollover and its ordered ownership model are recorded in
+`docs/adr/0003-independent-binlog-rollover.md`.
 
 Recovery may truncate only a recognizable incomplete record at the end of the
 complete physical history. Complete corruption, ambiguous framing, and an

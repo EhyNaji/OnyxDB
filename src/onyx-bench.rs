@@ -401,6 +401,8 @@ fn server_metrics_are_quiescent(metrics: &ServerMetricsSnapshot) -> bool {
         "onyxdb_commit_groups_in_progress",
         "onyxdb_compaction_pending",
         "onyxdb_compaction_in_progress",
+        "onyxdb_binlog_rollover_pending",
+        "onyxdb_binlog_rollover_in_progress",
     ]
     .iter()
     .all(|name| metrics.samples.get(*name).copied().unwrap_or(0.0) == 0.0)
@@ -797,7 +799,7 @@ fn report_human(config: &BenchmarkConfig, authenticated: bool, results: &[RunRes
         );
         if let Some(metrics) = &result.server_metrics {
             println!(
-                "  Server metrics: groups {:.0} | logical batches {:.0} | binlog appends {:.0} | records/append {:.2} | compactions {:.0} | compaction {:.3} s | compaction lifetime max {:.3} s | preflush {:.3} s | preflush growth {:.0} bytes | preflush backpressure {:.3} s | generation seal {:.3} s | snapshot capture {:.3} s | snapshot materialization {:.3} s | snapshot write {:.3} s | segment cleanup {:.3} s | write pause {:.3} s | write pause lifetime max {:.3} s | sealed binlog {:.0} bytes | retained binlog {:.0} bytes | queue wait {:.3} s | queue lifetime max {:.0} | metrics settle {:.3} s",
+                "  Server metrics: groups {:.0} | logical batches {:.0} | binlog appends {:.0} | records/append {:.2} | rollovers {:.0} | active generation {:.0} bytes | compactions {:.0} | compaction {:.3} s | compaction lifetime max {:.3} s | maintenance preflush {:.3} s | preflush growth {:.0} bytes | preflush backpressure {:.3} s | generation seal {:.3} s | snapshot capture {:.3} s | snapshot materialization {:.3} s | snapshot write {:.3} s | segment cleanup {:.3} s | write pause {:.3} s | write pause lifetime max {:.3} s | sealed binlog {:.0} bytes | retained binlog {:.0} bytes | queue wait {:.3} s | queue lifetime max {:.0} | metrics settle {:.3} s",
                 metrics.delta("onyxdb_commit_groups_total"),
                 metrics.delta("onyxdb_commit_logical_batches_total"),
                 metrics.delta("onyxdb_binlog_append_accepted_total"),
@@ -809,6 +811,8 @@ fn report_human(config: &BenchmarkConfig, authenticated: bool, results: &[RunRes
                         metrics.delta("onyxdb_binlog_records_accepted_total") / appends
                     }
                 },
+                metrics.delta("onyxdb_binlog_rollover_completed_total"),
+                metrics.after("onyxdb_binlog_active_generation_bytes"),
                 metrics.delta("onyxdb_compaction_completed_total"),
                 metrics.delta("onyxdb_compaction_duration_seconds_total"),
                 metrics.after("onyxdb_compaction_duration_seconds_max"),
@@ -886,7 +890,7 @@ fn report_json(config: &BenchmarkConfig, authenticated: bool, results: &[RunResu
             "key_prefix": config.key_prefix,
             "keep_data": config.keep_data,
             "metrics_address": config.metrics_address,
-            "metrics_sampling": "before the measured phase and after coordinator/compaction quiescence; sampling and quiescence wait are excluded from measured elapsed time",
+            "metrics_sampling": "before the measured phase and after coordinator/snapshot/rollover quiescence; sampling and quiescence wait are excluded from measured elapsed time",
             "latency_definition": "client-observed response completion from pipeline batch submission",
         },
         "runs": runs,
@@ -1067,6 +1071,8 @@ mod tests {
             ("onyxdb_commit_groups_in_progress".to_string(), 1.0),
             ("onyxdb_compaction_pending".to_string(), 0.0),
             ("onyxdb_compaction_in_progress".to_string(), 0.0),
+            ("onyxdb_binlog_rollover_pending".to_string(), 0.0),
+            ("onyxdb_binlog_rollover_in_progress".to_string(), 0.0),
         ]);
         let metrics = ServerMetricsSnapshot {
             samples: samples.clone(),
@@ -1075,6 +1081,14 @@ mod tests {
         assert!(!server_metrics_are_quiescent(&metrics));
 
         samples.insert("onyxdb_commit_groups_in_progress".to_string(), 0.0);
+        samples.insert("onyxdb_binlog_rollover_in_progress".to_string(), 1.0);
+        let metrics = ServerMetricsSnapshot {
+            samples: samples.clone(),
+            counters: BTreeSet::new(),
+        };
+        assert!(!server_metrics_are_quiescent(&metrics));
+
+        samples.insert("onyxdb_binlog_rollover_in_progress".to_string(), 0.0);
         let metrics = ServerMetricsSnapshot {
             samples,
             counters: BTreeSet::new(),

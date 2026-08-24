@@ -31,11 +31,12 @@ machine-readable report.
 ## Server observability
 
 Pass `--metrics-address` to capture the OnyxDB Prometheus endpoint immediately
-before each measured run and again after the commit coordinator and automatic
-compaction become quiescent. Metrics sampling and the bounded quiescence wait
+before each measured run and again after the commit coordinator, automatic
+compaction, and generation rollover become quiescent. Metrics sampling and the bounded quiescence wait
 are outside the measured elapsed time. Human reports summarize commit groups,
 logical batches, physical binlog appends, records per append, compaction time,
-commit-path write pause, retained binlog bytes, queue wait, and queue
+independent rollovers, active-generation bytes, commit-path write pause,
+retained binlog bytes, queue wait, and queue
 high-water. JSON methodology version 3 includes complete `before`, `after`, and
 monotonic-counter `delta` maps for deeper analysis.
 
@@ -88,6 +89,8 @@ both profiles:
 
 - effective record threshold, writes since snapshot, and snapshot entries;
 - preflushed, growth, sealed, and retained binlog bytes;
+- independent rollover count and final active-generation bytes;
+- uncovered segment count and its forced-snapshot limit;
 - preflush backpressure waiters and duration;
 - snapshot capture, materialization, encoding, and durable installation;
 - total and process-lifetime maximum commit-path pause;
@@ -124,8 +127,8 @@ The benchmark performs these stages:
 6. For each repeat, establish fresh worker connections, start the timer, submit
    the requested operations, consume every response, and stop the timer after
    all workers complete.
-7. When server metrics are enabled, wait for coordinator and automatic
-   compaction quiescence and capture the second metrics sample outside the
+7. When server metrics are enabled, wait for coordinator, automatic compaction,
+   and generation-rollover quiescence and capture the second metrics sample outside the
    measurement.
 8. Delete the benchmark keyspace outside the measurement.
 

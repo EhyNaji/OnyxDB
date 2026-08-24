@@ -43,6 +43,8 @@ pub(crate) struct RecoveryState {
     pub(crate) last_sequence: u64,
     pub(crate) snapshot_watermark: u64,
     pub(crate) replayed_records: usize,
+    pub(crate) active_binlog_bytes: u64,
+    pub(crate) unsnapshotted_segment_count: usize,
 }
 
 #[derive(Debug)]
@@ -403,11 +405,25 @@ pub(crate) fn load_data_from_paths(
         .map(|file| file.inspection.max_sequence)
         .max()
         .unwrap_or(0);
+    let active_binlog_bytes = history
+        .iter()
+        .find(|file| file.declared_end_sequence.is_none())
+        .map(|file| file.inspection.valid_len)
+        .unwrap_or(0);
+    let unsnapshotted_segment_count = history
+        .iter()
+        .filter(|file| {
+            file.declared_end_sequence
+                .is_some_and(|end_sequence| end_sequence > snapshot_watermark)
+        })
+        .count();
 
     Ok(RecoveryState {
         last_sequence: snapshot_watermark.max(history_sequence),
         snapshot_watermark,
         replayed_records: replayed,
+        active_binlog_bytes,
+        unsnapshotted_segment_count,
     })
 }
 
