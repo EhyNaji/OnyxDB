@@ -36,8 +36,13 @@ compaction become quiescent. Metrics sampling and the bounded quiescence wait
 are outside the measured elapsed time. Human reports summarize commit groups,
 logical batches, physical binlog appends, records per append, compaction time,
 commit-path write pause, retained binlog bytes, queue wait, and queue
-high-water. JSON methodology version 2 includes complete `before`, `after`, and
+high-water. JSON methodology version 3 includes complete `before`, `after`, and
 monotonic-counter `delta` maps for deeper analysis.
+
+Maximum gauges are process-lifetime values. The human report labels them as
+`lifetime max`; JSON consumers must compare `before` and `after` rather than
+subtracting them. A maximum that does not change during a run is historical
+context, not evidence that the old event repeated.
 
 The option is deliberately explicit. A benchmark without `--metrics-address`
 does not contact a metrics endpoint and retains the same traffic shape as the
@@ -74,6 +79,19 @@ mutation rate during snapshot writing changes the retained active-generation
 size. A useful long-running comparison therefore keeps both cardinality and
 offered write load constant and reports p99.9 rather than relying on throughput
 alone.
+
+Use at least two compaction profiles. A small, repeatedly overwritten keyspace
+exercises preflush growth, generation sealing, and recurrent snapshots. A
+growing high-cardinality keyspace exercises snapshot capture, materialization,
+compression, and adaptive cadence. Report the following counters and phases for
+both profiles:
+
+- effective record threshold, writes since snapshot, and snapshot entries;
+- preflushed, growth, sealed, and retained binlog bytes;
+- preflush backpressure waiters and duration;
+- snapshot capture, materialization, encoding, and durable installation;
+- total and process-lifetime maximum commit-path pause;
+- coordinator queue wait, storage duration, group composition, and errors.
 
 ## Workloads
 

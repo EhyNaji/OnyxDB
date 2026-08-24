@@ -113,7 +113,7 @@ fn benchmark_runs_against_the_real_server_and_emits_machine_readable_results() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["methodology_version"], 2);
+    assert_eq!(report["methodology_version"], 3);
     assert_eq!(report["configuration"]["workload"], "mixed");
     assert_eq!(report["runs"][0]["requested"], 40);
     assert_eq!(report["runs"][0]["completed"], 40);

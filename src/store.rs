@@ -4,6 +4,7 @@ use crate::clock::unix_seconds;
 use crate::engine::{DataEntry, EngineStats, EntryMutation, EvictionPolicy, OnyxEngine, OnyxValue};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub const MAX_KEYS: usize = 1_000_000;
 
@@ -18,6 +19,70 @@ pub struct ShardedStore {
     engine: OnyxEngine,
     maxmemory_bytes: usize,
     maxmemory_policy: EvictionPolicy,
+}
+
+/// Owns an immutable store view and closes its copy-on-write epoch on drop.
+/// This makes snapshot cleanup resilient to writer errors and task unwinding.
+pub struct StoreSnapshot {
+    store: Arc<ShardedStore>,
+    view: Option<crate::engine::EngineSnapshot>,
+}
+
+impl StoreSnapshot {
+    pub fn entries(&self) -> impl Iterator<Item = (&Bytes, &DataEntry)> {
+        self.view
+            .as_ref()
+            .expect("an active store snapshot must own its engine view")
+            .entries()
+    }
+
+    pub fn len(&self) -> usize {
+        self.view
+            .as_ref()
+            .expect("an active store snapshot must own its engine view")
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.view
+            .as_ref()
+            .expect("an active store snapshot must own its engine view")
+            .is_empty()
+    }
+
+    /// Materializes a cache-friendly image outside the authoritative boundary
+    /// and then closes the snapshot epoch before durable encoding begins.
+    pub fn into_entries(mut self) -> Vec<(Bytes, DataEntry)> {
+        let (shard_count, entry_capacity) = {
+            let view = self
+                .view
+                .as_ref()
+                .expect("an active store snapshot must own its engine view");
+            (view.shard_count(), view.entry_capacity())
+        };
+        let mut entries = Vec::with_capacity(entry_capacity);
+        for shard_index in 0..shard_count {
+            let view = self
+                .view
+                .as_mut()
+                .expect("an active store snapshot must own its engine view");
+            view.append_shard_entries(shard_index, &mut entries);
+            view.release_shard(shard_index);
+            self.store.engine.finish_snapshot_shard(shard_index);
+        }
+        self.view.take();
+        self.store.engine.finish_snapshot();
+        entries
+    }
+}
+
+impl Drop for StoreSnapshot {
+    fn drop(&mut self) {
+        if let Some(view) = self.view.take() {
+            drop(view);
+            self.store.engine.finish_snapshot();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,6 +347,15 @@ impl ShardedStore {
     /// Clones the complete non-expired dataset for a durable state boundary.
     pub fn raw_entries(&self) -> Vec<(Bytes, DataEntry)> {
         self.engine.snapshot_all()
+    }
+
+    /// Captures a point-in-time view without scanning or cloning every entry
+    /// while the authoritative commit boundary is held.
+    pub fn begin_snapshot(self: &Arc<Self>) -> StoreSnapshot {
+        StoreSnapshot {
+            store: Arc::clone(self),
+            view: Some(self.engine.begin_snapshot()),
+        }
     }
 
     /// Atomically replaces the complete dataset after the caller has validated
@@ -1040,6 +1114,37 @@ mod tests {
         assert!(!glob_match("user:*", "product:1"));
         assert!(glob_match("exact", "exact"));
         assert!(!glob_match("exact", "different"));
+    }
+
+    #[test]
+    fn materialized_snapshot_closes_each_copy_on_write_epoch_and_preserves_live_state() {
+        let store = Arc::new(ShardedStore::new());
+        for index in 0..256 {
+            store.set(format!("snapshot:{index}"), "before".to_string());
+        }
+
+        let snapshot = store.begin_snapshot();
+        for index in 0..256 {
+            store.set(format!("snapshot:{index}"), "after".to_string());
+        }
+        let entries = snapshot.into_entries();
+
+        assert_eq!(entries.len(), 256);
+        assert!(
+            entries.iter().all(|(_, entry)| {
+                entry.value == OnyxValue::Blob(Bytes::from_static(b"before"))
+            })
+        );
+        for index in 0..256 {
+            assert_eq!(
+                store.get(&format!("snapshot:{index}")),
+                Ok(Some("after".to_string()))
+            );
+        }
+
+        let next_snapshot = store.begin_snapshot();
+        assert_eq!(next_snapshot.len(), 256);
+        drop(next_snapshot);
     }
 
     #[test]

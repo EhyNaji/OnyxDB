@@ -94,9 +94,11 @@ wait for the same write boundary before proceeding.
 Coordinator, binlog, and compaction paths expose cumulative Prometheus metrics
 for queue depth and wait, group composition and duration, logical batches per
 physical append, accepted ONX4 bytes, append acknowledgement time, compaction
-serialization wait, commit-path write pause, retained suffix bytes, and phase
-duration. Metrics use relaxed atomics and never participate in correctness
-decisions. Scraping cannot change commit ordering or durability.
+serialization wait, commit-path write pause, snapshot cardinality and
+materialization, preflush growth and backpressure, retained suffix bytes, and
+phase duration. Process-lifetime maximum gauges are explicitly distinct from
+cumulative counters. Metrics use relaxed atomics and never participate in
+correctness decisions. Scraping cannot change commit ordering or durability.
 
 ### Mutation invariant
 
@@ -210,9 +212,14 @@ binlog transitions from interleaving. Compaction itself has five phases:
 2. Hold the complete write and visibility boundary, capture watermark `W`,
    flush and durably rename a non-empty `onyx.binlog` to the immutable
    `onyx.binlog.segment.<W>` generation, create a new empty active binlog, and
-   clone the committed store image.
-3. Release the boundary and write, synchronize, and install the snapshot while
-   normal commits append only to the new active generation.
+   replace each live shard map with a copy-on-write view over its immutable
+   snapshot base. This capture is proportional to the fixed shard count rather
+   than dataset cardinality.
+3. Release the boundary, materialize each immutable shard and immediately fold
+   its live delta back into the engine, then encode, synchronize, and install
+   the snapshot while normal commits append only to the new active generation.
+   Snapshot files retain gzip compatibility but use the fast compression level
+   to bound CPU interference with live commits.
 4. Reacquire the complete boundary, issue an ordered checkpoint on the active
    generation, and update durable replica identity when applicable.
    Concurrently accepted write counts are retained for the next automatic
@@ -228,6 +235,14 @@ slow compaction from leaving an over-threshold suffix indefinitely quiescent.
 Failures are not retried in a tight loop; the next accepted write may schedule
 the retry.
 
+The automatic record threshold is at least the entry count of the last
+successfully materialized snapshot. This retains the 100,000-record floor for
+small datasets while preventing a growing dataset from paying for a full
+snapshot after every fixed-size mutation interval. Recovery and full
+synchronization seed the same threshold from their installed cardinality;
+recovery also restores the number of post-snapshot records already present in
+the validated history so restart cannot silently defer an overdue compaction.
+
 The concurrent preflush drains most dirty predecessor pages before generation
 sealing. Sealing still flushes and synchronizes the complete predecessor under
 the commit boundary before a new active file can accept commits. The final sync
@@ -239,6 +254,16 @@ an owned supervisor completes or fail-stops finalization even if the initiating
 task disconnects or is cancelled. Both short boundary phases use the visibility
 gate as well as the write gate, so compaction cannot capture or finalize a
 tentative mutation after an indeterminate commit has established fail-stop.
+
+Preflush may otherwise form a positive feedback loop: continued appends dirty
+new pages while the separate handle is synchronizing the same generation. A
+compaction therefore admits only a bounded number of additional framed bytes
+before commit-boundary acquisition waits. The compaction itself bypasses that
+admission wait, seals the predecessor, and releases all waiters through an RAII
+guard on every success or failure path. One already-admitted physical commit
+group may cross the byte limit; group input is independently bounded. Current
+waiters, completed waits, wait duration, and actual preflush growth are exposed
+for operators.
 
 Immutable segment filenames use a fixed-width final sequence. Recovery sorts
 them, inspects their ONX4 records, verifies each declared final sequence, and
@@ -272,6 +297,8 @@ interrupted snapshots. Suffix copying preserved a workload-dependent final
 pause and duplicate physical I/O. Full-boundary snapshot creation caused
 dataset-sized pauses. The complete decision is recorded in
 `docs/adr/0001-generational-binlog.md`.
+The in-memory capture refinement and its bounded preflush admission rule are
+recorded in `docs/adr/0002-bounded-snapshot-capture.md`.
 
 Recovery may truncate only a recognizable incomplete record at the end of the
 complete physical history. Complete corruption, ambiguous framing, and an

@@ -1,8 +1,10 @@
 use super::{
     CommittedBatch, PersistenceError, ReplicaIdentity, durable_rename, encode_committed_batch,
-    encode_versioned_binlog_record, framed_versioned_binlog_record_length, sync_parent_directory,
-    write_replica_identity, write_snapshot_file,
+    encode_framed_versioned_binlog_record_into, framed_versioned_binlog_record_length,
+    sync_parent_directory, write_replica_identity, write_snapshot_file,
 };
+#[cfg(test)]
+use super::{MAX_BINLOG_RECORD_SIZE, encode_versioned_binlog_record};
 use crate::config::FsyncPolicy;
 use onyxdb::store::ShardedStore;
 use std::fs::{self, File, OpenOptions};
@@ -13,6 +15,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{error, info, warn};
+
+pub(crate) const COMPACTION_PREFLUSH_WRITE_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
+const WRITE_BUDGET_OPEN: u64 = u64::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StorageFailureDisposition {
@@ -168,12 +173,18 @@ pub(crate) struct CompactionMetricsSnapshot {
     pub(crate) serialization_wait_nanoseconds_max: u64,
     pub(crate) generation_preflush_nanoseconds_total: u64,
     pub(crate) generation_preflush_nanoseconds_max: u64,
+    pub(crate) preflush_backpressure_nanoseconds_total: u64,
+    pub(crate) preflush_backpressure_nanoseconds_max: u64,
+    pub(crate) preflush_backpressure_waiters_total: u64,
+    pub(crate) preflush_backpressure_waiters_current: u64,
     pub(crate) write_pause_nanoseconds_total: u64,
     pub(crate) write_pause_nanoseconds_max: u64,
     pub(crate) checkpoint_nanoseconds_total: u64,
     pub(crate) checkpoint_nanoseconds_max: u64,
     pub(crate) snapshot_capture_nanoseconds_total: u64,
     pub(crate) snapshot_capture_nanoseconds_max: u64,
+    pub(crate) snapshot_materialization_nanoseconds_total: u64,
+    pub(crate) snapshot_materialization_nanoseconds_max: u64,
     pub(crate) snapshot_write_nanoseconds_total: u64,
     pub(crate) snapshot_write_nanoseconds_max: u64,
     pub(crate) rotation_nanoseconds_total: u64,
@@ -184,8 +195,13 @@ pub(crate) struct CompactionMetricsSnapshot {
     pub(crate) sealed_bytes_max: u64,
     pub(crate) preflushed_bytes_total: u64,
     pub(crate) preflushed_bytes_max: u64,
+    pub(crate) preflush_growth_bytes_total: u64,
+    pub(crate) preflush_growth_bytes_max: u64,
     pub(crate) retained_bytes_total: u64,
     pub(crate) retained_bytes_max: u64,
+    pub(crate) snapshot_entries_total: u64,
+    pub(crate) snapshot_entries_last: u64,
+    pub(crate) snapshot_entries_max: u64,
     pub(crate) cleanup_files_total: u64,
     pub(crate) cleanup_bytes_total: u64,
     pub(crate) cleanup_failures_total: u64,
@@ -217,9 +233,13 @@ struct CompactionMetrics {
     gate_wait: DurationMetric,
     serialization_wait: DurationMetric,
     generation_preflush: DurationMetric,
+    preflush_backpressure: DurationMetric,
+    preflush_backpressure_waiters_total: AtomicU64,
+    preflush_backpressure_waiters_current: AtomicU64,
     write_pause: DurationMetric,
     checkpoint: DurationMetric,
     snapshot_capture: DurationMetric,
+    snapshot_materialization: DurationMetric,
     snapshot_write: DurationMetric,
     rotation: DurationMetric,
     segment_cleanup: DurationMetric,
@@ -227,8 +247,13 @@ struct CompactionMetrics {
     sealed_bytes_max: AtomicU64,
     preflushed_bytes_total: AtomicU64,
     preflushed_bytes_max: AtomicU64,
+    preflush_growth_bytes_total: AtomicU64,
+    preflush_growth_bytes_max: AtomicU64,
     retained_bytes_total: AtomicU64,
     retained_bytes_max: AtomicU64,
+    snapshot_entries_total: AtomicU64,
+    snapshot_entries_last: AtomicU64,
+    snapshot_entries_max: AtomicU64,
     cleanup_files_total: AtomicU64,
     cleanup_bytes_total: AtomicU64,
     cleanup_failures_total: AtomicU64,
@@ -259,12 +284,34 @@ impl CompactionMetrics {
                 .generation_preflush
                 .max
                 .load(Ordering::Relaxed),
+            preflush_backpressure_nanoseconds_total: self
+                .preflush_backpressure
+                .total
+                .load(Ordering::Relaxed),
+            preflush_backpressure_nanoseconds_max: self
+                .preflush_backpressure
+                .max
+                .load(Ordering::Relaxed),
+            preflush_backpressure_waiters_total: self
+                .preflush_backpressure_waiters_total
+                .load(Ordering::Relaxed),
+            preflush_backpressure_waiters_current: self
+                .preflush_backpressure_waiters_current
+                .load(Ordering::Relaxed),
             write_pause_nanoseconds_total: self.write_pause.total.load(Ordering::Relaxed),
             write_pause_nanoseconds_max: self.write_pause.max.load(Ordering::Relaxed),
             checkpoint_nanoseconds_total: self.checkpoint.total.load(Ordering::Relaxed),
             checkpoint_nanoseconds_max: self.checkpoint.max.load(Ordering::Relaxed),
             snapshot_capture_nanoseconds_total: self.snapshot_capture.total.load(Ordering::Relaxed),
             snapshot_capture_nanoseconds_max: self.snapshot_capture.max.load(Ordering::Relaxed),
+            snapshot_materialization_nanoseconds_total: self
+                .snapshot_materialization
+                .total
+                .load(Ordering::Relaxed),
+            snapshot_materialization_nanoseconds_max: self
+                .snapshot_materialization
+                .max
+                .load(Ordering::Relaxed),
             snapshot_write_nanoseconds_total: self.snapshot_write.total.load(Ordering::Relaxed),
             snapshot_write_nanoseconds_max: self.snapshot_write.max.load(Ordering::Relaxed),
             rotation_nanoseconds_total: self.rotation.total.load(Ordering::Relaxed),
@@ -275,8 +322,13 @@ impl CompactionMetrics {
             sealed_bytes_max: self.sealed_bytes_max.load(Ordering::Relaxed),
             preflushed_bytes_total: self.preflushed_bytes_total.load(Ordering::Relaxed),
             preflushed_bytes_max: self.preflushed_bytes_max.load(Ordering::Relaxed),
+            preflush_growth_bytes_total: self.preflush_growth_bytes_total.load(Ordering::Relaxed),
+            preflush_growth_bytes_max: self.preflush_growth_bytes_max.load(Ordering::Relaxed),
             retained_bytes_total: self.retained_bytes_total.load(Ordering::Relaxed),
             retained_bytes_max: self.retained_bytes_max.load(Ordering::Relaxed),
+            snapshot_entries_total: self.snapshot_entries_total.load(Ordering::Relaxed),
+            snapshot_entries_last: self.snapshot_entries_last.load(Ordering::Relaxed),
+            snapshot_entries_max: self.snapshot_entries_max.load(Ordering::Relaxed),
             cleanup_files_total: self.cleanup_files_total.load(Ordering::Relaxed),
             cleanup_bytes_total: self.cleanup_bytes_total.load(Ordering::Relaxed),
             cleanup_failures_total: self.cleanup_failures_total.load(Ordering::Relaxed),
@@ -296,10 +348,36 @@ impl CompactionMetrics {
         observe_max(&self.preflushed_bytes_max, preflushed_bytes);
     }
 
+    fn observe_preflush_growth(&self, growth_bytes: u64) {
+        self.preflush_growth_bytes_total
+            .fetch_add(growth_bytes, Ordering::Relaxed);
+        observe_max(&self.preflush_growth_bytes_max, growth_bytes);
+    }
+
+    fn begin_preflush_backpressure(&self) -> PreflushBackpressureWait<'_> {
+        self.preflush_backpressure_waiters_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.preflush_backpressure_waiters_current
+            .fetch_add(1, Ordering::Relaxed);
+        PreflushBackpressureWait {
+            metrics: self,
+            started_at: Instant::now(),
+        }
+    }
+
     fn observe_retained_bytes(&self, retained_bytes: u64) {
         self.retained_bytes_total
             .fetch_add(retained_bytes, Ordering::Relaxed);
         observe_max(&self.retained_bytes_max, retained_bytes);
+    }
+
+    fn observe_snapshot_entries(&self, entry_count: usize) {
+        let entry_count = u64::try_from(entry_count).unwrap_or(u64::MAX);
+        self.snapshot_entries_total
+            .fetch_add(entry_count, Ordering::Relaxed);
+        self.snapshot_entries_last
+            .store(entry_count, Ordering::Relaxed);
+        observe_max(&self.snapshot_entries_max, entry_count);
     }
 
     fn observe_cleanup(&self, cleanup: BinlogSegmentCleanup, elapsed: Duration) {
@@ -310,6 +388,22 @@ impl CompactionMetrics {
             .fetch_add(cleanup.removed_bytes, Ordering::Relaxed);
         self.cleanup_failures_total
             .fetch_add(cleanup.failed_files, Ordering::Relaxed);
+    }
+}
+
+struct PreflushBackpressureWait<'a> {
+    metrics: &'a CompactionMetrics,
+    started_at: Instant,
+}
+
+impl Drop for PreflushBackpressureWait<'_> {
+    fn drop(&mut self) {
+        self.metrics
+            .preflush_backpressure
+            .observe(self.started_at.elapsed());
+        self.metrics
+            .preflush_backpressure_waiters_current
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -693,6 +787,10 @@ impl BinlogIo for ManagedBinlogFile {
 pub(crate) struct CommitRuntime {
     pub(crate) binlog: BinlogHandle,
     pub(crate) write_count: AtomicUsize,
+    accepted_binlog_bytes: AtomicU64,
+    compaction_entry_floor: AtomicUsize,
+    compaction_write_budget_limit: AtomicU64,
+    compaction_write_budget_notify: Notify,
     pub(crate) compaction_pending: AtomicBool,
     pub(crate) accepting_writes: AtomicBool,
     /// Readers hold a shared guard while observing state. Durable mutations and
@@ -714,6 +812,34 @@ pub(crate) struct CommitRuntime {
     compaction_metrics: CompactionMetrics,
 }
 
+struct CompactionWriteBudget {
+    runtime: Arc<CommitRuntime>,
+    released: bool,
+}
+
+impl CompactionWriteBudget {
+    fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if self.released {
+            return;
+        }
+        self.runtime
+            .compaction_write_budget_limit
+            .store(WRITE_BUDGET_OPEN, Ordering::SeqCst);
+        self.runtime.compaction_write_budget_notify.notify_waiters();
+        self.released = true;
+    }
+}
+
+impl Drop for CompactionWriteBudget {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
 impl CommitRuntime {
     pub(crate) fn new(
         binlog: BinlogHandle,
@@ -723,6 +849,10 @@ impl CommitRuntime {
         Self {
             binlog,
             write_count: AtomicUsize::new(0),
+            accepted_binlog_bytes: AtomicU64::new(0),
+            compaction_entry_floor: AtomicUsize::new(0),
+            compaction_write_budget_limit: AtomicU64::new(WRITE_BUDGET_OPEN),
+            compaction_write_budget_notify: Notify::new(),
             compaction_pending: AtomicBool::new(false),
             accepting_writes: AtomicBool::new(true),
             visibility_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -740,7 +870,8 @@ impl CommitRuntime {
     }
 
     fn record_persisted_write(&self, compaction_threshold: usize) -> bool {
-        self.write_count.fetch_add(1, Ordering::SeqCst) + 1 >= compaction_threshold
+        self.write_count.fetch_add(1, Ordering::SeqCst) + 1
+            >= self.compaction_record_threshold(compaction_threshold)
             && self
                 .compaction_pending
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -756,6 +887,7 @@ impl CommitRuntime {
         compaction_threshold: usize,
         retry_immediately: bool,
     ) -> bool {
+        let compaction_threshold = self.compaction_record_threshold(compaction_threshold);
         self.compaction_pending.store(false, Ordering::SeqCst);
         retry_immediately
             && self.write_count.load(Ordering::SeqCst) >= compaction_threshold
@@ -767,6 +899,70 @@ impl CommitRuntime {
 
     pub(crate) fn sequence(&self) -> u64 {
         self.repl_offset.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn compaction_record_threshold(&self, minimum: usize) -> usize {
+        minimum.max(self.compaction_entry_floor.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn compaction_write_budget_active(&self) -> bool {
+        self.compaction_write_budget_limit.load(Ordering::SeqCst) != WRITE_BUDGET_OPEN
+    }
+
+    pub(crate) fn set_compaction_entry_floor(&self, entry_count: usize) {
+        self.compaction_entry_floor
+            .store(entry_count, Ordering::SeqCst);
+    }
+
+    fn binlog_accepted_bytes(&self) -> u64 {
+        self.accepted_binlog_bytes.load(Ordering::SeqCst)
+    }
+
+    fn record_accepted_binlog_bytes(&self, accepted_bytes: usize) {
+        let accepted_bytes = u64::try_from(accepted_bytes).unwrap_or(u64::MAX);
+        self.accepted_binlog_bytes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_add(accepted_bytes))
+            })
+            .expect("accepted binlog byte accounting cannot fail");
+    }
+
+    fn compaction_write_budget_allows_progress(&self) -> bool {
+        let limit = self.compaction_write_budget_limit.load(Ordering::SeqCst);
+        limit == WRITE_BUDGET_OPEN || self.binlog_accepted_bytes() < limit
+    }
+
+    async fn wait_for_compaction_write_budget(&self) {
+        let mut wait = None;
+        loop {
+            let notified = self.compaction_write_budget_notify.notified();
+            if self.compaction_write_budget_allows_progress() {
+                return;
+            }
+            wait.get_or_insert_with(|| self.compaction_metrics.begin_preflush_backpressure());
+            notified.await;
+        }
+    }
+
+    fn activate_compaction_write_budget(self: &Arc<Self>) -> CompactionWriteBudget {
+        let accepted = self.binlog_accepted_bytes();
+        let limit = accepted
+            .checked_add(COMPACTION_PREFLUSH_WRITE_BUDGET_BYTES)
+            .unwrap_or(WRITE_BUDGET_OPEN - 1);
+        assert_eq!(
+            self.compaction_write_budget_limit.compare_exchange(
+                WRITE_BUDGET_OPEN,
+                limit,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ),
+            Ok(WRITE_BUDGET_OPEN),
+            "compaction write budget ownership must be exclusive"
+        );
+        CompactionWriteBudget {
+            runtime: Arc::clone(self),
+            released: false,
+        }
     }
 
     pub(crate) fn binlog_metrics(&self) -> BinlogMetricsSnapshot {
@@ -796,7 +992,8 @@ impl CommitRuntime {
                 expected, sequence
             )));
         }
-        self.binlog.append_batch(sequence, batch).await?;
+        let accepted_bytes = self.binlog.append_batch(sequence, batch).await?;
+        self.record_accepted_binlog_bytes(accepted_bytes);
         self.repl_offset.store(sequence, Ordering::SeqCst);
         Ok(self.record_persisted_write(compaction_threshold))
     }
@@ -829,7 +1026,8 @@ impl CommitRuntime {
             expected = expected_sequence.checked_add(1);
         }
 
-        self.binlog.append_batches(batches).await?;
+        let accepted_bytes = self.binlog.append_batches(batches).await?;
+        self.record_accepted_binlog_bytes(accepted_bytes);
         let last_sequence = batches
             .last()
             .expect("a non-empty persistence group has a last sequence")
@@ -843,12 +1041,25 @@ impl CommitRuntime {
         Ok(should_compact)
     }
 
-    pub(crate) fn install_baseline(&self, sequence: u64) {
+    pub(crate) fn install_baseline(&self, sequence: u64, entry_count: usize) {
         self.repl_offset.store(sequence, Ordering::SeqCst);
         self.write_count.store(0, Ordering::SeqCst);
+        self.accepted_binlog_bytes.store(0, Ordering::SeqCst);
+        self.set_compaction_entry_floor(entry_count);
     }
 
     pub(crate) async fn acquire_commit_boundary(&self) -> CommitBoundary {
+        loop {
+            self.wait_for_compaction_write_budget().await;
+            let boundary = CommitBoundary::acquire(&self.write_gate, &self.visibility_gate).await;
+            if self.compaction_write_budget_allows_progress() {
+                return boundary;
+            }
+            drop(boundary);
+        }
+    }
+
+    async fn acquire_compaction_boundary(&self) -> CommitBoundary {
         CommitBoundary::acquire(&self.write_gate, &self.visibility_gate).await
     }
 
@@ -995,6 +1206,7 @@ impl CommitRuntime {
         self.compaction_metrics
             .serialization_wait
             .observe(serialization_started.elapsed());
+        let write_budget = self.activate_compaction_write_budget();
 
         let preflush_started = Instant::now();
         let preflush_paths = self.paths.clone();
@@ -1025,7 +1237,7 @@ impl CommitRuntime {
             .observe_preflush(preflushed_bytes, preflush_started.elapsed());
 
         let gate_started = Instant::now();
-        let boundary = self.acquire_commit_boundary().await;
+        let boundary = self.acquire_compaction_boundary().await;
         self.compaction_metrics
             .gate_wait
             .observe(gate_started.elapsed());
@@ -1055,17 +1267,37 @@ impl CommitRuntime {
             .rotation
             .observe(rotation_started.elapsed());
         self.compaction_metrics.observe_sealed_bytes(sealed_bytes);
+        self.compaction_metrics
+            .observe_preflush_growth(sealed_bytes.saturating_sub(preflushed_bytes));
 
         let compacted_write_count = self.write_count.load(Ordering::SeqCst);
         let capture_started = Instant::now();
-        let entries = store.raw_entries();
+        let snapshot = store.begin_snapshot();
         self.compaction_metrics
             .snapshot_capture
             .observe(capture_started.elapsed());
         drop(boundary);
+        write_budget.release();
         self.compaction_metrics
             .write_pause
             .observe(capture_pause_started.elapsed());
+
+        let materialization_started = Instant::now();
+        let entries = match tokio::task::spawn_blocking(move || snapshot.into_entries()).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                measurement.finish(false);
+                return Err(PersistenceError::new(format!(
+                    "Snapshot materialization task failed: {error}"
+                )));
+            }
+        };
+        self.compaction_metrics
+            .snapshot_materialization
+            .observe(materialization_started.elapsed());
+        let snapshot_entry_count = entries.len();
+        self.compaction_metrics
+            .observe_snapshot_entries(snapshot_entry_count);
 
         let paths = self.paths.clone();
         let snapshot_started = Instant::now();
@@ -1090,7 +1322,7 @@ impl CommitRuntime {
         }
 
         let final_gate_started = Instant::now();
-        let boundary = self.acquire_commit_boundary().await;
+        let boundary = self.acquire_compaction_boundary().await;
         self.compaction_metrics
             .gate_wait
             .observe(final_gate_started.elapsed());
@@ -1142,6 +1374,7 @@ impl CommitRuntime {
                 Some(count.saturating_sub(compacted_write_count))
             })
             .expect("compaction write-count update cannot fail");
+        self.set_compaction_entry_floor(snapshot_entry_count);
         self.compaction_metrics
             .write_pause
             .observe(final_pause_started.elapsed());
@@ -1217,11 +1450,14 @@ impl BinlogHandle {
         }
     }
 
-    async fn append(&self, sequence: u64, record: Vec<u8>) -> Result<(), PersistenceError> {
+    async fn append(&self, sequence: u64, record: Vec<u8>) -> Result<usize, PersistenceError> {
         self.append_records(vec![(sequence, record)]).await
     }
 
-    async fn append_records(&self, records: Vec<(u64, Vec<u8>)>) -> Result<(), PersistenceError> {
+    async fn append_records(
+        &self,
+        records: Vec<(u64, Vec<u8>)>,
+    ) -> Result<usize, PersistenceError> {
         let record_count = records.len();
         let physical_bytes = records.iter().try_fold(0usize, |total, (_, record)| {
             total
@@ -1255,7 +1491,7 @@ impl BinlogHandle {
                     started_at.elapsed(),
                     Ok(()),
                 );
-                Ok(())
+                Ok(physical_bytes)
             }
             Ok(Err(error)) => {
                 let disposition = error.disposition;
@@ -1285,14 +1521,14 @@ impl BinlogHandle {
         &self,
         sequence: u64,
         batch: &CommittedBatch,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<usize, PersistenceError> {
         self.append(sequence, encode_committed_batch(batch)?).await
     }
 
     pub(crate) async fn append_batches(
         &self,
         batches: &[(u64, CommittedBatch)],
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<usize, PersistenceError> {
         if batches.is_empty() {
             return Err(PersistenceError::new(
                 "A binlog append group must contain at least one committed batch",
@@ -1440,29 +1676,6 @@ fn rollback_binlog_tail<T: BinlogIo>(
     }
 }
 
-fn encode_framed_binlog_record(
-    sequence: u64,
-    record: &[u8],
-    output: &mut Vec<u8>,
-) -> Result<(), StorageFailure> {
-    let encoded = encode_versioned_binlog_record(sequence, record)
-        .map_err(|error| StorageFailure::rejected(error.to_string()))?;
-    let length = u32::try_from(encoded.len())
-        .map_err(|_| StorageFailure::rejected("Binlog record exceeds the format limit"))?;
-    let additional = 4usize
-        .checked_add(encoded.len())
-        .and_then(|additional| output.len().checked_add(additional).map(|_| additional))
-        .ok_or_else(|| {
-            StorageFailure::rejected("Binlog append group exceeds addressable memory")
-        })?;
-    output.try_reserve(additional).map_err(|_| {
-        StorageFailure::rejected("Unable to allocate the encoded binlog append group")
-    })?;
-    output.extend_from_slice(&length.to_be_bytes());
-    output.extend_from_slice(&encoded);
-    Ok(())
-}
-
 fn append_binlog_tail<T: BinlogIo>(
     binlog: &mut T,
     encoded_tail: &[u8],
@@ -1526,11 +1739,49 @@ fn append_binlog_records<T: BinlogIo>(
             "A binlog append group must contain at least one record",
         ));
     }
+    let encoded_length = records.iter().try_fold(0usize, |total, (_, record)| {
+        let record_length = framed_versioned_binlog_record_length(record.len())
+            .map_err(|error| StorageFailure::rejected(error.to_string()))?;
+        total.checked_add(record_length).ok_or_else(|| {
+            StorageFailure::rejected("Binlog append group exceeds addressable memory")
+        })
+    })?;
     let mut encoded_tail = Vec::new();
+    encoded_tail
+        .try_reserve_exact(encoded_length)
+        .map_err(|_| {
+            StorageFailure::rejected("Unable to allocate the encoded binlog append group")
+        })?;
     for (sequence, record) in records {
-        encode_framed_binlog_record(*sequence, record, &mut encoded_tail)?;
+        encode_framed_versioned_binlog_record_into(*sequence, record, &mut encoded_tail)
+            .map_err(|error| StorageFailure::rejected(error.to_string()))?;
     }
+    debug_assert_eq!(encoded_tail.len(), encoded_length);
     append_binlog_tail(binlog, &encoded_tail, fsync_policy)
+}
+
+async fn run_blocking_binlog_operation<T, R>(
+    binlog: &Arc<std::sync::Mutex<T>>,
+    context: &'static str,
+    operation: impl FnOnce(&mut T) -> Result<R, StorageFailure> + Send + 'static,
+) -> Result<R, StorageFailure>
+where
+    T: BinlogIo,
+    R: Send + 'static,
+{
+    let binlog = Arc::clone(binlog);
+    tokio::task::spawn_blocking(move || {
+        let mut file = binlog
+            .lock()
+            .map_err(|_| StorageFailure::indeterminate("Binlog file lock is poisoned"))?;
+        operation(&mut *file)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(StorageFailure::indeterminate(format!(
+            "{context} task was interrupted: {error}"
+        )))
+    })
 }
 
 pub(crate) async fn run_binlog_worker<T: BinlogIo>(
@@ -1551,33 +1802,35 @@ pub(crate) async fn run_binlog_worker<T: BinlogIo>(
                 let _ = completion.send(result);
             }
             LogMessage::Checkpoint { completion } => {
-                let result = (|| -> StoragePositionResult {
-                    let mut file = binlog.lock().map_err(|_| {
-                        StorageFailure::indeterminate("Binlog file lock is poisoned")
-                    })?;
-                    file.flush().map_err(|error| {
-                        StorageFailure::indeterminate(format!(
-                            "Binlog compaction checkpoint flush failed: {}",
-                            error
-                        ))
-                    })?;
-                    file.seek(SeekFrom::End(0)).map_err(|error| {
-                        StorageFailure::indeterminate(format!(
-                            "Binlog compaction checkpoint seek failed: {}",
-                            error
-                        ))
-                    })
-                })();
+                let result = run_blocking_binlog_operation(
+                    &binlog,
+                    "Binlog compaction checkpoint",
+                    |file| {
+                        file.flush().map_err(|error| {
+                            StorageFailure::indeterminate(format!(
+                                "Binlog compaction checkpoint flush failed: {}",
+                                error
+                            ))
+                        })?;
+                        file.seek(SeekFrom::End(0)).map_err(|error| {
+                            StorageFailure::indeterminate(format!(
+                                "Binlog compaction checkpoint seek failed: {}",
+                                error
+                            ))
+                        })
+                    },
+                )
+                .await;
                 let _ = completion.send(result);
             }
             LogMessage::SealActive {
                 end_sequence,
                 completion,
             } => {
-                let result = binlog
-                    .lock()
-                    .map_err(|_| StorageFailure::indeterminate("Binlog file lock is poisoned"))
-                    .and_then(|mut file| {
+                let result = run_blocking_binlog_operation(
+                    &binlog,
+                    "Binlog generation sealing",
+                    move |file| {
                         file.seal_active(end_sequence).map_err(|error| match error {
                             BinlogRotationError::Unchanged(error) => {
                                 StorageFailure::rejected(format!(
@@ -1590,14 +1843,13 @@ pub(crate) async fn run_binlog_worker<T: BinlogIo>(
                                 ))
                             }
                         })
-                    });
+                    },
+                )
+                .await;
                 let _ = completion.send(result);
             }
             LogMessage::Flush { completion } => {
-                let result = (|| -> StorageResult {
-                    let mut file = binlog.lock().map_err(|_| {
-                        StorageFailure::indeterminate("Binlog file lock is poisoned")
-                    })?;
+                let result = run_blocking_binlog_operation(&binlog, "Binlog flush", |file| {
                     file.flush().map_err(|error| {
                         StorageFailure::indeterminate(format!("Binlog flush failed: {}", error))
                     })?;
@@ -1605,26 +1857,22 @@ pub(crate) async fn run_binlog_worker<T: BinlogIo>(
                         StorageFailure::indeterminate(format!("Binlog sync failed: {}", error))
                     })?;
                     Ok(())
-                })();
+                })
+                .await;
                 let _ = completion.send(result);
             }
             LogMessage::SyncData { completion } => {
-                let result = (|| -> StorageResult {
-                    let mut file = binlog.lock().map_err(|_| {
-                        StorageFailure::indeterminate("Binlog file lock is poisoned")
-                    })?;
+                let result = run_blocking_binlog_operation(&binlog, "Binlog sync", |file| {
                     file.sync_data().map_err(|error| {
                         StorageFailure::indeterminate(format!("Binlog sync failed: {}", error))
                     })?;
                     Ok(())
-                })();
+                })
+                .await;
                 let _ = completion.send(result);
             }
             LogMessage::Truncate { completion } => {
-                let result = (|| -> StorageResult {
-                    let mut file = binlog.lock().map_err(|_| {
-                        StorageFailure::indeterminate("Binlog file lock is poisoned")
-                    })?;
+                let result = run_blocking_binlog_operation(&binlog, "Binlog truncation", |file| {
                     file.flush().map_err(|error| {
                         StorageFailure::rejected(format!(
                             "Binlog was not truncated because the pre-truncation flush failed: {}",
@@ -1647,7 +1895,8 @@ pub(crate) async fn run_binlog_worker<T: BinlogIo>(
                         ))
                     })?;
                     Ok(())
-                })();
+                })
+                .await;
                 let _ = completion.send(result);
             }
         }
@@ -1939,6 +2188,144 @@ mod tests {
         runtime.write_count.store(10, Ordering::SeqCst);
         assert!(!runtime.finish_compaction_schedule_and_rearm(10, false));
         assert!(!runtime.compaction_pending.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn automatic_compaction_scales_with_the_last_snapshot_cardinality() {
+        let directory = TestDirectory::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let runtime = CommitRuntime::new(BinlogHandle::new(sender), 0, directory.paths());
+        runtime.set_compaction_entry_floor(250);
+
+        for _ in 0..249 {
+            assert!(!runtime.record_persisted_write(100));
+        }
+        assert!(runtime.record_persisted_write(100));
+        assert_eq!(runtime.compaction_record_threshold(100), 250);
+    }
+
+    #[test]
+    fn preflush_admission_uses_authoritative_bytes_instead_of_relaxed_metrics() {
+        let directory = TestDirectory::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let runtime = Arc::new(CommitRuntime::new(
+            BinlogHandle::new(sender),
+            0,
+            directory.paths(),
+        ));
+        runtime
+            .binlog
+            .metrics
+            .bytes_accepted_total
+            .store(u64::MAX, Ordering::Relaxed);
+
+        let _budget = runtime.activate_compaction_write_budget();
+        assert!(runtime.compaction_write_budget_allows_progress());
+        runtime.record_accepted_binlog_bytes(COMPACTION_PREFLUSH_WRITE_BUDGET_BYTES as usize);
+        assert!(!runtime.compaction_write_budget_allows_progress());
+    }
+
+    #[tokio::test]
+    async fn exhausted_preflush_budget_blocks_and_drop_releases_commit_admission() {
+        let directory = TestDirectory::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let runtime = Arc::new(CommitRuntime::new(
+            BinlogHandle::new(sender),
+            0,
+            directory.paths(),
+        ));
+        let budget = runtime.activate_compaction_write_budget();
+        runtime
+            .accepted_binlog_bytes
+            .store(COMPACTION_PREFLUSH_WRITE_BUDGET_BYTES, Ordering::SeqCst);
+
+        let waiting_runtime = Arc::clone(&runtime);
+        let waiter = tokio::spawn(async move { waiting_runtime.acquire_commit_boundary().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime
+                .compaction_metrics()
+                .preflush_backpressure_waiters_total
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("commit admission never entered preflush backpressure");
+        assert!(!waiter.is_finished());
+        assert_eq!(
+            runtime
+                .compaction_metrics()
+                .preflush_backpressure_waiters_current,
+            1
+        );
+
+        drop(budget);
+        let boundary = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("commit admission remained blocked after the preflush budget was released")
+            .unwrap();
+        drop(boundary);
+        assert_eq!(
+            runtime
+                .compaction_metrics()
+                .preflush_backpressure_waiters_total,
+            1
+        );
+        assert_eq!(
+            runtime
+                .compaction_metrics()
+                .preflush_backpressure_waiters_current,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_preflush_waiter_releases_the_current_waiter_gauge() {
+        let directory = TestDirectory::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let runtime = Arc::new(CommitRuntime::new(
+            BinlogHandle::new(sender),
+            0,
+            directory.paths(),
+        ));
+        let _budget = runtime.activate_compaction_write_budget();
+        runtime
+            .accepted_binlog_bytes
+            .store(COMPACTION_PREFLUSH_WRITE_BUDGET_BYTES, Ordering::SeqCst);
+
+        let waiting_runtime = Arc::clone(&runtime);
+        let waiter = tokio::spawn(async move { waiting_runtime.acquire_commit_boundary().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime
+                .compaction_metrics()
+                .preflush_backpressure_waiters_current
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("commit admission never entered preflush backpressure");
+
+        waiter.abort();
+        let error = match waiter.await {
+            Ok(_) => panic!("cancelled commit admission unexpectedly acquired the boundary"),
+            Err(error) => error,
+        };
+        assert!(error.is_cancelled());
+        assert_eq!(
+            runtime
+                .compaction_metrics()
+                .preflush_backpressure_waiters_current,
+            0
+        );
+        assert_eq!(
+            runtime
+                .compaction_metrics()
+                .preflush_backpressure_waiters_total,
+            1
+        );
     }
 
     #[tokio::test]
@@ -2315,9 +2702,9 @@ mod tests {
         let first = encode_committed_batch(&put_batch_for(b"first", b"one")).unwrap();
         let second = encode_committed_batch(&put_batch_for(b"second", b"two")).unwrap();
         let mut encoded_tail = Vec::new();
-        encode_framed_binlog_record(1, &first, &mut encoded_tail).unwrap();
+        encode_framed_versioned_binlog_record_into(1, &first, &mut encoded_tail).unwrap();
         let first_record_length = encoded_tail.len();
-        encode_framed_binlog_record(2, &second, &mut encoded_tail).unwrap();
+        encode_framed_versioned_binlog_record_into(2, &second, &mut encoded_tail).unwrap();
         let torn_length = first_record_length + 7;
         let mut file = File::create(&paths.binlog).unwrap();
         file.write_all(&encoded_tail[..torn_length]).unwrap();
@@ -2334,6 +2721,11 @@ mod tests {
             std::fs::metadata(&paths.binlog).unwrap().len(),
             first_record_length as u64
         );
+    }
+
+    #[test]
+    fn physical_group_length_rejects_oversized_records_before_allocation() {
+        assert!(framed_versioned_binlog_record_length(MAX_BINLOG_RECORD_SIZE).is_err());
     }
 
     #[tokio::test]
@@ -2398,10 +2790,14 @@ mod tests {
         assert!(metrics.checkpoint_nanoseconds_total > 0);
         assert!(metrics.generation_preflush_nanoseconds_total > 0);
         assert!(metrics.snapshot_capture_nanoseconds_total > 0);
+        assert!(metrics.snapshot_materialization_nanoseconds_total > 0);
         assert!(metrics.snapshot_write_nanoseconds_total > 0);
         assert!(metrics.rotation_nanoseconds_total > 0);
         assert!(metrics.write_pause_nanoseconds_total > 0);
         assert_eq!(metrics.retained_bytes_total, 0);
+        assert_eq!(metrics.snapshot_entries_total, 1);
+        assert_eq!(metrics.snapshot_entries_last, 1);
+        assert_eq!(metrics.snapshot_entries_max, 1);
         {
             let io = io.lock().unwrap();
             assert_eq!(io.flush_calls, 2);

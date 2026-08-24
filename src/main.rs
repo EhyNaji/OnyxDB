@@ -2021,6 +2021,34 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
         "gauge",
         u8::from(persistence.compaction_pending.load(Ordering::Relaxed)),
     );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_writes_since_snapshot",
+        "Committed mutation records not yet amortized by a completed snapshot",
+        "gauge",
+        persistence.write_count.load(Ordering::Relaxed),
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_record_threshold",
+        "Current mutation-record threshold for automatic compaction",
+        "gauge",
+        persistence.compaction_record_threshold(COMPACTION_THRESHOLD),
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_preflush_write_budget_active",
+        "1 while preflush growth is subject to commit-path byte budgeting",
+        "gauge",
+        u8::from(persistence.compaction_write_budget_active()),
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_preflush_write_budget_bytes",
+        "Commit admission byte budget during preflush before bounded in-flight group overshoot",
+        "gauge",
+        COMPACTION_PREFLUSH_WRITE_BUDGET_BYTES,
+    );
     for (name, help, metric_type, value) in [
         (
             "onyxdb_compaction_attempts_total",
@@ -2105,6 +2133,18 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
             seconds(compaction.generation_preflush_nanoseconds_max),
         ),
         (
+            "onyxdb_compaction_preflush_backpressure_seconds_total",
+            "Cumulative commit admission wait after preflush growth exhausted its byte budget",
+            "counter",
+            seconds(compaction.preflush_backpressure_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_preflush_backpressure_seconds_max",
+            "Longest commit admission wait caused by an exhausted preflush byte budget",
+            "gauge",
+            seconds(compaction.preflush_backpressure_nanoseconds_max),
+        ),
+        (
             "onyxdb_compaction_write_pause_seconds_total",
             "Cumulative time authoritative commits were paused for generation sealing, snapshot capture, or final checkpointing",
             "counter",
@@ -2151,6 +2191,18 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
             "Longest observed in-memory snapshot capture",
             "gauge",
             seconds(compaction.snapshot_capture_nanoseconds_max),
+        ),
+        (
+            "onyxdb_compaction_snapshot_materialization_seconds_total",
+            "Cumulative copy-on-write snapshot materialization time outside the commit boundary",
+            "counter",
+            seconds(compaction.snapshot_materialization_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_snapshot_materialization_seconds_max",
+            "Longest copy-on-write snapshot materialization outside the commit boundary",
+            "gauge",
+            seconds(compaction.snapshot_materialization_nanoseconds_max),
         ),
         (
             "onyxdb_compaction_snapshot_write_seconds_total",
@@ -2204,6 +2256,55 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
         "Largest active binlog generation covered by one compaction preflush",
         "gauge",
         compaction.preflushed_bytes_max,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_preflush_growth_bytes_total",
+        "Binlog bytes accepted after preflush started and before generation sealing",
+        "counter",
+        compaction.preflush_growth_bytes_total,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_preflush_growth_bytes_max",
+        "Largest binlog growth observed during one active-generation preflush",
+        "gauge",
+        compaction.preflush_growth_bytes_max,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_preflush_backpressure_waiters_total",
+        "Commit-boundary acquisitions delayed by an exhausted preflush byte budget",
+        "counter",
+        compaction.preflush_backpressure_waiters_total,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_preflush_backpressure_waiters_current",
+        "Commit-boundary acquisitions currently delayed by an exhausted preflush byte budget",
+        "gauge",
+        compaction.preflush_backpressure_waiters_current,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_snapshot_entries_total",
+        "Logical entries materialized across snapshot attempts",
+        "counter",
+        compaction.snapshot_entries_total,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_snapshot_entries_last",
+        "Logical entries in the most recently materialized snapshot",
+        "gauge",
+        compaction.snapshot_entries_last,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_compaction_snapshot_entries_max",
+        "Largest logical entry count materialized by one snapshot attempt",
+        "gauge",
+        compaction.snapshot_entries_max,
     );
     push_metric(
         &mut output,
@@ -2590,9 +2691,10 @@ fn schedule_compaction(
                 Ok(_) => true,
                 Err(error) => {
                     error!("Automatic compaction failed: {}", error);
-                    persistence
-                        .write_count
-                        .store(COMPACTION_THRESHOLD, Ordering::SeqCst);
+                    persistence.write_count.store(
+                        persistence.compaction_record_threshold(COMPACTION_THRESHOLD),
+                        Ordering::SeqCst,
+                    );
                     false
                 }
             };
@@ -2784,8 +2886,9 @@ async fn install_full_sync(
         return Err(error);
     }
 
+    let entry_count = entries.len();
     store.replace_all(entries);
-    persistence.install_baseline(sequence);
+    persistence.install_baseline(sequence, entry_count);
     persistence.upstream_replid.store(replid, Ordering::SeqCst);
     persistence.replication_ready.store(true, Ordering::SeqCst);
     persistence.backlog.lock().unwrap().clear();
@@ -3529,6 +3632,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replication_ready: AtomicBool::new(recovered_replica_identity.is_some()),
         replica_lifecycle,
     });
+    persistence
+        .write_count
+        .store(recovery.replayed_records, Ordering::SeqCst);
+    persistence.set_compaction_entry_floor(store.stats().total_keys);
 
     persistence
         .master_commit
@@ -4690,6 +4797,10 @@ mod tests {
         assert!(body.contains("onyxdb_binlog_append_attempts_total 0\n"));
         assert!(body.contains("onyxdb_compaction_completed_total 0\n"));
         assert!(body.contains("onyxdb_compaction_preflushed_binlog_bytes_total 0\n"));
+        assert!(body.contains("onyxdb_compaction_preflush_growth_bytes_total 0\n"));
+        assert!(body.contains("onyxdb_compaction_preflush_backpressure_waiters_current 0\n"));
+        assert!(body.contains("onyxdb_compaction_snapshot_materialization_seconds_total 0\n"));
+        assert!(body.contains("onyxdb_compaction_snapshot_entries_last 0\n"));
         assert!(body.contains("onyxdb_compaction_sealed_binlog_bytes_total 0\n"));
         assert!(body.contains("onyxdb_compaction_cleaned_segments_total 0\n"));
         assert!(!body.contains("onyxdb_compaction_suffix_prepare_seconds"));

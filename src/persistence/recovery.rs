@@ -42,6 +42,7 @@ pub(crate) struct BinlogInspection {
 pub(crate) struct RecoveryState {
     pub(crate) last_sequence: u64,
     pub(crate) snapshot_watermark: u64,
+    pub(crate) replayed_records: usize,
 }
 
 #[derive(Debug)]
@@ -406,6 +407,7 @@ pub(crate) fn load_data_from_paths(
     Ok(RecoveryState {
         last_sequence: snapshot_watermark.max(history_sequence),
         snapshot_watermark,
+        replayed_records: replayed,
     })
 }
 
@@ -703,14 +705,17 @@ fn write_snapshot_file_with_installer(
     installer: &mut impl SnapshotInstaller,
 ) -> Result<(), PersistenceError> {
     let file = File::create(&paths.snapshot_temp)?;
-    let mut encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
+    // Snapshot creation competes with live commit processing. The fast gzip
+    // profile preserves the existing wire format while bounding compression
+    // CPU more effectively than the default level.
+    let mut encoder = GzEncoder::new(BufWriter::new(file), Compression::fast());
     writeln!(
         encoder,
         "{}\t{}\t{}",
         SNAPSHOT_MAGIC, SNAPSHOT_VERSION, watermark
     )?;
-    for (key, entry) in entries {
-        let record = encode_snapshot_entry(&key, &entry)?;
+    for (key, entry) in &entries {
+        let record = encode_snapshot_entry(key, entry)?;
         let record_length = u32::try_from(record.len())
             .map_err(|_| PersistenceError::new("Snapshot entry exceeds the format limit"))?;
         encoder.write_all(&record_length.to_be_bytes())?;
@@ -977,6 +982,7 @@ mod tests {
 
         assert_eq!(recovery.snapshot_watermark, 1);
         assert_eq!(recovery.last_sequence, 3);
+        assert_eq!(recovery.replayed_records, 2);
         assert_eq!(store.get("key"), Ok(Some("active".to_string())));
     }
 
@@ -1035,6 +1041,7 @@ mod tests {
         let recovery = load_data_from_paths(&store, &paths).unwrap();
 
         assert_eq!(recovery.last_sequence, 3);
+        assert_eq!(recovery.replayed_records, 1);
         assert_eq!(store.get("key"), Ok(Some("active".to_string())));
         assert!(!segment.exists());
     }

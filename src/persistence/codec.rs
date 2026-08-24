@@ -127,10 +127,21 @@ pub(crate) fn safe_slice(bytes: &[u8], offset: usize, len: usize) -> Option<&[u8
     bytes.get(offset..end)
 }
 
+#[cfg(test)]
 pub(crate) fn encode_versioned_binlog_record(
     sequence: u64,
     effect_record: &[u8],
 ) -> Result<Vec<u8>, PersistenceError> {
+    let record_length = versioned_binlog_record_length(sequence, effect_record.len())?;
+    let mut record = Vec::with_capacity(record_length);
+    encode_versioned_binlog_record_into(sequence, effect_record, &mut record)?;
+    Ok(record)
+}
+
+fn versioned_binlog_record_length(
+    sequence: u64,
+    effect_record_length: usize,
+) -> Result<usize, PersistenceError> {
     if sequence == 0 {
         return Err(PersistenceError::new(
             "Versioned binlog records require a non-zero sequence",
@@ -140,7 +151,7 @@ pub(crate) fn encode_versioned_binlog_record(
         .len()
         .checked_add(BINLOG_RECORD_LENGTH_SIZE)
         .and_then(|length| length.checked_add(8))
-        .and_then(|length| length.checked_add(effect_record.len()))
+        .and_then(|length| length.checked_add(effect_record_length))
         .and_then(|length| length.checked_add(BINLOG_CHECKSUM_SIZE))
         .ok_or_else(|| PersistenceError::new("Binlog record length overflow"))?;
     if record_length > MAX_BINLOG_RECORD_SIZE {
@@ -148,30 +159,50 @@ pub(crate) fn encode_versioned_binlog_record(
             "Binlog record exceeds the format limit",
         ));
     }
-    let mut record = Vec::with_capacity(record_length);
-    record.extend_from_slice(BINLOG_RECORD_MAGIC);
+    Ok(record_length)
+}
+
+fn encode_versioned_binlog_record_into(
+    sequence: u64,
+    effect_record: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<(), PersistenceError> {
+    let record_length = versioned_binlog_record_length(sequence, effect_record.len())?;
+    let record_start = output.len();
+    output.extend_from_slice(BINLOG_RECORD_MAGIC);
     write_u32_be(
-        &mut record,
+        output,
         u32::try_from(record_length)
             .map_err(|_| PersistenceError::new("Binlog record length exceeds u32"))?,
     );
-    write_u64_be(&mut record, sequence);
-    record.extend_from_slice(effect_record);
-    let checksum = crc32fast::hash(&record);
-    write_u32_be(&mut record, checksum);
-    Ok(record)
+    write_u64_be(output, sequence);
+    output.extend_from_slice(effect_record);
+    let checksum = crc32fast::hash(&output[record_start..]);
+    write_u32_be(output, checksum);
+    Ok(())
+}
+
+/// Encodes the outer length prefix and one ONX4 record directly into an
+/// existing physical append buffer.
+pub(crate) fn encode_framed_versioned_binlog_record_into(
+    sequence: u64,
+    effect_record: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<(), PersistenceError> {
+    let record_length = versioned_binlog_record_length(sequence, effect_record.len())?;
+    write_u32_be(
+        output,
+        u32::try_from(record_length)
+            .map_err(|_| PersistenceError::new("Binlog record length exceeds u32"))?,
+    );
+    encode_versioned_binlog_record_into(sequence, effect_record, output)
 }
 
 pub(crate) fn framed_versioned_binlog_record_length(
     effect_record_length: usize,
 ) -> Result<usize, PersistenceError> {
-    BINLOG_RECORD_MAGIC
-        .len()
+    versioned_binlog_record_length(1, effect_record_length)?
         .checked_add(BINLOG_RECORD_LENGTH_SIZE)
-        .and_then(|length| length.checked_add(8))
-        .and_then(|length| length.checked_add(effect_record_length))
-        .and_then(|length| length.checked_add(BINLOG_CHECKSUM_SIZE))
-        .and_then(|length| length.checked_add(BINLOG_RECORD_LENGTH_SIZE))
         .ok_or_else(|| PersistenceError::new("Framed binlog record length overflow"))
 }
 
