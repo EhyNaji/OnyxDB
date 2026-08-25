@@ -2,7 +2,11 @@
 
 All notable changes to OnyxDB are documented in this file.
 
-## Unreleased
+## 0.2.0 (unreleased)
+
+This is the current development version. It consolidates the reliability and
+architecture work completed after the `0.1.0` baseline; it is not yet a tagged
+release or a stability commitment.
 
 ### Reliability
 
@@ -32,6 +36,14 @@ All notable changes to OnyxDB are documented in this file.
 - Made durable commit finalization independent of client-task cancellation, so
   RESP, transaction, OBP, and replicated mutations cannot diverge after a
   binlog write whose acknowledgement is interrupted.
+- Made persistence failures fail closed across append, truncation, generation
+  sealing, periodic synchronization, compaction, and coordinator supervision.
+- Added crash-safe immutable binlog generations, bounded concurrent snapshot
+  capture, byte-driven rollover, and conservative recovery of incomplete final
+  history.
+- Made physical segment-catalog capacity authoritative, reserved snapshot
+  progress below the bounded recovery limit, and applied bounded admission when
+  cleanup or catalog synchronization cannot establish safe capacity.
 
 ### Architecture and maintainability
 
@@ -74,6 +86,11 @@ All notable changes to OnyxDB are documented in this file.
   fixtures to professional English.
 - Added current architecture and reliability invariant documentation.
 - Made continuous integration run locked formatting, lint, and all-target tests.
+- Added a bounded FIFO commit coordinator that groups logical mutations into
+  fewer physical appends without weakening canonical sequence order,
+  cancellation safety, rollback, or replication visibility.
+- Added permanent coordinator, binlog, snapshot-phase, rollover, physical
+  catalog, cleanup, backpressure, and failure observability.
 
 ## 0.1.0 - Initial development baseline
 

@@ -10,18 +10,28 @@ strong regression coverage, but OnyxDB is not yet presented as a production
 replacement for Redis. Review the [known limitations](#known-limitations) before
 using it with important data.
 
+The current package version is **0.2.0 (unreleased)**. It represents the
+reliability and architecture maturation completed after the original `0.1.0`
+development baseline; it is not a protocol-stability or production-readiness
+promise.
+
 ## Highlights
 
 - Strings, integers, lists, hashes, sets, and native JSON documents.
 - JSON field and array access such as `$.profile.name` and `$.items[2]`.
 - RESP and OBP listeners with bounded, fail-closed frame parsing.
-- Checksummed write-ahead logging and versioned gzip-compressed snapshots.
+- Canonical committed-effect persistence with bounded group commit and one
+  authoritative mutation sequence across recovery and replication.
+- Checksummed ONX4 write-ahead records, crash-safe immutable generations, and
+  versioned gzip-compressed snapshots captured while commits continue.
 - Ordered asynchronous master/replica synchronization with authenticated
   upstream connections, partial resynchronization, and full-state replacement.
 - Projected `maxmemory` admission with optional LRU or random eviction.
 - Bounded `MULTI`/`EXEC` queues and atomic visibility for committed transaction
   batches.
 - Prometheus-formatted metrics and a Redis-style `INFO` response.
+- Commit-coordinator, compaction-phase, rollover, catalog-capacity, and
+  backpressure observability.
 
 ## Quick start
 
@@ -147,13 +157,34 @@ acknowledgement durability depends on `--appendfsync`: `always` synchronizes eac
 batch, `everysec` synchronizes in the background, and `no` relies on the
 operating system after userspace flush.
 
+Master mutations enter a bounded FIFO commit coordinator. The coordinator may
+group several logical committed-effect batches into one physical append, but
+each batch retains its own canonical ONX4 record and sequence. Live visibility,
+replication publication, rollback, and client completion follow that same
+authoritative order. Once persistence owns an append, cancellation of the
+originating client task cannot cancel its durable finalization.
+
 Recovery installs a snapshot and replays only binlog sequences after the
 snapshot watermark. A recognizable incomplete final record may be truncated;
 complete corrupted records, sequence gaps, and ambiguous legacy data fail
-startup rather than being skipped. Compaction seals the current binlog
-generation under the commit boundary, then installs and synchronizes the new
-snapshot while commits continue in a new active generation. Snapshot-covered
-segments are cleaned outside the commit path.
+startup rather than being skipped.
+
+Compaction preflushes the active generation while commits continue, briefly
+captures a copy-on-write snapshot boundary, and normally seals the active file
+as an immutable generation. Snapshot materialization, compression, durable
+installation, and covered-segment cleanup run after the commit boundary is
+released. Independent byte-driven rollover prevents a slow or repeatedly
+failing snapshot from allowing unbounded active-file growth.
+
+Recovery accepts a bounded catalog of at most 1,024 immutable segments. The
+runtime accounts for the physical catalog, requests proactive cleanup, reserves
+the last slot for snapshot progress, and applies bounded admission if cleanup or
+catalog synchronization cannot establish safe capacity. At the hard limit,
+compaction can advance the snapshot watermark without creating another segment;
+recovery skips the covered active-file prefix and replays its contiguous
+suffix. See [the architecture guide](docs/architecture.md) and
+[ADR 0004](docs/adr/0004-recoverable-segment-catalog.md) for the complete
+invariants and failure behavior.
 
 ## Replication
 
@@ -215,7 +246,10 @@ replication, lifecycle, and real network/subprocess coverage.
 
 The bundled `onyx-bench` supports bounded, repeatable GET, SET, mixed, and native
 JSON workloads with warmup, concurrency, pipelining, error accounting,
-p50/p95/p99/p99.9 completion latency, and JSON output. See
+p50/p95/p99/p99.9 completion latency, and JSON output. With metrics sampling it
+also reports coordinator queueing and group composition, physical append
+behavior, compaction phases and pauses, rollover, retained bytes, segment
+cleanup, and catalog backpressure. See
 [docs/benchmarking.md](docs/benchmarking.md) for the methodology and comparison
 rules. Benchmark output is evidence from one environment, not a general
 performance claim.
@@ -234,6 +268,9 @@ incremental decomposition plan.
 - No cluster mode, consensus, quorum, or automatic multi-replica fencing.
 - Replication is asynchronous; acknowledged master writes can be ahead of a
   replica.
+- Segment cleanup validates complete covered history before deletion. This work
+  runs outside the commit boundary but is linear in segment bytes and can still
+  compete with commits for physical I/O.
 - Pub/Sub is ephemeral and is neither persisted nor replicated.
 - OBP exposes only a small command subset and is not a stable public protocol.
 - JSON path support is deliberately limited as described above.
