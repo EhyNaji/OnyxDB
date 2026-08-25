@@ -90,7 +90,9 @@ both profiles:
 - effective record threshold, writes since snapshot, and snapshot entries;
 - preflushed, growth, sealed, and retained binlog bytes;
 - independent rollover count and final active-generation bytes;
-- uncovered segment count and its forced-snapshot limit;
+- uncovered and physical segment counts, proactive snapshot pressure, recovery
+  limit, cleanup-blocked and catalog-unavailable states, and catalog
+  backpressure;
 - preflush backpressure waiters and duration;
 - snapshot capture, materialization, encoding, and durable installation;
 - total and process-lifetime maximum commit-path pause;

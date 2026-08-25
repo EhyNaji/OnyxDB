@@ -2079,6 +2079,55 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
     );
     push_metric(
         &mut output,
+        "onyxdb_binlog_physical_segments",
+        "Immutable binlog segments physically present after authoritative cleanup accounting",
+        "gauge",
+        persistence.physical_segment_count(),
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_physical_segment_limit",
+        "Maximum immutable segment count accepted by recovery",
+        "gauge",
+        MAX_BINLOG_SEGMENTS,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_physical_segment_snapshot_pressure",
+        "Physical segment count that requests proactive snapshot cleanup",
+        "gauge",
+        BINLOG_SEGMENT_SNAPSHOT_PRESSURE,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_physical_segment_rollover_limit",
+        "Physical segment count reserved from independent rollover for snapshot recovery",
+        "gauge",
+        BINLOG_SEGMENT_ROLLOVER_LIMIT,
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_segment_cleanup_blocked",
+        "1 when the most recent authoritative segment cleanup retained one or more covered files",
+        "gauge",
+        u8::from(persistence.segment_cleanup_blocked()),
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_segment_catalog_unavailable",
+        "1 when segment catalog enumeration or directory synchronization is not authoritative",
+        "gauge",
+        u8::from(persistence.segment_catalog_unavailable()),
+    );
+    push_metric(
+        &mut output,
+        "onyxdb_binlog_segment_catalog_backpressure_active",
+        "1 while commit admission is stopped to preserve recoverable segment-catalog capacity",
+        "gauge",
+        u8::from(persistence.segment_catalog_backpressure_active()),
+    );
+    push_metric(
+        &mut output,
         "onyxdb_binlog_rollover_pending",
         "1 when automatic active-generation rollover is scheduled or active",
         "gauge",
@@ -2150,6 +2199,18 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
             "Independent active-generation rollover attempts currently active",
             "gauge",
             compaction.rollover_in_progress,
+        ),
+        (
+            "onyxdb_binlog_catalog_capacity_rejections_total",
+            "Independent rollovers rejected to preserve snapshot catalog capacity",
+            "counter",
+            compaction.catalog_capacity_rejections_total,
+        ),
+        (
+            "onyxdb_compaction_full_catalog_snapshots_total",
+            "Snapshots captured without sealing because the physical segment catalog was full",
+            "counter",
+            compaction.full_catalog_snapshots_total,
         ),
     ] {
         push_metric(&mut output, name, help, metric_type, value);
@@ -2414,14 +2475,14 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
     push_metric(
         &mut output,
         "onyxdb_compaction_retained_binlog_bytes_total",
-        "Post-watermark binlog bytes retained across completed compactions",
+        "Active binlog bytes retained at completed snapshot checkpoints",
         "counter",
         compaction.retained_bytes_total,
     );
     push_metric(
         &mut output,
         "onyxdb_compaction_retained_binlog_bytes_max",
-        "Largest post-watermark binlog suffix retained by one compaction",
+        "Largest active binlog file retained at a completed snapshot checkpoint",
         "gauge",
         compaction.retained_bytes_max,
     );
@@ -3741,6 +3802,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recovery.replayed_records,
         recovery.active_binlog_bytes,
         recovery.unsnapshotted_segment_count,
+        recovery.physical_segment_count,
+        recovery.snapshot_watermark,
     );
     persistence.set_compaction_entry_floor(store.stats().total_keys);
 
@@ -4907,7 +4970,13 @@ mod tests {
         assert!(body.contains("onyxdb_binlog_active_generation_bytes 0\n"));
         assert!(body.contains("onyxdb_binlog_rollover_completed_total 0\n"));
         assert!(body.contains("onyxdb_binlog_unsnapshotted_segments 0\n"));
+        assert!(body.contains("onyxdb_binlog_physical_segments 0\n"));
+        assert!(body.contains("onyxdb_binlog_segment_cleanup_blocked 0\n"));
+        assert!(body.contains("onyxdb_binlog_segment_catalog_unavailable 0\n"));
+        assert!(body.contains("onyxdb_binlog_segment_catalog_backpressure_active 0\n"));
+        assert!(body.contains("onyxdb_binlog_catalog_capacity_rejections_total 0\n"));
         assert!(body.contains("onyxdb_compaction_completed_total 0\n"));
+        assert!(body.contains("onyxdb_compaction_full_catalog_snapshots_total 0\n"));
         assert!(body.contains("onyxdb_compaction_preflushed_binlog_bytes_total 0\n"));
         assert!(body.contains("onyxdb_compaction_preflush_growth_bytes_total 0\n"));
         assert!(body.contains("onyxdb_compaction_preflush_backpressure_waiters_current 0\n"));

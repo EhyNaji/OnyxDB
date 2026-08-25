@@ -1,9 +1,9 @@
 use super::{
     BINLOG_RECORD_LENGTH_SIZE, BINLOG_RECORD_MAGIC, BinlogRecordIntegrity,
     CHECKSUMLESS_BINLOG_RECORD_MAGIC, DecodedBinlogRecord, MAX_BINLOG_RECORD_SIZE,
-    MAX_SNAPSHOT_RECORD_SIZE, PersistenceError, PersistencePaths, apply_committed_batch,
-    decode_binlog_record, decode_committed_batch, decode_snapshot_entry, encode_snapshot_entry,
-    line_to_entry, read_u32_be,
+    MAX_BINLOG_SEGMENTS, MAX_SNAPSHOT_RECORD_SIZE, PersistenceError, PersistencePaths,
+    apply_committed_batch, decode_binlog_record, decode_committed_batch, decode_snapshot_entry,
+    encode_snapshot_entry, line_to_entry, read_u32_be,
 };
 use bytes::Bytes;
 use flate2::Compression;
@@ -20,7 +20,6 @@ pub(crate) const SNAPSHOT_MAGIC: &str = "ONYXSNAP";
 pub(crate) const SNAPSHOT_VERSION: u8 = 2;
 pub(crate) const MAX_SNAPSHOT_METADATA_SIZE: usize = 4096;
 pub(crate) const MAX_SNAPSHOT_LINE_SIZE: usize = 512 * 1024 * 1024 + 1024;
-const MAX_BINLOG_SEGMENTS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SnapshotFormat {
@@ -45,6 +44,7 @@ pub(crate) struct RecoveryState {
     pub(crate) replayed_records: usize,
     pub(crate) active_binlog_bytes: u64,
     pub(crate) unsnapshotted_segment_count: usize,
+    pub(crate) physical_segment_count: usize,
 }
 
 #[derive(Debug)]
@@ -397,7 +397,8 @@ pub(crate) fn load_data_from_paths(
     }
     store.replace_all(staging.raw_entries());
     info!("Binlog replayed: {} commands", replayed);
-    cleanup_snapshot_covered_segments(&history, snapshot_watermark, paths);
+    let physical_segment_count =
+        cleanup_snapshot_covered_segments(&history, snapshot_watermark, paths);
     cleanup_redundant_binlog_rotation_files(paths);
 
     let history_sequence = history
@@ -424,6 +425,7 @@ pub(crate) fn load_data_from_paths(
         replayed_records: replayed,
         active_binlog_bytes,
         unsnapshotted_segment_count,
+        physical_segment_count,
     })
 }
 
@@ -562,14 +564,18 @@ fn cleanup_snapshot_covered_segments(
     history: &[InspectedBinlogFile],
     snapshot_watermark: u64,
     paths: &PersistencePaths,
-) {
-    let mut removed = false;
+) -> usize {
+    let sealed_segment_count = history
+        .iter()
+        .filter(|file| file.declared_end_sequence.is_some())
+        .count();
+    let mut removed_files = 0usize;
     for file in history.iter().filter(|file| {
         file.declared_end_sequence.is_some() && file.inspection.max_sequence <= snapshot_watermark
     }) {
         match fs::remove_file(&file.path) {
-            Ok(()) => removed = true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(()) => removed_files += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => removed_files += 1,
             Err(error) => warn!(
                 "Unable to remove snapshot-covered binlog segment {}: {}",
                 file.path.display(),
@@ -577,12 +583,16 @@ fn cleanup_snapshot_covered_segments(
             ),
         }
     }
-    if removed && let Err(error) = sync_parent_directory(&paths.binlog) {
+    if removed_files > 0
+        && let Err(error) = sync_parent_directory(&paths.binlog)
+    {
         warn!(
             "Unable to synchronize snapshot-covered binlog segment cleanup: {}",
             error
         );
+        return sealed_segment_count;
     }
+    sealed_segment_count.saturating_sub(removed_files)
 }
 
 fn recover_interrupted_binlog_rotation(paths: &PersistencePaths) -> Result<(), PersistenceError> {
@@ -999,6 +1009,7 @@ mod tests {
         assert_eq!(recovery.snapshot_watermark, 1);
         assert_eq!(recovery.last_sequence, 3);
         assert_eq!(recovery.replayed_records, 2);
+        assert_eq!(recovery.physical_segment_count, 1);
         assert_eq!(store.get("key"), Ok(Some("active".to_string())));
     }
 
@@ -1012,6 +1023,7 @@ mod tests {
         let recovery = load_data_from_paths(&store, &paths).unwrap();
 
         assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(recovery.physical_segment_count, 1);
         assert_eq!(store.get("key"), Ok(Some("sealed".to_string())));
     }
 
@@ -1058,6 +1070,7 @@ mod tests {
 
         assert_eq!(recovery.last_sequence, 3);
         assert_eq!(recovery.replayed_records, 1);
+        assert_eq!(recovery.physical_segment_count, 0);
         assert_eq!(store.get("key"), Ok(Some("active".to_string())));
         assert!(!segment.exists());
     }

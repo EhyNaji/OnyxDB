@@ -107,5 +107,5 @@ therefore be an independent snapshot signal.
   Its pause is bounded by generation growth and admission policy, but storage
   latency itself is not bounded.
 - Repeated snapshot installation failures can continue to accumulate valid
-  segments. The 256-segment trigger provides recovery headroom but does not
-  claim infinite tolerance of a permanently unwritable snapshot destination.
+  segments. ADR 0004 adds physical catalog accounting, reserved snapshot
+  capacity, and bounded admission before the recovery limit can be exceeded.

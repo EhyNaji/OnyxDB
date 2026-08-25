@@ -21,6 +21,9 @@ pub(crate) const BINLOG_GENERATION_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const BINLOG_GENERATION_ADMISSION_LIMIT_BYTES: u64 =
     BINLOG_GENERATION_TARGET_BYTES + COMPACTION_PREFLUSH_WRITE_BUDGET_BYTES;
 pub(crate) const MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS: usize = 256;
+pub(crate) const BINLOG_SEGMENT_SNAPSHOT_PRESSURE: usize =
+    super::MAX_BINLOG_SEGMENTS - MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS;
+pub(crate) const BINLOG_SEGMENT_ROLLOVER_LIMIT: usize = super::MAX_BINLOG_SEGMENTS - 1;
 const WRITE_BUDGET_OPEN: u64 = u64::MAX;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -227,6 +230,8 @@ pub(crate) struct CompactionMetricsSnapshot {
     pub(crate) rollover_in_progress: u64,
     pub(crate) rollover_duration_nanoseconds_total: u64,
     pub(crate) rollover_duration_nanoseconds_max: u64,
+    pub(crate) catalog_capacity_rejections_total: u64,
+    pub(crate) full_catalog_snapshots_total: u64,
 }
 
 #[derive(Default)]
@@ -284,6 +289,8 @@ struct CompactionMetrics {
     rollover_failed_total: AtomicU64,
     rollover_in_progress: AtomicU64,
     rollover_duration: DurationMetric,
+    catalog_capacity_rejections_total: AtomicU64,
+    full_catalog_snapshots_total: AtomicU64,
 }
 
 impl CompactionMetrics {
@@ -368,6 +375,10 @@ impl CompactionMetrics {
                 .total
                 .load(Ordering::Relaxed),
             rollover_duration_nanoseconds_max: self.rollover_duration.max.load(Ordering::Relaxed),
+            catalog_capacity_rejections_total: self
+                .catalog_capacity_rejections_total
+                .load(Ordering::Relaxed),
+            full_catalog_snapshots_total: self.full_catalog_snapshots_total.load(Ordering::Relaxed),
         }
     }
 
@@ -696,24 +707,37 @@ struct BinlogSegmentCleanup {
     removed_files: u64,
     removed_bytes: u64,
     failed_files: u64,
+    remaining_files: usize,
 }
 
 fn cleanup_binlog_segments_through(
     paths: &super::PersistencePaths,
     watermark: u64,
-) -> BinlogSegmentCleanup {
+) -> Result<BinlogSegmentCleanup, PersistenceError> {
     let mut cleanup = BinlogSegmentCleanup::default();
-    let segments = match list_binlog_segments(paths) {
-        Ok(segments) => segments,
-        Err(error) => {
-            warn!("Unable to enumerate snapshot-covered binlog segments: {error}");
-            cleanup.failed_files = 1;
-            return cleanup;
-        }
-    };
+    let segments = list_binlog_segments(paths).map_err(|error| {
+        PersistenceError::new(format!(
+            "Unable to enumerate binlog segment catalog: {error}"
+        ))
+    })?;
     for (end_sequence, path) in segments {
         if end_sequence > watermark {
             continue;
+        }
+        let inspection = super::inspect_binlog(&path).map_err(|error| {
+            PersistenceError::new(format!(
+                "Unable to validate snapshot-covered binlog segment {}: {error}",
+                path.display()
+            ))
+        })?;
+        if inspection.min_sequence.is_none()
+            || inspection.max_sequence != end_sequence
+            || inspection.truncated_tail
+        {
+            return Err(PersistenceError::new(format!(
+                "Snapshot-covered binlog segment does not match its catalog identity: {}",
+                path.display()
+            )));
         }
         let length = fs::metadata(&path)
             .map(|metadata| metadata.len())
@@ -734,13 +758,42 @@ fn cleanup_binlog_segments_through(
             }
         }
     }
-    if cleanup.removed_files > 0
-        && let Err(error) = sync_parent_directory(&paths.binlog)
-    {
-        cleanup.failed_files += 1;
-        warn!("Unable to synchronize binlog segment cleanup: {error}");
-    }
-    cleanup
+    sync_parent_directory(&paths.binlog).map_err(|error| {
+        PersistenceError::new(format!(
+            "Unable to synchronize binlog segment catalog maintenance: {error}"
+        ))
+    })?;
+    cleanup.remaining_files = list_binlog_segments(paths)
+        .map_err(|error| {
+            PersistenceError::new(format!(
+                "Unable to refresh binlog segment catalog after cleanup: {error}"
+            ))
+        })?
+        .len();
+    Ok(cleanup)
+}
+
+type SegmentCatalogOperation = Arc<
+    dyn Fn(super::PersistencePaths, u64) -> Result<BinlogSegmentCleanup, PersistenceError>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+fn operating_system_segment_catalog_operation() -> SegmentCatalogOperation {
+    Arc::new(|paths, watermark| cleanup_binlog_segments_through(&paths, watermark))
+}
+
+async fn run_segment_catalog_operation(
+    operation: SegmentCatalogOperation,
+    paths: super::PersistencePaths,
+    watermark: u64,
+) -> Result<BinlogSegmentCleanup, PersistenceError> {
+    tokio::task::spawn_blocking(move || operation(paths, watermark))
+        .await
+        .map_err(|error| {
+            PersistenceError::new(format!("Binlog segment catalog task failed: {error}"))
+        })?
 }
 
 fn preflush_active_generation(paths: &super::PersistencePaths) -> Result<u64, PersistenceError> {
@@ -880,6 +933,10 @@ pub(crate) struct CommitRuntime {
     accepted_binlog_bytes: AtomicU64,
     active_binlog_bytes: AtomicU64,
     unsnapshotted_segment_count: AtomicUsize,
+    physical_segment_count: AtomicUsize,
+    snapshot_watermark: AtomicU64,
+    segment_cleanup_blocked: AtomicBool,
+    segment_catalog_unavailable: AtomicBool,
     compaction_entry_floor: AtomicUsize,
     compaction_write_budget_limit: AtomicU64,
     compaction_write_budget_notify: Notify,
@@ -949,6 +1006,10 @@ impl CommitRuntime {
             accepted_binlog_bytes: AtomicU64::new(0),
             active_binlog_bytes: AtomicU64::new(0),
             unsnapshotted_segment_count: AtomicUsize::new(0),
+            physical_segment_count: AtomicUsize::new(0),
+            snapshot_watermark: AtomicU64::new(0),
+            segment_cleanup_blocked: AtomicBool::new(false),
+            segment_catalog_unavailable: AtomicBool::new(false),
             compaction_entry_floor: AtomicUsize::new(0),
             compaction_write_budget_limit: AtomicU64::new(WRITE_BUDGET_OPEN),
             compaction_write_budget_notify: Notify::new(),
@@ -990,10 +1051,14 @@ impl CommitRuntime {
     }
 
     fn request_snapshot_if_needed(&self, compaction_threshold: usize) -> bool {
+        let physical_pressure = self.physical_segment_count.load(Ordering::SeqCst)
+            >= BINLOG_SEGMENT_SNAPSHOT_PRESSURE
+            && !self.segment_cleanup_blocked.load(Ordering::SeqCst);
         (self.write_count.load(Ordering::SeqCst)
             >= self.compaction_record_threshold(compaction_threshold)
             || self.unsnapshotted_segment_count.load(Ordering::SeqCst)
-                >= MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS)
+                >= MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS
+            || physical_pressure)
             && self
                 .compaction_pending
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1001,7 +1066,12 @@ impl CommitRuntime {
     }
 
     fn request_rollover_if_needed(&self) -> bool {
+        let physical_segment_count = self.physical_segment_count.load(Ordering::SeqCst);
+        let snapshot_catalog_pressure = physical_segment_count >= BINLOG_SEGMENT_SNAPSHOT_PRESSURE
+            && !self.segment_cleanup_blocked.load(Ordering::SeqCst);
         self.active_binlog_bytes.load(Ordering::SeqCst) >= BINLOG_GENERATION_TARGET_BYTES
+            && physical_segment_count < BINLOG_SEGMENT_ROLLOVER_LIMIT
+            && !snapshot_catalog_pressure
             && self
                 .rollover_pending
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1066,8 +1136,30 @@ impl CommitRuntime {
             && self.active_binlog_bytes() >= BINLOG_GENERATION_ADMISSION_LIMIT_BYTES
     }
 
+    pub(crate) fn segment_catalog_backpressure_active(&self) -> bool {
+        (self.physical_segment_count() >= BINLOG_SEGMENT_ROLLOVER_LIMIT
+            || self.segment_catalog_unavailable.load(Ordering::SeqCst))
+            && self.active_binlog_bytes() >= BINLOG_GENERATION_ADMISSION_LIMIT_BYTES
+    }
+
     pub(crate) fn unsnapshotted_segment_count(&self) -> usize {
         self.unsnapshotted_segment_count.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn physical_segment_count(&self) -> usize {
+        self.physical_segment_count.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn segment_cleanup_blocked(&self) -> bool {
+        self.segment_cleanup_blocked.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn segment_catalog_unavailable(&self) -> bool {
+        self.segment_catalog_unavailable.load(Ordering::SeqCst)
+    }
+
+    fn snapshot_watermark(&self) -> u64 {
+        self.snapshot_watermark.load(Ordering::SeqCst)
     }
 
     pub(crate) fn restore_maintenance_state(
@@ -1075,17 +1167,85 @@ impl CommitRuntime {
         replayed_records: usize,
         active_binlog_bytes: u64,
         unsnapshotted_segment_count: usize,
+        physical_segment_count: usize,
+        snapshot_watermark: u64,
     ) {
         self.write_count.store(replayed_records, Ordering::SeqCst);
         self.active_binlog_bytes
             .store(active_binlog_bytes, Ordering::SeqCst);
         self.unsnapshotted_segment_count
             .store(unsnapshotted_segment_count, Ordering::SeqCst);
+        self.physical_segment_count
+            .store(physical_segment_count, Ordering::SeqCst);
+        self.snapshot_watermark
+            .store(snapshot_watermark, Ordering::SeqCst);
+        self.segment_cleanup_blocked.store(false, Ordering::SeqCst);
+        self.segment_catalog_unavailable
+            .store(false, Ordering::SeqCst);
     }
 
     pub(crate) fn set_compaction_entry_floor(&self, entry_count: usize) {
         self.compaction_entry_floor
             .store(entry_count, Ordering::SeqCst);
+    }
+
+    fn record_sealed_segment(&self, sealed_bytes: u64) {
+        if sealed_bytes == 0 {
+            return;
+        }
+        let previous = self.physical_segment_count.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            previous < super::MAX_BINLOG_SEGMENTS,
+            "binlog sealing must not exceed the recovery catalog limit"
+        );
+        self.unsnapshotted_segment_count
+            .fetch_add(1, Ordering::SeqCst);
+        // A new physical generation authorizes one more cleanup attempt. This
+        // avoids a tight snapshot loop while still retrying transient cleanup
+        // failures as the catalog changes.
+        self.segment_cleanup_blocked.store(false, Ordering::SeqCst);
+    }
+
+    fn apply_segment_catalog_cleanup(&self, cleanup: BinlogSegmentCleanup) {
+        self.physical_segment_count
+            .store(cleanup.remaining_files, Ordering::SeqCst);
+        self.segment_cleanup_blocked
+            .store(cleanup.failed_files > 0, Ordering::SeqCst);
+        self.segment_catalog_unavailable
+            .store(false, Ordering::SeqCst);
+        self.compaction_write_budget_notify.notify_waiters();
+    }
+
+    async fn refresh_segment_catalog(
+        &self,
+        operation: SegmentCatalogOperation,
+    ) -> Result<BinlogSegmentCleanup, PersistenceError> {
+        let started = Instant::now();
+        let result =
+            run_segment_catalog_operation(operation, self.paths.clone(), self.snapshot_watermark())
+                .await;
+        match result {
+            Ok(cleanup) => {
+                self.apply_segment_catalog_cleanup(cleanup);
+                self.compaction_metrics
+                    .observe_cleanup(cleanup, started.elapsed());
+                Ok(cleanup)
+            }
+            Err(error) => {
+                self.segment_cleanup_blocked.store(true, Ordering::SeqCst);
+                self.segment_catalog_unavailable
+                    .store(true, Ordering::SeqCst);
+                self.compaction_metrics.observe_cleanup(
+                    BinlogSegmentCleanup {
+                        failed_files: 1,
+                        remaining_files: self.physical_segment_count(),
+                        ..BinlogSegmentCleanup::default()
+                    },
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
     }
 
     fn binlog_accepted_bytes(&self) -> u64 {
@@ -1110,6 +1270,7 @@ impl CommitRuntime {
         let limit = self.compaction_write_budget_limit.load(Ordering::SeqCst);
         (limit == WRITE_BUDGET_OPEN || self.binlog_accepted_bytes() < limit)
             && !self.rollover_backpressure_active()
+            && !self.segment_catalog_backpressure_active()
     }
 
     async fn wait_for_compaction_write_budget(&self) {
@@ -1223,6 +1384,12 @@ impl CommitRuntime {
         self.accepted_binlog_bytes.store(0, Ordering::SeqCst);
         self.active_binlog_bytes.store(0, Ordering::SeqCst);
         self.unsnapshotted_segment_count.store(0, Ordering::SeqCst);
+        self.physical_segment_count.store(0, Ordering::SeqCst);
+        self.snapshot_watermark.store(sequence, Ordering::SeqCst);
+        self.segment_cleanup_blocked.store(false, Ordering::SeqCst);
+        self.segment_catalog_unavailable
+            .store(false, Ordering::SeqCst);
+        self.compaction_write_budget_notify.notify_waiters();
         self.set_compaction_entry_floor(entry_count);
     }
 
@@ -1359,6 +1526,26 @@ impl CommitRuntime {
             measurement.finish(true);
             return Ok(watermark);
         }
+        if let Err(error) = self
+            .refresh_segment_catalog(operating_system_segment_catalog_operation())
+            .await
+        {
+            measurement.finish(false);
+            return Err(error_with_context(
+                error,
+                "Binlog generation rollover catalog maintenance failed",
+            ));
+        }
+        if self.physical_segment_count() >= BINLOG_SEGMENT_ROLLOVER_LIMIT {
+            self.compaction_metrics
+                .catalog_capacity_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            measurement.finish(false);
+            return Err(PersistenceError::new(format!(
+                "Binlog generation rollover is blocked at {} physical segments; the remaining catalog capacity is reserved for snapshot compaction",
+                self.physical_segment_count()
+            )));
+        }
         let write_budget = self.activate_compaction_write_budget();
 
         let preflush_started = Instant::now();
@@ -1423,10 +1610,7 @@ impl CommitRuntime {
         self.compaction_metrics
             .observe_preflush_growth(sealed_bytes.saturating_sub(preflushed_bytes));
         self.active_binlog_bytes.store(0, Ordering::SeqCst);
-        if sealed_bytes > 0 {
-            self.unsnapshotted_segment_count
-                .fetch_add(1, Ordering::SeqCst);
-        }
+        self.record_sealed_segment(sealed_bytes);
         self.compaction_metrics
             .write_pause
             .observe(pause_started.elapsed());
@@ -1459,13 +1643,34 @@ impl CommitRuntime {
         upstream_replid: Arc<AtomicU64>,
         snapshot_writer: SnapshotWriteOperation,
     ) -> Result<u64, PersistenceError> {
+        self.compact_with_operations(
+            store,
+            upstream_replid,
+            snapshot_writer,
+            operating_system_segment_catalog_operation(),
+        )
+        .await
+    }
+
+    async fn compact_with_operations(
+        self: &Arc<Self>,
+        store: Arc<ShardedStore>,
+        upstream_replid: Arc<AtomicU64>,
+        snapshot_writer: SnapshotWriteOperation,
+        segment_catalog_operation: SegmentCatalogOperation,
+    ) -> Result<u64, PersistenceError> {
         let (completion_tx, completion_rx) = oneshot::channel();
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             let worker_runtime = Arc::clone(&runtime);
             let worker = tokio::spawn(async move {
                 worker_runtime
-                    .compact_owned(store, upstream_replid, snapshot_writer)
+                    .compact_owned(
+                        store,
+                        upstream_replid,
+                        snapshot_writer,
+                        segment_catalog_operation,
+                    )
                     .await
             });
             let result = match worker.await {
@@ -1502,6 +1707,7 @@ impl CommitRuntime {
         store: Arc<ShardedStore>,
         upstream_replid: Arc<AtomicU64>,
         snapshot_writer: SnapshotWriteOperation,
+        segment_catalog_operation: SegmentCatalogOperation,
     ) -> Result<u64, PersistenceError> {
         let measurement = CompactionMeasurement::start(&self.compaction_metrics);
         let serialization_started = Instant::now();
@@ -1510,15 +1716,35 @@ impl CommitRuntime {
             .serialization_wait
             .observe(serialization_started.elapsed());
         let _rotation_guard = self.rotation_gate.lock().await;
-        let write_budget = self.activate_compaction_write_budget();
+        if let Err(error) = self
+            .refresh_segment_catalog(Arc::clone(&segment_catalog_operation))
+            .await
+        {
+            measurement.finish(false);
+            return Err(error_with_context(
+                error,
+                "Snapshot compaction catalog maintenance failed",
+            ));
+        }
+        let seal_generation = self.physical_segment_count() < super::MAX_BINLOG_SEGMENTS;
+        if !seal_generation {
+            self.compaction_metrics
+                .full_catalog_snapshots_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let write_budget = seal_generation.then(|| self.activate_compaction_write_budget());
 
-        let preflush_started = Instant::now();
-        let preflush_paths = self.paths.clone();
-        let preflushed_bytes =
+        let preflushed_bytes = if seal_generation {
+            let preflush_started = Instant::now();
+            let preflush_paths = self.paths.clone();
             match tokio::task::spawn_blocking(move || preflush_active_generation(&preflush_paths))
                 .await
             {
-                Ok(Ok(preflushed_bytes)) => preflushed_bytes,
+                Ok(Ok(preflushed_bytes)) => {
+                    self.compaction_metrics
+                        .observe_preflush(preflushed_bytes, preflush_started.elapsed());
+                    preflushed_bytes
+                }
                 Ok(Err(error)) => {
                     self.compaction_metrics
                         .observe_preflush(0, preflush_started.elapsed());
@@ -1536,9 +1762,10 @@ impl CommitRuntime {
                         "Active binlog generation preflush task failed: {error}"
                     )));
                 }
-            };
-        self.compaction_metrics
-            .observe_preflush(preflushed_bytes, preflush_started.elapsed());
+            }
+        } else {
+            0
+        };
 
         let gate_started = Instant::now();
         let boundary = self.acquire_compaction_boundary().await;
@@ -1548,33 +1775,36 @@ impl CommitRuntime {
         let capture_pause_started = Instant::now();
         let watermark = self.sequence();
         let rotation_started = Instant::now();
-        let sealed_bytes = match self.binlog.seal_active(watermark).await {
-            Ok(sealed_bytes) => sealed_bytes,
-            Err(error) => {
-                self.compaction_metrics
-                    .rotation
-                    .observe(rotation_started.elapsed());
-                self.compaction_metrics
-                    .write_pause
-                    .observe(capture_pause_started.elapsed());
-                let error = error_with_context(error, "Binlog generation sealing failed");
-                if error.is_indeterminate() {
-                    self.enter_fail_stop_with_boundary(boundary, error.to_string());
-                } else {
-                    drop(boundary);
+        let sealed_bytes = if seal_generation {
+            match self.binlog.seal_active(watermark).await {
+                Ok(sealed_bytes) => sealed_bytes,
+                Err(error) => {
+                    self.compaction_metrics
+                        .rotation
+                        .observe(rotation_started.elapsed());
+                    self.compaction_metrics
+                        .write_pause
+                        .observe(capture_pause_started.elapsed());
+                    let error = error_with_context(error, "Binlog generation sealing failed");
+                    if error.is_indeterminate() {
+                        self.enter_fail_stop_with_boundary(boundary, error.to_string());
+                    } else {
+                        drop(boundary);
+                    }
+                    measurement.finish(false);
+                    return Err(error);
                 }
-                measurement.finish(false);
-                return Err(error);
             }
+        } else {
+            0
         };
         self.compaction_metrics
             .rotation
             .observe(rotation_started.elapsed());
         self.compaction_metrics.observe_sealed_bytes(sealed_bytes);
-        self.active_binlog_bytes.store(0, Ordering::SeqCst);
-        if sealed_bytes > 0 {
-            self.unsnapshotted_segment_count
-                .fetch_add(1, Ordering::SeqCst);
+        if seal_generation {
+            self.active_binlog_bytes.store(0, Ordering::SeqCst);
+            self.record_sealed_segment(sealed_bytes);
         }
         self.compaction_metrics
             .observe_preflush_growth(sealed_bytes.saturating_sub(preflushed_bytes));
@@ -1588,7 +1818,9 @@ impl CommitRuntime {
             .observe(capture_started.elapsed());
         drop(boundary);
         drop(_rotation_guard);
-        write_budget.release();
+        if let Some(write_budget) = write_budget {
+            write_budget.release();
+        }
         self.compaction_metrics
             .write_pause
             .observe(capture_pause_started.elapsed());
@@ -1680,6 +1912,7 @@ impl CommitRuntime {
         }
         self.compaction_metrics
             .observe_retained_bytes(retained_bytes);
+        self.snapshot_watermark.store(watermark, Ordering::SeqCst);
         self.write_count
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 Some(count.saturating_sub(compacted_write_count))
@@ -1696,24 +1929,27 @@ impl CommitRuntime {
             .observe(final_pause_started.elapsed());
         drop(boundary);
 
-        let cleanup_started = Instant::now();
-        let cleanup_paths = self.paths.clone();
-        let cleanup = tokio::task::spawn_blocking(move || {
-            cleanup_binlog_segments_through(&cleanup_paths, watermark)
-        })
-        .await
-        .unwrap_or_else(|error| {
-            warn!("Binlog segment cleanup task failed: {error}");
-            BinlogSegmentCleanup {
-                failed_files: 1,
-                ..BinlogSegmentCleanup::default()
+        let cleanup = match self
+            .refresh_segment_catalog(segment_catalog_operation)
+            .await
+        {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                warn!("Binlog segment cleanup could not establish catalog capacity: {error}");
+                BinlogSegmentCleanup {
+                    failed_files: 1,
+                    remaining_files: self.physical_segment_count(),
+                    ..BinlogSegmentCleanup::default()
+                }
             }
-        });
-        self.compaction_metrics
-            .observe_cleanup(cleanup, cleanup_started.elapsed());
+        };
         info!(
-            "Compaction complete at sequence {}: {} bytes sealed, {} post-boundary bytes retained, {} covered segment(s) removed",
-            watermark, sealed_bytes, retained_bytes, cleanup.removed_files
+            "Compaction complete at sequence {}: {} bytes sealed, {} active binlog bytes retained, {} covered segment(s) removed, {} physical segment(s) remain",
+            watermark,
+            sealed_bytes,
+            retained_bytes,
+            cleanup.removed_files,
+            self.physical_segment_count()
         );
         measurement.finish(true);
         Ok(watermark)
@@ -2550,7 +2786,25 @@ mod tests {
         let directory = TestDirectory::new();
         let (sender, _receiver) = mpsc::channel(1);
         let runtime = CommitRuntime::new(BinlogHandle::new(sender), 0, directory.paths());
-        runtime.restore_maintenance_state(0, 0, MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS);
+        runtime.restore_maintenance_state(0, 0, MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS, 0, 0);
+
+        let request = runtime.request_maintenance_if_needed(100_000);
+
+        assert!(request.snapshot);
+        assert!(!request.rollover);
+    }
+
+    #[test]
+    fn physical_catalog_pressure_prefers_snapshot_compaction_over_rollover() {
+        let directory = TestDirectory::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let runtime = CommitRuntime::new(BinlogHandle::new(sender), 0, directory.paths());
+        runtime
+            .physical_segment_count
+            .store(BINLOG_SEGMENT_SNAPSHOT_PRESSURE, Ordering::SeqCst);
+        runtime
+            .active_binlog_bytes
+            .store(BINLOG_GENERATION_TARGET_BYTES, Ordering::SeqCst);
 
         let request = runtime.request_maintenance_if_needed(100_000);
 
@@ -2567,6 +2821,8 @@ mod tests {
             0,
             BINLOG_GENERATION_TARGET_BYTES,
             MAX_UNSNAPSHOTTED_BINLOG_SEGMENTS,
+            0,
+            0,
         );
         let initial = runtime.request_maintenance_if_needed(100_000);
         assert!(initial.snapshot);
@@ -2664,7 +2920,7 @@ mod tests {
             0,
             directory.paths(),
         ));
-        runtime.restore_maintenance_state(1, BINLOG_GENERATION_ADMISSION_LIMIT_BYTES, 0);
+        runtime.restore_maintenance_state(1, BINLOG_GENERATION_ADMISSION_LIMIT_BYTES, 0, 0, 0);
         runtime.rollover_pending.store(true, Ordering::SeqCst);
 
         let waiting_runtime = Arc::clone(&runtime);
@@ -2697,6 +2953,87 @@ mod tests {
                 .preflush_backpressure_waiters_current,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn exhausted_segment_catalog_bounds_active_generation_growth() {
+        let directory = TestDirectory::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let runtime = Arc::new(CommitRuntime::new(
+            BinlogHandle::new(sender),
+            1,
+            directory.paths(),
+        ));
+        runtime
+            .physical_segment_count
+            .store(BINLOG_SEGMENT_ROLLOVER_LIMIT, Ordering::SeqCst);
+        runtime
+            .active_binlog_bytes
+            .store(BINLOG_GENERATION_ADMISSION_LIMIT_BYTES, Ordering::SeqCst);
+
+        assert!(runtime.segment_catalog_backpressure_active());
+        let waiting_runtime = Arc::clone(&runtime);
+        let mut waiter =
+            tokio::spawn(async move { waiting_runtime.acquire_commit_boundary().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiter)
+                .await
+                .is_err(),
+            "commit admission crossed the recovery catalog capacity bound"
+        );
+
+        runtime
+            .physical_segment_count
+            .store(BINLOG_SEGMENT_ROLLOVER_LIMIT - 1, Ordering::SeqCst);
+        runtime.compaction_write_budget_notify.notify_waiters();
+        let boundary = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("catalog capacity release did not wake commit admission")
+            .unwrap();
+        drop(boundary);
+    }
+
+    #[tokio::test]
+    async fn unavailable_segment_catalog_keeps_growth_bounded_until_refresh() {
+        let directory = TestDirectory::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        let runtime = Arc::new(CommitRuntime::new(
+            BinlogHandle::new(sender),
+            1,
+            directory.paths(),
+        ));
+        runtime
+            .active_binlog_bytes
+            .store(BINLOG_GENERATION_ADMISSION_LIMIT_BYTES, Ordering::SeqCst);
+
+        let error = runtime
+            .refresh_segment_catalog(Arc::new(|_, _| {
+                Err(PersistenceError::new(
+                    "Injected segment catalog synchronization failure",
+                ))
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("synchronization failure"));
+        assert!(runtime.segment_catalog_unavailable());
+        assert!(runtime.segment_cleanup_blocked());
+        assert!(runtime.segment_catalog_backpressure_active());
+        assert_eq!(runtime.compaction_metrics().cleanup_failures_total, 1);
+
+        runtime
+            .refresh_segment_catalog(Arc::new(|_, _| {
+                Ok(BinlogSegmentCleanup {
+                    remaining_files: 0,
+                    ..BinlogSegmentCleanup::default()
+                })
+            }))
+            .await
+            .unwrap();
+
+        assert!(!runtime.segment_catalog_unavailable());
+        assert!(!runtime.segment_cleanup_blocked());
+        assert!(!runtime.segment_catalog_backpressure_active());
     }
 
     #[tokio::test]
@@ -3236,6 +3573,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_catalog_snapshot_advances_without_creating_a_generation() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.binlog)
+            .unwrap();
+        let io = Arc::new(std::sync::Mutex::new(ManagedBinlogFile::new(
+            file,
+            paths.clone(),
+        )));
+        let (sender, receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::Always,
+        ));
+        let handle = BinlogHandle::new(sender);
+        handle
+            .append_batch(1, &put_batch_for(b"key", b"first"))
+            .await
+            .unwrap();
+        let active_bytes = std::fs::metadata(&paths.binlog).unwrap().len();
+        let runtime = Arc::new(CommitRuntime::new(handle, 1, paths.clone()));
+        runtime.restore_maintenance_state(1, active_bytes, 0, 0, 0);
+        let store = Arc::new(ShardedStore::new());
+        store.set("key".to_string(), "first".to_string());
+        let catalog_calls = Arc::new(AtomicUsize::new(0));
+        let operation_calls = Arc::clone(&catalog_calls);
+        let catalog_operation: SegmentCatalogOperation = Arc::new(move |_, _| {
+            let call = operation_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(BinlogSegmentCleanup {
+                remaining_files: if call == 0 {
+                    crate::persistence::MAX_BINLOG_SEGMENTS
+                } else {
+                    0
+                },
+                ..BinlogSegmentCleanup::default()
+            })
+        });
+
+        assert_eq!(
+            runtime
+                .compact_with_operations(
+                    Arc::clone(&store),
+                    Arc::new(AtomicU64::new(0)),
+                    Box::new(|entries, watermark, paths| {
+                        write_snapshot_file(entries, watermark, &paths)
+                    }),
+                    catalog_operation,
+                )
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(catalog_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(runtime.active_binlog_bytes(), active_bytes);
+        assert_eq!(runtime.physical_segment_count(), 0);
+        assert_eq!(runtime.unsnapshotted_segment_count(), 0);
+        assert_eq!(runtime.compaction_metrics().full_catalog_snapshots_total, 1);
+        assert_eq!(runtime.compaction_metrics().sealed_bytes_total, 0);
+        assert!(list_binlog_segments(&paths).unwrap().is_empty());
+
+        store.set("key".to_string(), "second".to_string());
+        runtime
+            .accept_next_batch(2, &put_batch_for(b"key", b"second"), 100_000)
+            .await
+            .unwrap();
+        drop(runtime);
+        worker.await.unwrap();
+        drop(io);
+
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &paths).unwrap();
+        assert_eq!(recovery.snapshot_watermark, 1);
+        assert_eq!(recovery.last_sequence, 2);
+        assert_eq!(recovery.replayed_records, 1);
+        assert_eq!(recovery.physical_segment_count, 0);
+        assert_eq!(recovered.get("key"), Ok(Some("second".to_string())));
+    }
+
+    #[tokio::test]
+    async fn failed_segment_cleanup_remains_in_authoritative_catalog_accounting() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.binlog)
+            .unwrap();
+        let io = Arc::new(std::sync::Mutex::new(ManagedBinlogFile::new(
+            file,
+            paths.clone(),
+        )));
+        let (sender, receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::Always,
+        ));
+        let handle = BinlogHandle::new(sender);
+        handle.append_batch(1, &put_batch()).await.unwrap();
+        let runtime = Arc::new(CommitRuntime::new(handle, 1, paths.clone()));
+        runtime.restore_maintenance_state(
+            1,
+            std::fs::metadata(&paths.binlog).unwrap().len(),
+            0,
+            0,
+            0,
+        );
+        let store = Arc::new(ShardedStore::new());
+        store.set("key".to_string(), "accepted".to_string());
+        let catalog_calls = Arc::new(AtomicUsize::new(0));
+        let operation_calls = Arc::clone(&catalog_calls);
+        let catalog_operation: SegmentCatalogOperation = Arc::new(move |_, _| {
+            let call = operation_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(BinlogSegmentCleanup {
+                failed_files: u64::from(call > 0),
+                remaining_files: usize::from(call > 0),
+                ..BinlogSegmentCleanup::default()
+            })
+        });
+
+        runtime
+            .compact_with_operations(
+                store,
+                Arc::new(AtomicU64::new(0)),
+                Box::new(|entries, watermark, paths| {
+                    write_snapshot_file(entries, watermark, &paths)
+                }),
+                catalog_operation,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.physical_segment_count(), 1);
+        assert!(runtime.segment_cleanup_blocked());
+        assert_eq!(runtime.unsnapshotted_segment_count(), 0);
+        assert_eq!(runtime.compaction_metrics().cleanup_failures_total, 1);
+        assert!(paths.binlog_segment(1).exists());
+
+        drop(runtime);
+        worker.await.unwrap();
+        drop(io);
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &paths).unwrap();
+        assert_eq!(recovery.snapshot_watermark, 1);
+        assert_eq!(recovery.last_sequence, 1);
+        assert_eq!(recovery.physical_segment_count, 0);
+        assert_eq!(recovered.get("key"), Ok(Some("accepted".to_string())));
+    }
+
+    #[test]
+    fn catalog_cleanup_validates_covered_segments_before_deletion() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let segment = paths.binlog_segment(1);
+        std::fs::write(&segment, b"corrupt sealed history").unwrap();
+
+        let error = cleanup_binlog_segments_through(&paths, 1).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("snapshot-covered binlog segment")
+        );
+        assert!(segment.exists());
+    }
+
+    #[tokio::test]
     async fn managed_generation_seal_moves_history_and_reopens_the_active_binlog() {
         let directory = TestDirectory::new();
         let paths = directory.paths();
@@ -3430,7 +3943,13 @@ mod tests {
             .await
             .unwrap();
         let runtime = Arc::new(CommitRuntime::new(handle, 1, paths.clone()));
-        runtime.restore_maintenance_state(1, std::fs::metadata(&paths.binlog).unwrap().len(), 0);
+        runtime.restore_maintenance_state(
+            1,
+            std::fs::metadata(&paths.binlog).unwrap().len(),
+            0,
+            0,
+            0,
+        );
         let store = Arc::new(ShardedStore::new());
         store.set("key".to_string(), "first".to_string());
         let upstream_replid = Arc::new(AtomicU64::new(0));
@@ -3461,8 +3980,13 @@ mod tests {
             .await
             .unwrap();
         drop(boundary);
+        let rotation_probe = runtime
+            .rotation_gate
+            .try_lock()
+            .expect("captured snapshot retained the generation rotation gate");
+        drop(rotation_probe);
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), runtime.rollover_generation())
+            tokio::time::timeout(Duration::from_secs(30), runtime.rollover_generation())
                 .await
                 .expect("rollover remained coupled to snapshot installation")
                 .unwrap(),
@@ -3877,7 +4401,7 @@ mod tests {
             1,
             paths.clone(),
         ));
-        runtime.restore_maintenance_state(1, 1, 0);
+        runtime.restore_maintenance_state(1, 1, 0, 0, 0);
 
         let error = runtime.rollover_generation().await.unwrap_err();
 
@@ -3913,7 +4437,7 @@ mod tests {
             FsyncPolicy::No,
         ));
         let runtime = Arc::new(CommitRuntime::new(BinlogHandle::new(sender), 1, paths));
-        runtime.restore_maintenance_state(1, 1, 0);
+        runtime.restore_maintenance_state(1, 1, 0, 0, 0);
 
         let error = runtime.rollover_generation().await.unwrap_err();
 
@@ -3999,7 +4523,19 @@ mod tests {
         ));
 
         let error = runtime
-            .compact(&Arc::new(ShardedStore::new()), &Arc::new(AtomicU64::new(0)))
+            .compact_with_operations(
+                Arc::new(ShardedStore::new()),
+                Arc::new(AtomicU64::new(0)),
+                Box::new(|entries, watermark, paths| {
+                    write_snapshot_file(entries, watermark, &paths)
+                }),
+                Arc::new(|_, _| {
+                    Ok(BinlogSegmentCleanup {
+                        remaining_files: 0,
+                        ..BinlogSegmentCleanup::default()
+                    })
+                }),
+            )
             .await
             .unwrap_err();
 

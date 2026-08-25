@@ -209,14 +209,17 @@ binlog transitions from interleaving. Active-generation rollover has a
 separate ownership gate. Operations that need both gates acquire baseline
 ownership first. Compaction itself has five phases:
 
-1. Without holding the commit boundary, preflush the current active generation
-   through a separate file handle while normal commits continue.
+1. Under rotation ownership, validate and retry cleanup of segments covered by
+   the installed snapshot, synchronize the catalog, and refresh its physical
+   count. When catalog capacity remains available, preflush the current active
+   generation through a separate file handle while normal commits continue.
 2. Hold the complete write and visibility boundary, capture watermark `W`,
-   flush and durably rename a non-empty `onyx.binlog` to the immutable
+   normally flush and durably rename a non-empty `onyx.binlog` to the immutable
    `onyx.binlog.segment.<W>` generation, create a new empty active binlog, and
    replace each live shard map with a copy-on-write view over its immutable
-   snapshot base. This capture is proportional to the fixed shard count rather
-   than dataset cardinality.
+   snapshot base. At the 1,024-segment recovery limit, skip sealing and retain
+   the active file across the snapshot boundary. This capture is proportional
+   to the fixed shard count rather than dataset cardinality.
 3. Release the boundary, materialize each immutable shard and immediately fold
    its live delta back into the engine, then encode, synchronize, and install
    the snapshot while normal commits append only to the new active generation.
@@ -258,12 +261,18 @@ commit admission stops at 24 MiB plus one group that entered below the limit;
 the internal rotation boundary bypasses this limit and cannot deadlock behind
 its own backpressure.
 
-The count of immutable segments newer than the installed snapshot is also
-authoritative and reconstructed during recovery. At 256 segments, snapshot
+Both the count of immutable segments newer than the installed snapshot and the
+physical immutable-segment count are authoritative and reconstructed during
+recovery. At 256 uncovered segments, or 768 physical segments, snapshot
 compaction is requested independently of record count. A snapshot subtracts
-only the segments captured at its watermark, so rollover concurrent with
-snapshot writing remains represented. This threshold retains headroom below
-the 1,024-segment recovery catalog limit.
+only the uncovered segments captured at its watermark, so rollover concurrent
+with snapshot writing remains represented. Independent rollover stops at 1,023
+physical segments to preserve one slot for compaction. At the 1,024-segment
+recovery limit, compaction advances the snapshot watermark without sealing;
+the active file retains its covered prefix and recovery skips it normally.
+Commit admission stops at the bounded active-generation limit while catalog
+capacity remains unavailable. The same bound applies when catalog enumeration
+or directory synchronization cannot establish an authoritative physical count.
 
 The concurrent preflush drains most dirty predecessor pages before generation
 sealing. Sealing still flushes and synchronizes the complete predecessor under
@@ -323,6 +332,8 @@ The in-memory capture refinement and its bounded preflush admission rule are
 recorded in `docs/adr/0002-bounded-snapshot-capture.md`.
 Independent byte rollover and its ordered ownership model are recorded in
 `docs/adr/0003-independent-binlog-rollover.md`.
+Physical catalog capacity and full-catalog snapshot progress are recorded in
+`docs/adr/0004-recoverable-segment-catalog.md`.
 
 Recovery may truncate only a recognizable incomplete record at the end of the
 complete physical history. Complete corruption, ambiguous framing, and an

@@ -18,6 +18,7 @@ const BINLOG_TEMP_PATH: &str = "onyx.binlog.tmp";
 const BINLOG_BACKUP_PATH: &str = "onyx.binlog.previous";
 const BINLOG_SEGMENT_PREFIX: &str = "onyx.binlog.segment.";
 const BINLOG_SEGMENT_SEQUENCE_WIDTH: usize = 20;
+pub(crate) const MAX_BINLOG_SEGMENTS: usize = 1024;
 const REPLICA_STATE_PATH: &str = "onyx.replica";
 
 #[derive(Clone, Debug)]
