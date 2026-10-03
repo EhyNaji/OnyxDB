@@ -48,6 +48,10 @@ Compaction releases rotation ownership immediately after sealing and capturing
 the copy-on-write snapshot epoch, so a later independent rollover may proceed
 while the captured snapshot is materialized and installed. Full
 synchronization holds both gates while destroying and replacing the baseline.
+After installing the snapshot, compaction reacquires rotation ownership for
+snapshot-covered segment validation, deletion, and physical catalog accounting.
+This excludes a concurrent rollover catalog refresh without holding the commit
+boundary; ordinary commits can continue during catalog maintenance.
 
 The runtime separately tracks immutable segments not covered by the installed
 snapshot. Recovery reconstructs this count from validated segment end

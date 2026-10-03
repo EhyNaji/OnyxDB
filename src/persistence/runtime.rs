@@ -1929,6 +1929,15 @@ impl CommitRuntime {
             .observe(final_pause_started.elapsed());
         drop(boundary);
 
+        // Catalog cleanup must not race another generation seal or catalog
+        // refresh. The snapshot writer ran without this gate so commits and
+        // independent rollovers could continue; only final catalog maintenance
+        // reacquires it. Normal commits do not take the rotation gate.
+        let cleanup_gate_started = Instant::now();
+        let cleanup_rotation_guard = self.rotation_gate.lock().await;
+        self.compaction_metrics
+            .gate_wait
+            .observe(cleanup_gate_started.elapsed());
         let cleanup = match self
             .refresh_segment_catalog(segment_catalog_operation)
             .await
@@ -1943,6 +1952,7 @@ impl CommitRuntime {
                 }
             }
         };
+        drop(cleanup_rotation_guard);
         info!(
             "Compaction complete at sequence {}: {} bytes sealed, {} active binlog bytes retained, {} covered segment(s) removed, {} physical segment(s) remain",
             watermark,
@@ -4009,6 +4019,119 @@ mod tests {
         assert_eq!(recovery.snapshot_watermark, 1);
         assert_eq!(recovery.last_sequence, 2);
         assert_eq!(recovery.unsnapshotted_segment_count, 1);
+        assert_eq!(recovered.get("key"), Ok(Some("second".to_string())));
+    }
+
+    #[tokio::test]
+    async fn snapshot_catalog_cleanup_excludes_concurrent_generation_rollover() {
+        let directory = TestDirectory::new();
+        let paths = directory.paths();
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.binlog)
+            .unwrap();
+        let io = Arc::new(std::sync::Mutex::new(ManagedBinlogFile::new(
+            file,
+            paths.clone(),
+        )));
+        let (sender, receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(run_binlog_worker(
+            receiver,
+            Arc::clone(&io),
+            FsyncPolicy::Always,
+        ));
+        let handle = BinlogHandle::new(sender);
+        handle
+            .append_batch(1, &put_batch_for(b"key", b"first"))
+            .await
+            .unwrap();
+        let runtime = Arc::new(CommitRuntime::new(handle, 1, paths.clone()));
+        runtime.restore_maintenance_state(
+            1,
+            std::fs::metadata(&paths.binlog).unwrap().len(),
+            0,
+            0,
+            0,
+        );
+        let store = Arc::new(ShardedStore::new());
+        store.set("key".to_string(), "first".to_string());
+        let (snapshot_started_tx, snapshot_started_rx) = oneshot::channel();
+        let (release_snapshot_tx, release_snapshot_rx) = std::sync::mpsc::channel();
+        let (cleanup_started_tx, cleanup_started_rx) = oneshot::channel();
+        let cleanup_started_tx = std::sync::Mutex::new(Some(cleanup_started_tx));
+        let (release_cleanup_tx, release_cleanup_rx) = std::sync::mpsc::channel();
+        let release_cleanup_rx = std::sync::Mutex::new(release_cleanup_rx);
+        let catalog_calls = Arc::new(AtomicUsize::new(0));
+        let operation_calls = Arc::clone(&catalog_calls);
+        let catalog_operation: SegmentCatalogOperation = Arc::new(move |paths, watermark| {
+            if operation_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                let _ = cleanup_started_tx.lock().unwrap().take().unwrap().send(());
+                release_cleanup_rx.lock().unwrap().recv().unwrap();
+            }
+            cleanup_binlog_segments_through(&paths, watermark)
+        });
+        let compact_runtime = Arc::clone(&runtime);
+        let compact_store = Arc::clone(&store);
+        let compact = tokio::spawn(async move {
+            compact_runtime
+                .compact_with_operations(
+                    compact_store,
+                    Arc::new(AtomicU64::new(0)),
+                    Box::new(move |entries, watermark, paths| {
+                        let _ = snapshot_started_tx.send(());
+                        release_snapshot_rx.recv().unwrap();
+                        write_snapshot_file(entries, watermark, &paths)
+                    }),
+                    catalog_operation,
+                )
+                .await
+        });
+        snapshot_started_rx.await.unwrap();
+
+        let boundary = runtime.acquire_commit_boundary().await;
+        store.set("key".to_string(), "second".to_string());
+        runtime
+            .accept_next_batch(2, &put_batch_for(b"key", b"second"), 100_000)
+            .await
+            .unwrap();
+        drop(boundary);
+        release_snapshot_tx.send(()).unwrap();
+        cleanup_started_rx.await.unwrap();
+
+        let cleanup_owns_catalog = runtime.rotation_gate.try_lock().is_err();
+        let rollover_runtime = Arc::clone(&runtime);
+        let rollover = tokio::spawn(async move { rollover_runtime.rollover_generation().await });
+        let commit_boundary =
+            tokio::time::timeout(Duration::from_secs(1), runtime.acquire_commit_boundary()).await;
+        let commit_admitted = commit_boundary.is_ok();
+        if let Ok(boundary) = commit_boundary {
+            drop(boundary);
+        }
+        release_cleanup_tx.send(()).unwrap();
+        assert!(
+            commit_admitted,
+            "catalog cleanup blocked normal commit admission"
+        );
+        assert!(
+            cleanup_owns_catalog,
+            "snapshot catalog cleanup did not exclude concurrent generation rollover"
+        );
+        assert_eq!(compact.await.unwrap().unwrap(), 1);
+        assert_eq!(rollover.await.unwrap().unwrap(), 2);
+        assert_eq!(runtime.physical_segment_count(), 1);
+        assert!(paths.binlog_segment(2).exists());
+
+        drop(runtime);
+        worker.await.unwrap();
+        drop(io);
+        let recovered = ShardedStore::new();
+        let recovery = load_data_from_paths(&recovered, &paths).unwrap();
+        assert_eq!(recovery.snapshot_watermark, 1);
+        assert_eq!(recovery.last_sequence, 2);
+        assert_eq!(recovery.physical_segment_count, 1);
         assert_eq!(recovered.get("key"), Ok(Some("second".to_string())));
     }
 
