@@ -2392,6 +2392,30 @@ fn format_prometheus_metrics(store: &ShardedStore, persistence: &Persistence) ->
             "gauge",
             seconds(compaction.rotation_nanoseconds_max),
         ),
+        (
+            "onyxdb_compaction_predecessor_sync_seconds_total",
+            "Cumulative predecessor flush and file synchronization time during successful generation seals",
+            "counter",
+            seconds(compaction.predecessor_sync_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_predecessor_sync_seconds_max",
+            "Longest predecessor flush and file synchronization during a successful generation seal",
+            "gauge",
+            seconds(compaction.predecessor_sync_nanoseconds_max),
+        ),
+        (
+            "onyxdb_compaction_successor_install_seconds_total",
+            "Cumulative durable rename, successor creation, and directory synchronization time during successful generation seals",
+            "counter",
+            seconds(compaction.successor_install_nanoseconds_total),
+        ),
+        (
+            "onyxdb_compaction_successor_install_seconds_max",
+            "Longest durable successor installation during a successful generation seal",
+            "gauge",
+            seconds(compaction.successor_install_nanoseconds_max),
+        ),
     ] {
         push_metric(&mut output, name, help, metric_type, value);
     }
@@ -4948,7 +4972,7 @@ mod tests {
                     let _ = completion.send(Ok(0));
                 }
                 LogMessage::SealActive { completion, .. } => {
-                    let _ = completion.send(Ok(0));
+                    let _ = completion.send(Ok(BinlogSealOutcome::default()));
                 }
             }
         }
@@ -4981,6 +5005,8 @@ mod tests {
         assert!(body.contains("onyxdb_compaction_preflush_growth_bytes_total 0\n"));
         assert!(body.contains("onyxdb_compaction_preflush_backpressure_waiters_current 0\n"));
         assert!(body.contains("onyxdb_compaction_snapshot_materialization_seconds_total 0\n"));
+        assert!(body.contains("onyxdb_compaction_predecessor_sync_seconds_total 0\n"));
+        assert!(body.contains("onyxdb_compaction_successor_install_seconds_total 0\n"));
         assert!(body.contains("onyxdb_compaction_snapshot_entries_last 0\n"));
         assert!(body.contains("onyxdb_compaction_sealed_binlog_bytes_total 0\n"));
         assert!(body.contains("onyxdb_compaction_cleaned_segments_total 0\n"));
@@ -5115,7 +5141,7 @@ mod tests {
                         let _ = completion.send(Ok(0));
                     }
                     LogMessage::SealActive { completion, .. } => {
-                        let _ = completion.send(Ok(0));
+                        let _ = completion.send(Ok(BinlogSealOutcome::default()));
                     }
                 }
             }
@@ -5807,7 +5833,7 @@ mod tests {
                     }
                     LogMessage::SealActive { completion, .. } => {
                         generation_seal_observer.store(true, Ordering::SeqCst);
-                        let _ = completion.send(Ok(0));
+                        let _ = completion.send(Ok(BinlogSealOutcome::default()));
                     }
                     LogMessage::Append { completion, .. } => {
                         let _ = completion.send(Ok(()));
@@ -6907,7 +6933,7 @@ mod tests {
                         let _ = completion.send(Ok(0));
                     }
                     LogMessage::SealActive { completion, .. } => {
-                        let _ = completion.send(Ok(0));
+                        let _ = completion.send(Ok(BinlogSealOutcome::default()));
                     }
                 }
             }
@@ -8013,7 +8039,7 @@ mod tests {
                         let _ = completion.send(Ok(0));
                     }
                     LogMessage::SealActive { completion, .. } => {
-                        let _ = completion.send(Ok(0));
+                        let _ = completion.send(Ok(BinlogSealOutcome::default()));
                     }
                 }
             }
@@ -8092,7 +8118,7 @@ mod tests {
                         let _ = completion.send(Ok(0));
                     }
                     LogMessage::SealActive { completion, .. } => {
-                        let _ = completion.send(Ok(0));
+                        let _ = completion.send(Ok(BinlogSealOutcome::default()));
                     }
                 }
             }
@@ -8160,7 +8186,7 @@ mod tests {
                         let _ = completion.send(Ok(0));
                     }
                     LogMessage::SealActive { completion, .. } => {
-                        let _ = completion.send(Ok(0));
+                        let _ = completion.send(Ok(BinlogSealOutcome::default()));
                     }
                 }
             }
@@ -8419,7 +8445,7 @@ mod tests {
                         let _ = completion.send(Ok(0));
                     }
                     LogMessage::SealActive { completion, .. } => {
-                        let _ = completion.send(Ok(0));
+                        let _ = completion.send(Ok(BinlogSealOutcome::default()));
                     }
                 }
             }
@@ -9610,7 +9636,7 @@ mod tests {
                         let _ = completion.send(Ok(0));
                     }
                     LogMessage::SealActive { completion, .. } => {
-                        let _ = completion.send(Ok(0));
+                        let _ = completion.send(Ok(BinlogSealOutcome::default()));
                     }
                 }
             }
@@ -9717,7 +9743,7 @@ mod tests {
                         let _ = completion.send(Ok(0));
                     }
                     LogMessage::SealActive { completion, .. } => {
-                        let _ = completion.send(Ok(0));
+                        let _ = completion.send(Ok(BinlogSealOutcome::default()));
                     }
                 }
             }

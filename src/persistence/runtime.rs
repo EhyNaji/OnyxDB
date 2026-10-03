@@ -83,6 +83,7 @@ impl std::fmt::Display for StorageFailure {
 
 pub(crate) type StorageResult = Result<(), StorageFailure>;
 pub(crate) type StoragePositionResult = Result<u64, StorageFailure>;
+pub(crate) type StorageSealResult = Result<BinlogSealOutcome, StorageFailure>;
 
 fn duration_nanoseconds(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
@@ -208,6 +209,10 @@ pub(crate) struct CompactionMetricsSnapshot {
     pub(crate) snapshot_write_nanoseconds_max: u64,
     pub(crate) rotation_nanoseconds_total: u64,
     pub(crate) rotation_nanoseconds_max: u64,
+    pub(crate) predecessor_sync_nanoseconds_total: u64,
+    pub(crate) predecessor_sync_nanoseconds_max: u64,
+    pub(crate) successor_install_nanoseconds_total: u64,
+    pub(crate) successor_install_nanoseconds_max: u64,
     pub(crate) segment_cleanup_nanoseconds_total: u64,
     pub(crate) segment_cleanup_nanoseconds_max: u64,
     pub(crate) sealed_bytes_total: u64,
@@ -269,6 +274,8 @@ struct CompactionMetrics {
     snapshot_materialization: DurationMetric,
     snapshot_write: DurationMetric,
     rotation: DurationMetric,
+    predecessor_sync: DurationMetric,
+    successor_install: DurationMetric,
     segment_cleanup: DurationMetric,
     sealed_bytes_total: AtomicU64,
     sealed_bytes_max: AtomicU64,
@@ -350,6 +357,13 @@ impl CompactionMetrics {
             snapshot_write_nanoseconds_max: self.snapshot_write.max.load(Ordering::Relaxed),
             rotation_nanoseconds_total: self.rotation.total.load(Ordering::Relaxed),
             rotation_nanoseconds_max: self.rotation.max.load(Ordering::Relaxed),
+            predecessor_sync_nanoseconds_total: self.predecessor_sync.total.load(Ordering::Relaxed),
+            predecessor_sync_nanoseconds_max: self.predecessor_sync.max.load(Ordering::Relaxed),
+            successor_install_nanoseconds_total: self
+                .successor_install
+                .total
+                .load(Ordering::Relaxed),
+            successor_install_nanoseconds_max: self.successor_install.max.load(Ordering::Relaxed),
             segment_cleanup_nanoseconds_total: self.segment_cleanup.total.load(Ordering::Relaxed),
             segment_cleanup_nanoseconds_max: self.segment_cleanup.max.load(Ordering::Relaxed),
             sealed_bytes_total: self.sealed_bytes_total.load(Ordering::Relaxed),
@@ -386,6 +400,13 @@ impl CompactionMetrics {
         self.sealed_bytes_total
             .fetch_add(sealed_bytes, Ordering::Relaxed);
         observe_max(&self.sealed_bytes_max, sealed_bytes);
+    }
+
+    fn observe_seal_phases(&self, seal: BinlogSealOutcome) {
+        if seal.bytes > 0 {
+            self.predecessor_sync.observe(seal.predecessor_sync);
+            self.successor_install.observe(seal.successor_install);
+        }
     }
 
     fn observe_preflush(&self, preflushed_bytes: u64, elapsed: Duration) {
@@ -574,11 +595,21 @@ pub(crate) enum BinlogRotationError {
     Indeterminate(std::io::Error),
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BinlogSealOutcome {
+    pub(crate) bytes: u64,
+    pub(crate) predecessor_sync: Duration,
+    pub(crate) successor_install: Duration,
+}
+
 pub(crate) trait BinlogIo: Write + Seek + Send + 'static {
     fn sync_data(&mut self) -> std::io::Result<()>;
     fn sync_all(&mut self) -> std::io::Result<()>;
     fn truncate(&mut self, length: u64) -> Result<(), TruncateError>;
-    fn seal_active(&mut self, _end_sequence: u64) -> Result<u64, BinlogRotationError> {
+    fn seal_active(
+        &mut self,
+        _end_sequence: u64,
+    ) -> Result<BinlogSealOutcome, BinlogRotationError> {
         Err(BinlogRotationError::Unchanged(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "Binlog generation sealing is unsupported by this storage backend",
@@ -642,7 +673,7 @@ impl ManagedBinlogFile {
         &mut self,
         segment: &Path,
         original_error: std::io::Error,
-    ) -> Result<u64, BinlogRotationError> {
+    ) -> Result<BinlogSealOutcome, BinlogRotationError> {
         if self.paths.binlog.exists() {
             return Err(BinlogRotationError::Indeterminate(std::io::Error::other(
                 format!(
@@ -850,7 +881,7 @@ impl BinlogIo for ManagedBinlogFile {
         Ok(())
     }
 
-    fn seal_active(&mut self, end_sequence: u64) -> Result<u64, BinlogRotationError> {
+    fn seal_active(&mut self, end_sequence: u64) -> Result<BinlogSealOutcome, BinlogRotationError> {
         let active_length = self
             .file_mut()
             .map_err(BinlogRotationError::Indeterminate)?
@@ -858,7 +889,7 @@ impl BinlogIo for ManagedBinlogFile {
             .map_err(BinlogRotationError::Unchanged)?
             .len();
         if active_length == 0 {
-            return Ok(0);
+            return Ok(BinlogSealOutcome::default());
         }
         if end_sequence == 0 {
             return Err(BinlogRotationError::Unchanged(std::io::Error::new(
@@ -873,6 +904,7 @@ impl BinlogIo for ManagedBinlogFile {
                 format!("Binlog segment already exists: {}", segment.display()),
             )));
         }
+        let predecessor_sync_started = Instant::now();
         self.file_mut()
             .map_err(BinlogRotationError::Indeterminate)?
             .flush()
@@ -884,6 +916,8 @@ impl BinlogIo for ManagedBinlogFile {
             .map_err(BinlogRotationError::Indeterminate)?
             .sync_all()
             .map_err(BinlogRotationError::Indeterminate)?;
+        let predecessor_sync = predecessor_sync_started.elapsed();
+        let successor_install_started = Instant::now();
         drop(self.file.take());
         if let Err(error) = durable_rename(&self.paths.binlog, &segment) {
             return match self.reopen_active() {
@@ -919,7 +953,11 @@ impl BinlogIo for ManagedBinlogFile {
             .seek(SeekFrom::End(0))
             .map_err(BinlogRotationError::Indeterminate)?;
         self.file = Some(active);
-        Ok(active_length)
+        Ok(BinlogSealOutcome {
+            bytes: active_length,
+            predecessor_sync,
+            successor_install: successor_install_started.elapsed(),
+        })
     }
 }
 
@@ -1584,8 +1622,8 @@ impl CommitRuntime {
         let pause_started = Instant::now();
         let watermark = self.sequence();
         let rotation_started = Instant::now();
-        let sealed_bytes = match self.binlog.seal_active(watermark).await {
-            Ok(sealed_bytes) => sealed_bytes,
+        let seal = match self.binlog.seal_active(watermark).await {
+            Ok(seal) => seal,
             Err(error) => {
                 self.compaction_metrics
                     .rotation
@@ -1606,6 +1644,8 @@ impl CommitRuntime {
         self.compaction_metrics
             .rotation
             .observe(rotation_started.elapsed());
+        self.compaction_metrics.observe_seal_phases(seal);
+        let sealed_bytes = seal.bytes;
         self.compaction_metrics.observe_sealed_bytes(sealed_bytes);
         self.compaction_metrics
             .observe_preflush_growth(sealed_bytes.saturating_sub(preflushed_bytes));
@@ -1775,9 +1815,9 @@ impl CommitRuntime {
         let capture_pause_started = Instant::now();
         let watermark = self.sequence();
         let rotation_started = Instant::now();
-        let sealed_bytes = if seal_generation {
+        let seal = if seal_generation {
             match self.binlog.seal_active(watermark).await {
-                Ok(sealed_bytes) => sealed_bytes,
+                Ok(seal) => seal,
                 Err(error) => {
                     self.compaction_metrics
                         .rotation
@@ -1796,11 +1836,13 @@ impl CommitRuntime {
                 }
             }
         } else {
-            0
+            BinlogSealOutcome::default()
         };
         self.compaction_metrics
             .rotation
             .observe(rotation_started.elapsed());
+        self.compaction_metrics.observe_seal_phases(seal);
+        let sealed_bytes = seal.bytes;
         self.compaction_metrics.observe_sealed_bytes(sealed_bytes);
         if seal_generation {
             self.active_binlog_bytes.store(0, Ordering::SeqCst);
@@ -1985,7 +2027,7 @@ pub(crate) enum LogMessage {
     },
     SealActive {
         end_sequence: u64,
-        completion: oneshot::Sender<StoragePositionResult>,
+        completion: oneshot::Sender<StorageSealResult>,
     },
     Flush {
         completion: oneshot::Sender<StorageResult>,
@@ -2145,9 +2187,12 @@ impl BinlogHandle {
     }
 
     /// Seals the active generation at the supplied authoritative sequence and
-    /// creates a new empty active binlog. The returned value is the number of
-    /// bytes moved into the immutable segment.
-    pub(crate) async fn seal_active(&self, end_sequence: u64) -> Result<u64, PersistenceError> {
+    /// creates a new empty active binlog. The result reports the sealed bytes
+    /// and storage phase durations for an accepted transition.
+    pub(crate) async fn seal_active(
+        &self,
+        end_sequence: u64,
+    ) -> Result<BinlogSealOutcome, PersistenceError> {
         let (completion_tx, completion_rx) = oneshot::channel();
         self.sender
             .send(LogMessage::SealActive {
@@ -2661,7 +2706,10 @@ mod tests {
                 .map_err(TruncateError::Indeterminate)
         }
 
-        fn seal_active(&mut self, _end_sequence: u64) -> Result<u64, BinlogRotationError> {
+        fn seal_active(
+            &mut self,
+            _end_sequence: u64,
+        ) -> Result<BinlogSealOutcome, BinlogRotationError> {
             self.seal_calls += 1;
             if let Some((call, disposition)) = self.plan.seal_error_on_call
                 && call == self.seal_calls
@@ -2683,7 +2731,10 @@ mod tests {
             self.flush().map_err(BinlogRotationError::Indeterminate)?;
             self.sync_all()
                 .map_err(BinlogRotationError::Indeterminate)?;
-            Ok(active_length)
+            Ok(BinlogSealOutcome {
+                bytes: active_length,
+                ..BinlogSealOutcome::default()
+            })
         }
     }
 
@@ -3784,7 +3835,10 @@ mod tests {
             .append_batch(1, &put_batch_for(b"key", b"first"))
             .await
             .unwrap();
-        let sealed_bytes = handle.seal_active(1).await.unwrap();
+        let seal = handle.seal_active(1).await.unwrap();
+        assert!(seal.predecessor_sync > Duration::ZERO);
+        assert!(seal.successor_install > Duration::ZERO);
+        let sealed_bytes = seal.bytes;
         assert!(sealed_bytes > 0);
         let segment = paths.binlog_segment(1);
         let sealed = crate::persistence::inspect_binlog(&segment).unwrap();
@@ -4227,6 +4281,13 @@ mod tests {
         assert_eq!(metrics.cleanup_bytes_total, metrics.sealed_bytes_total);
         assert_eq!(metrics.cleanup_failures_total, 0);
         assert!(metrics.segment_cleanup_nanoseconds_total > 0);
+        assert!(metrics.predecessor_sync_nanoseconds_total > 0);
+        assert!(metrics.successor_install_nanoseconds_total > 0);
+        assert!(
+            metrics.rotation_nanoseconds_total
+                >= metrics.predecessor_sync_nanoseconds_total
+                    + metrics.successor_install_nanoseconds_total
+        );
         assert!(metrics.write_pause_nanoseconds_total < metrics.duration_nanoseconds_total);
         assert!(!paths.binlog_segment(1).exists());
         let active = crate::persistence::inspect_binlog(&paths.binlog).unwrap();

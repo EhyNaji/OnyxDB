@@ -73,8 +73,11 @@ cargo run --release --locked --bin onyx-bench -- \
 
 Report commit latency percentiles together with compaction count, total and
 maximum duration, serialization wait, checkpoint, snapshot-capture,
-snapshot-write, generation preflush, generation sealing, segment cleanup,
+snapshot-write, generation preflush, generation sealing, predecessor file
+synchronization, durable successor installation, segment cleanup,
 total/maximum write pause, sealed bytes, and retained active-generation bytes.
+The predecessor and successor phase totals cover successful nonempty seals;
+the overall sealing duration also includes failed attempts and worker handoff.
 Dataset cardinality materially changes snapshot capture and serialization cost;
 mutation rate during snapshot writing changes the retained active-generation
 size. A useful long-running comparison therefore keeps both cardinality and
@@ -94,6 +97,7 @@ both profiles:
   limit, cleanup-blocked and catalog-unavailable states, and catalog
   backpressure;
 - preflush backpressure waiters and duration;
+- generation predecessor synchronization and successor installation;
 - snapshot capture, materialization, encoding, and durable installation;
 - total and process-lifetime maximum commit-path pause;
 - coordinator queue wait, storage duration, group composition, and errors.

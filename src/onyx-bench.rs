@@ -799,7 +799,7 @@ fn report_human(config: &BenchmarkConfig, authenticated: bool, results: &[RunRes
         );
         if let Some(metrics) = &result.server_metrics {
             println!(
-                "  Server metrics: groups {:.0} | logical batches {:.0} | binlog appends {:.0} | records/append {:.2} | rollovers {:.0} | active generation {:.0} bytes | compactions {:.0} | compaction {:.3} s | compaction lifetime max {:.3} s | maintenance preflush {:.3} s | preflush growth {:.0} bytes | preflush backpressure {:.3} s | generation seal {:.3} s | snapshot capture {:.3} s | snapshot materialization {:.3} s | snapshot write {:.3} s | segment cleanup {:.3} s | write pause {:.3} s | write pause lifetime max {:.3} s | sealed binlog {:.0} bytes | retained binlog {:.0} bytes | queue wait {:.3} s | queue lifetime max {:.0} | metrics settle {:.3} s",
+                "  Server metrics: groups {:.0} | logical batches {:.0} | binlog appends {:.0} | records/append {:.2} | rollovers {:.0} | active generation {:.0} bytes | compactions {:.0} | compaction {:.3} s | compaction lifetime max {:.3} s | maintenance preflush {:.3} s | preflush growth {:.0} bytes | preflush backpressure {:.3} s | generation seal {:.3} s | predecessor sync {:.3} s | successor install {:.3} s | snapshot capture {:.3} s | snapshot materialization {:.3} s | snapshot write {:.3} s | segment cleanup {:.3} s | write pause {:.3} s | write pause lifetime max {:.3} s | sealed binlog {:.0} bytes | retained binlog {:.0} bytes | queue wait {:.3} s | queue lifetime max {:.0} | metrics settle {:.3} s",
                 metrics.delta("onyxdb_commit_groups_total"),
                 metrics.delta("onyxdb_commit_logical_batches_total"),
                 metrics.delta("onyxdb_binlog_append_accepted_total"),
@@ -820,6 +820,8 @@ fn report_human(config: &BenchmarkConfig, authenticated: bool, results: &[RunRes
                 metrics.delta("onyxdb_compaction_preflush_growth_bytes_total"),
                 metrics.delta("onyxdb_compaction_preflush_backpressure_seconds_total"),
                 metrics.delta("onyxdb_compaction_rotation_seconds_total"),
+                metrics.delta("onyxdb_compaction_predecessor_sync_seconds_total"),
+                metrics.delta("onyxdb_compaction_successor_install_seconds_total"),
                 metrics.delta("onyxdb_compaction_snapshot_capture_seconds_total"),
                 metrics.delta("onyxdb_compaction_snapshot_materialization_seconds_total"),
                 metrics.delta("onyxdb_compaction_snapshot_write_seconds_total"),
